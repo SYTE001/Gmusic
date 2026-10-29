@@ -1,0 +1,35 @@
+# Local environment (never committed). See .env.example for the template.
+.env
+.env.local
+.env.*.local
+.env.*
+!.env.example
+
+# Keys / certificates / credentials
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.keystore
+.dev.vars.*
+!.dev.vars.example
+
+# Dependencies
+node_modules
+
+# Build output
+dist
+
+# Cloudflare Worker project (separate package; see worker/)
+worker/node_modules
+worker/dist
+worker/.wrangler
+worker/.dev.vars
+
+# Logs and editor clutter
+*.log
+.DS_Store
+.idea
+.vscode
+*.tsbuildinfo

@@ -1,0 +1,40 @@
+# Cloudflare Worker — Local Music R2 API
+#
+# Every value below is a PLACEHOLDER. Real values live in Worker secrets
+# (`wrangler secret put NAME`) or in a local .dev.vars file that is never
+# committed. R2 access keys must never appear in the frontend, in VITE_*
+# variables, or in version control.
+
+name = "local-music-r2"
+main = "src/index.ts"
+compatibility_date = "2024-11-06"
+compatibility_flags = ["nodejs_compat"]
+
+# Direct object operations (HEAD / delete / list) go through the R2 binding,
+# which needs no credentials and is only reachable from this Worker.
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "local-music-media"
+# preview_bucket_name = "local-music-media-preview"
+
+[vars]
+# Non-secret configuration only. Secrets are injected by Cloudflare.
+R2_BUCKET_NAME = "local-music-media"
+ALLOWED_ORIGIN = "http://localhost:5173"
+# Max upload size in bytes (500 MB).
+MAX_UPLOAD_BYTES = "524288000"
+# Presigned URL lifetimes in seconds (keep short).
+PUT_URL_TTL_SECONDS = "120"
+GET_URL_TTL_SECONDS = "300"
+
+# ----------------------------------------------------------------------------
+# Required secrets (set with `wrangler secret put <NAME>`):
+#   R2_ACCOUNT_ID        Cloudflare account ID (used for the S3 endpoint host)
+#   R2_ACCESS_KEY_ID     R2 API token access key ID
+#   R2_SECRET_ACCESS_KEY R2 API token secret
+#   SUPABASE_URL         Supabase project URL, e.g. https://<project-ref>.supabase.co
+#                        Used for asymmetric JWT verification against official JWKS.
+# Optional secrets:
+#   SUPABASE_JWT_SECRET  Legacy Supabase project JWT secret (for HS256 local verification)
+#   SUPABASE_ANON_KEY    Used for legacy HS256 Auth-service verification fallback
+# ----------------------------------------------------------------------------

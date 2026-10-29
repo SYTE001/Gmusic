@@ -1,0 +1,253 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens (PRD §8.2). Semantic variables are defined per theme on
+ * :root/[data-theme], then mapped into Tailwind via @theme inline so utilities
+ * like bg-surface / text-secondary follow runtime theme switches.
+ */
+
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #090b12;
+  --surface: #111522;
+  --surface-raised: #191f2d;
+  --surface-hover: #232b3d;
+  --text-primary: #f4f6fb;
+  --text-secondary: #a4acbd;
+  --text-muted: #70798d;
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --accent: #8da8ff;
+  --accent-strong: #6285ff;
+  --accent-contrast: #0b1020;
+  --success: #74d6b0;
+  --danger: #ff737d;
+  --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.55);
+  --scrim: rgba(4, 6, 12, 0.66);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f5f6fa;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-hover: #eceef5;
+  --text-primary: #171b26;
+  --text-secondary: #434c5e;
+  --text-muted: #5d667c;
+  --border-subtle: rgba(15, 20, 35, 0.1);
+  --border-strong: rgba(15, 20, 35, 0.22);
+  --accent: #4a6df0;
+  --accent-strong: #3556e0;
+  --accent-contrast: #ffffff;
+  --success: #1d8f66;
+  --danger: #d2454f;
+  --shadow-overlay: 0 16px 40px rgba(20, 26, 44, 0.18);
+  --scrim: rgba(240, 242, 248, 0.7);
+}
+
+@theme inline {
+  --color-app-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-hover: var(--surface-hover);
+  --color-text-primary: var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted: var(--text-muted);
+  --color-line: var(--border-subtle);
+  --color-line-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-contrast: var(--accent-contrast);
+  --color-success: var(--success);
+  --color-danger: var(--danger);
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, "Noto Sans", sans-serif;
+
+  --radius-card: 12px;
+  --radius-tile: 16px;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* Visible focus for keyboard users (rules §9) */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+::selection {
+  background: var(--accent-strong);
+  color: var(--accent-contrast);
+}
+
+/* Subtle scrollbars that match the theme */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-hover) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--surface-hover);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Reduced motion: follow the OS, or the manual override on <html data-motion> */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="off"]) *,
+  html[data-motion="on"] * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+html[data-motion="on"] *,
+html:not([data-motion="off"]) .motion-safe-smooth {
+  scroll-behavior: smooth;
+}
+
+/* Reusable primitives */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  color: var(--text-secondary);
+  transition:
+    transform 100ms ease,
+    background-color 120ms ease,
+    color 120ms ease;
+  flex: none;
+}
+.icon-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+.icon-btn:active:not(:disabled) {
+  transform: scale(0.93);
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.icon-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-secondary);
+}
+/* Larger touch target on coarse pointers */
+@media (pointer: coarse) {
+  .icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+}
+
+.text-btn {
+  color: var(--text-secondary);
+  transition: color 140ms ease;
+}
+.text-btn:hover {
+  color: var(--text-primary);
+}
+
+.surface-card {
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-card);
+}
+
+.line-clamp-1 {
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Range inputs (volume) */
+input[type="range"].app-range {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  cursor: pointer;
+}
+input[type="range"].app-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  border: none;
+}
+input[type="range"].app-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  border: none;
+}
+
+/* Animations kept minimal and purposeful (PRD §8.5) */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-fade-in {
+  animation: fade-in 180ms ease both;
+}
+
+@keyframes overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-overlay-in {
+  animation: overlay-in 160ms ease both;
+}
