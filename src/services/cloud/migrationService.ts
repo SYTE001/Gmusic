@@ -77,6 +77,45 @@ function describeFailure(error: unknown): string {
 }
 
 /**
+ * Canonical MIME type per audio extension, matching the allow-list the Worker
+ * enforces (worker/src/keys.ts). Keys are lowercase, values are the type the
+ * Worker signs and verifies for that extension.
+ */
+const AUDIO_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  m4b: "audio/mp4",
+  mp4: "audio/mp4",
+  aac: "audio/aac",
+  wav: "audio/wav",
+  wave: "audio/wav",
+  oga: "audio/ogg",
+  ogg: "audio/ogg",
+  opus: "audio/opus",
+  flac: "audio/flac",
+  weba: "audio/webm",
+  webm: "audio/webm",
+};
+
+/**
+ * Resolves the MIME type an audio upload must declare. The file name's
+ * extension decides for every format the app and the Worker recognize,
+ * because the detected metadata is frequently wrong: browsers and OS pickers
+ * routinely label `.m4a` files `audio/mpeg`, which the Worker rejects for
+ * that extension. For an extension the app does not know, the detected type
+ * is trusted when it is a real audio type; otherwise the upload falls back
+ * to the MP3 default so the Worker, not the client, has the final say.
+ */
+export function resolveAudioMimeType(fileName: string, detectedMimeType?: string | null): string {
+  const extension = fileName.match(/\.([^.]+)$/)?.[1]?.toLowerCase() ?? "";
+  const known = AUDIO_MIME_BY_EXTENSION[extension];
+  if (known) return known;
+  const detected = (detectedMimeType ?? "").trim().toLowerCase();
+  if (detected.startsWith("audio/")) return detected;
+  return "audio/mpeg";
+}
+
+/**
  * Resolves the usable local audio for a track — a handle with granted
  * permission, a stored copy, or a session file — without prompting. Returns
  * null when nothing is reachable right now; `planMigration` reports those
@@ -94,7 +133,9 @@ export async function resolveLocalAudioForTrack(track: Track): Promise<File | nu
   }
   const blob = await repository.getAudioBlob(track.id);
   if (blob) {
-    return blob instanceof File ? blob : new File([blob], track.fileName, { type: track.mimeType || blob.type || "audio/mpeg" });
+    return blob instanceof File
+      ? blob
+      : new File([blob], track.fileName, { type: resolveAudioMimeType(track.fileName, track.mimeType || blob.type) });
   }
   const sessionFile = getSessionFile(track.id);
   return sessionFile ?? null;
@@ -183,7 +224,9 @@ async function uploadOne(
       response = await fetch(uploadUrl, {
         method: "PUT",
         body: file,
-        headers: { ...requiredHeaders },
+        // The same MIME type that presigned the URL also labels the bytes on
+        // the wire and is verified by the Worker afterwards.
+        headers: { ...requiredHeaders, "content-type": mimeType },
       });
     } catch (error) {
       lastError = error;
@@ -266,7 +309,10 @@ export async function runMigration(
     }
 
     try {
-      const objectKey = await uploadOne(track, file, file.type || "audio/mpeg", "audio");
+      // The upload MIME type follows the file name, not the blob's own
+      // metadata, so a mislabeled `.m4a` is never sent as `audio/mpeg`.
+      const mimeType = resolveAudioMimeType(track.fileName, file.type);
+      const objectKey = await uploadOne(track, file, mimeType, "audio");
 
       // Artwork follows the audio only after the audio object is verified;
       // a failed artwork upload must not mark the whole track as failed.

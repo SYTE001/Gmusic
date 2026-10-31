@@ -151,6 +151,11 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
           "This song is stored in the cloud and is not cached on this device. Reconnect to the internet to play it.",
       };
     }
+    // Releasing here keeps the single-URL invariant (rules §12): when playback
+    // moves from a local object URL to a cloud stream, the blob URL it
+    // replaces must not stay alive — its Blob would be retained for the
+    // rest of the session even though nothing can play it anymore.
+    releaseActiveUrl();
     try {
       const url = await getPlayUrl(track.objectKey);
       return { ok: true, url, release: () => undefined };

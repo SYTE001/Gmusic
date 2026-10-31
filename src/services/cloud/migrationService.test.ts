@@ -18,6 +18,12 @@ const storage = vi.hoisted(() => ({
   uploads: 0,
   concurrencyPeak: 0,
   inFlight: 0,
+  /** MIME type the client declared per audio upload-url request. */
+  audioMimeByTrack: new Map<string, string>(),
+  /** MIME type the client declared per artwork upload-url request. */
+  artworkMimeByTrack: new Map<string, string>(),
+  /** MIME type the client sent to `completeUpload`, per object key. */
+  completeMimeByObject: new Map<string, string>(),
 }));
 
 vi.mock("../cloud/r2StorageService", () => ({
@@ -31,24 +37,52 @@ vi.mock("../cloud/r2StorageService", () => ({
       this.status = status;
     }
   },
-  requestUploadUrl: async ({ trackId, sizeBytes }: { trackId: string; fileName: string; mimeType: string; sizeBytes: number }) => {
+  requestUploadUrl: async ({
+    trackId,
+    fileName,
+    mimeType,
+    sizeBytes,
+    kind,
+  }: {
+    trackId: string;
+    fileName: string;
+    mimeType: string;
+    sizeBytes: number;
+    kind?: "audio" | "artwork";
+  }) => {
     if (storage.failingTrackIds.has(trackId)) {
       throw new (class extends Error {})("The upload was rejected (500).");
     }
     storage.uploads += 1;
+    // Mirrors the real Worker: the object key and the signed Content-Type
+    // both follow the extension and the declared MIME type.
+    const extension = fileName.split(".").pop() ?? "mp3";
+    const category = kind ?? "audio";
+    if (category === "artwork") storage.artworkMimeByTrack.set(trackId, mimeType);
+    else storage.audioMimeByTrack.set(trackId, mimeType);
     return {
-      objectKey: `users/u-1/tracks/${trackId}/audio.mp3`,
-      uploadUrl: `https://r2/put/${trackId}`,
+      objectKey: `users/u-1/tracks/${trackId}/${category}.${extension}`,
+      uploadUrl: `https://r2/put/${trackId}/${category}`,
       expiresIn: 120,
-      requiredHeaders: { "content-type": "audio/mpeg" },
+      requiredHeaders: { "content-type": mimeType },
       sizeBytes,
     };
   },
-  completeUpload: async ({ objectKey, sizeBytes }: { objectKey: string; trackId: string; sizeBytes: number; mimeType: string }) => {
+  completeUpload: async ({
+    objectKey,
+    sizeBytes,
+    mimeType,
+  }: {
+    objectKey: string;
+    trackId: string;
+    sizeBytes: number;
+    mimeType: string;
+  }) => {
     if (storage.verificationFailsFor.has(objectKey)) {
       throw new (class extends Error {})("verification failed");
     }
-    return { objectKey, size: sizeBytes, etag: "etag", contentType: "audio/mpeg" };
+    storage.completeMimeByObject.set(objectKey, mimeType);
+    return { objectKey, size: sizeBytes, etag: "etag", contentType: mimeType };
   },
   /** Records rejected-object cleanup attempts. */
   deleteCloudObject: async (objectKey: string) => {
@@ -72,9 +106,11 @@ import {
   cancelMigration,
   initialMigrationProgress,
   planMigration,
+  resolveAudioMimeType,
   retryFailedItems,
   runMigration,
 } from "./migrationService";
+import { forgetSessionFile, rememberSessionFile } from "../file-access/FileAccessService";
 
 function makeTrack(overrides: Partial<Track> = {}): Track {
   return {
@@ -111,6 +147,41 @@ async function storedTracks(count: number): Promise<Track[]> {
   return tracks;
 }
 
+describe("resolveAudioMimeType", () => {
+  it("lets the file name win over mislabeled metadata for known formats", () => {
+    expect(resolveAudioMimeType("song.m4a", "audio/mpeg")).toBe("audio/mp4");
+    expect(resolveAudioMimeType("song.m4b", "audio/mpeg")).toBe("audio/mp4");
+    expect(resolveAudioMimeType("song.mp4", "audio/mpeg")).toBe("audio/mp4");
+    expect(resolveAudioMimeType("song.aac", "audio/mpeg")).toBe("audio/aac");
+    expect(resolveAudioMimeType("song.wav", "audio/mpeg")).toBe("audio/wav");
+    expect(resolveAudioMimeType("song.flac", "audio/mpeg")).toBe("audio/flac");
+    expect(resolveAudioMimeType("song.ogg", "audio/mpeg")).toBe("audio/ogg");
+    expect(resolveAudioMimeType("song.opus", "audio/mpeg")).toBe("audio/opus");
+    expect(resolveAudioMimeType("SONG.M4A", "audio/mpeg")).toBe("audio/mp4");
+  });
+
+  it("keeps the canonical type for already-correct metadata", () => {
+    expect(resolveAudioMimeType("song.mp3", "audio/mpeg")).toBe("audio/mpeg");
+    expect(resolveAudioMimeType("song.m4a", "audio/mp4")).toBe("audio/mp4");
+    expect(resolveAudioMimeType("song.mp3", "audio/mp3")).toBe("audio/mpeg");
+    expect(resolveAudioMimeType("song.wav", "audio/wav")).toBe("audio/wav");
+    expect(resolveAudioMimeType("song.flac", "audio/flac")).toBe("audio/flac");
+    expect(resolveAudioMimeType("song.ogg", "audio/ogg")).toBe("audio/ogg");
+  });
+
+  it("trusts a real audio type for extensions the app does not know", () => {
+    expect(resolveAudioMimeType("track.xyz", "audio/ogg")).toBe("audio/ogg");
+    expect(resolveAudioMimeType("track.xyz", " AUDIO/OPUS ")).toBe("audio/opus");
+  });
+
+  it("falls back to the MP3 default when nothing usable is known", () => {
+    expect(resolveAudioMimeType("song")).toBe("audio/mpeg");
+    expect(resolveAudioMimeType("song.xyz", "")).toBe("audio/mpeg");
+    expect(resolveAudioMimeType("song.xyz", "application/octet-stream")).toBe("audio/mpeg");
+    expect(resolveAudioMimeType("song.xyz", undefined)).toBe("audio/mpeg");
+  });
+});
+
 describe("migration planning", () => {
   beforeEach(async () => {
     await repository.clearAllData();
@@ -120,6 +191,9 @@ describe("migration planning", () => {
     storage.cleanedUpObjects = [];
     storage.concurrencyPeak = 0;
     storage.inFlight = 0;
+    storage.audioMimeByTrack.clear();
+    storage.artworkMimeByTrack.clear();
+    storage.completeMimeByObject.clear();
     library.upserted = [];
     // The presigned PUT goes to the object store, never the test network.
     vi.stubGlobal("fetch", async () => new Response("", { status: 200 }));
@@ -168,6 +242,9 @@ describe("migration run", () => {
     storage.cleanedUpObjects = [];
     storage.concurrencyPeak = 0;
     storage.inFlight = 0;
+    storage.audioMimeByTrack.clear();
+    storage.artworkMimeByTrack.clear();
+    storage.completeMimeByObject.clear();
     library.upserted = [];
     // The presigned PUT goes to the object store, never the test network.
     vi.stubGlobal("fetch", async () => new Response("", { status: 200 }));
@@ -322,5 +399,105 @@ describe("migration run", () => {
     expect(await repository.getAudioBlob(tracks[0]!.id)).toBeTruthy();
     const stored = await repository.getTrack(tracks[0]!.id);
     expect(stored?.availability).toBe("available");
+  });
+
+  it("uploads an .m4a file whose metadata says audio/mpeg as audio/mp4", async () => {
+    const track = makeTrack({ id: "m4a-1", fileName: "song.m4a", mimeType: "audio/mpeg" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(1000)], { type: "audio/mpeg" }));
+
+    const putContentTypes: string[] = [];
+    vi.stubGlobal("fetch", async (_url: unknown, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      putContentTypes.push(headers?.["content-type"] ?? "");
+      return new Response("", { status: 200 });
+    });
+
+    const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+    await runMigration([track], progress);
+
+    expect(progress.state).toBe("complete");
+    expect(progress.succeeded).toBe(1);
+    // The presigned request, the PUT Content-Type, and the verification call
+    // all carried the extension-derived type — never the mislabeled metadata.
+    expect(storage.audioMimeByTrack.get("m4a-1")).toBe("audio/mp4");
+    expect(putContentTypes).toEqual(["audio/mp4"]);
+    expect(storage.completeMimeByObject.get("users/u-1/tracks/m4a-1/audio.m4a")).toBe("audio/mp4");
+    // The local copy survived the upload untouched.
+    expect(await repository.getAudioBlob(track.id)).toBeTruthy();
+  });
+
+  it("keeps uploading .mp3 files as audio/mpeg", async () => {
+    const track = makeTrack({ id: "mp3-1", fileName: "song.mp3", mimeType: "audio/mpeg" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(1000)], { type: "audio/mpeg" }));
+
+    const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+    await runMigration([track], progress);
+
+    expect(storage.audioMimeByTrack.get("mp3-1")).toBe("audio/mpeg");
+    expect(storage.completeMimeByObject.get("users/u-1/tracks/mp3-1/audio.mp3")).toBe("audio/mpeg");
+  });
+
+  it("resolves the upload MIME from the file name for File System Access handles", async () => {
+    const track = makeTrack({ id: "handle-m4a", fileName: "song.m4a", mimeType: "audio/mpeg", accessMode: "handle" });
+    await repository.putTracks([track]);
+    // A retained handle whose file reports the wrong MIME type, as browsers
+    // and OS pickers regularly do for .m4a audio.
+    const handle = {
+      kind: "file" as const,
+      name: "song.m4a",
+      getFile: async () => new File([new Uint8Array(1000)], "song.m4a", { type: "audio/mpeg" }),
+    };
+    const spy = vi.spyOn(repository, "getHandle").mockResolvedValue(handle as unknown as FileSystemFileHandle);
+    try {
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.state).toBe("complete");
+      expect(storage.audioMimeByTrack.get("handle-m4a")).toBe("audio/mp4");
+      expect(storage.completeMimeByObject.get("users/u-1/tracks/handle-m4a/audio.m4a")).toBe("audio/mp4");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("resolves the upload MIME from the file name for session files", async () => {
+    const track = makeTrack({ id: "session-m4a", fileName: "song.m4a", mimeType: "audio/mpeg", accessMode: "session-only" });
+    await repository.putTracks([track]);
+    rememberSessionFile(track.id, new File([new Uint8Array(1000)], "song.m4a", { type: "audio/mpeg" }));
+    try {
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.state).toBe("complete");
+      expect(storage.audioMimeByTrack.get("session-m4a")).toBe("audio/mp4");
+      expect(storage.completeMimeByObject.get("users/u-1/tracks/session-m4a/audio.m4a")).toBe("audio/mp4");
+    } finally {
+      forgetSessionFile(track.id);
+    }
+  });
+
+  it("labels artwork uploads with the artwork blob type, not the audio resolution", async () => {
+    const track = makeTrack({ id: "artwork-1", fileName: "song.m4a", mimeType: "audio/mp4" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(1000)], { type: "audio/mp4" }));
+    // The artwork blob is served directly: this jsdom/fake-indexeddb build
+    // drops a Blob's type over the round trip, while real browsers keep it.
+    const artwork = new Blob([new Uint8Array(64)], { type: "image/png" });
+    const spy = vi.spyOn(repository, "getArtwork").mockResolvedValue(artwork);
+    try {
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.state).toBe("complete");
+      // The audio upload still used the extension-derived audio type, while
+      // the artwork upload kept its own image type — the MIME fix did not
+      // leak from audio into artwork.
+      expect(storage.audioMimeByTrack.get("artwork-1")).toBe("audio/mp4");
+      expect(storage.artworkMimeByTrack.get("artwork-1")).toBe("image/png");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

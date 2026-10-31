@@ -290,4 +290,56 @@ describe("playback with cloud sources", () => {
     expect(engine.src).toContain("blob:");
     expect(cloud.refreshCount).toBe(0);
   });
+
+  it("prefers the local copy of a cloud-synced track even while online", async () => {
+    const hybrid = makeTrack({
+      id: "hybrid-online",
+      accessMode: "stored-copy",
+      objectKey: "users/u-1/tracks/hybrid-online/audio.mp3",
+      cloudStatus: "ready",
+    });
+    tracks.push(hybrid);
+    await repository.putTracks([hybrid]);
+    await repository.putAudioBlob(hybrid.id, new Blob(["audio-bytes"]));
+
+    usePlaybackStore.getState().playContext(["hybrid-online"], 0, { type: "library", label: "L" });
+    await waitUntil(() => usePlaybackStore.getState().status === "ready");
+    // A reachable local copy wins over the cloud copy: playback stays offline
+    // capable and never pays for a network round trip it does not need.
+    expect(engine.src).toContain("blob:");
+    expect(cloud.refreshCount).toBe(0);
+  });
+
+  it("revokes the previous local object URL when playback moves to a cloud track", async () => {
+    const created: string[] = [];
+    const revoked: string[] = [];
+    const create = vi.spyOn(URL, "createObjectURL").mockImplementation(() => {
+      const url = `blob:test-${created.length}`;
+      created.push(url);
+      return url;
+    });
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation((url: string) => {
+      revoked.push(url);
+      return undefined;
+    });
+    try {
+      usePlaybackStore.getState().playContext(["local-a", "cloud-a"], 0, { type: "library", label: "L" });
+      await waitUntil(() => usePlaybackStore.getState().status === "ready");
+      expect(created).toHaveLength(1);
+      expect(engine.src).toBe(created[0]);
+
+      usePlaybackStore.getState().next(true);
+      await waitUntil(() => engine.src === "https://r2/get/cloud-a?sig=1");
+
+      // Only one object URL may stay alive at a time (rules §12): moving to a
+      // cloud source must release the local blob URL it replaced. (Any other
+      // revoked URL here is a stale leftover from an earlier test's module
+      // state, which the local→cloud transition must also clean up.)
+      expect(revoked).toContain(created[0]!);
+      expect(created).toHaveLength(1);
+    } finally {
+      create.mockRestore();
+      revoke.mockRestore();
+    }
+  });
 });
