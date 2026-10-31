@@ -119,7 +119,7 @@ export function TrackListSection({
           </select>
         </label>
         {headerRight}
-        <span className="ml-auto text-xs text-text-muted">
+        <span className="ml-auto text-xs text-text-muted tabular-nums">
           {filtered.length} song{filtered.length === 1 ? "" : "s"}
         </span>
       </div>
@@ -129,7 +129,7 @@ export function TrackListSection({
           No songs match “{query}”.
         </p>
       ) : (
-        <div className="space-y-0.5">
+        <div role="list" aria-label="Songs" className="space-y-0.5">
           {filtered.slice(0, maxRowsWithoutVirtualization).map((track, index) => (
             <TrackRow
               key={track.id}

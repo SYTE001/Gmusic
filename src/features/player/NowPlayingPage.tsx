@@ -305,11 +305,12 @@ export function NowPlayingPage() {
                 <button
                   type="button"
                   className="icon-btn shrink-0"
+                  title="Like (L)"
                   aria-label={track.isLiked ? "Remove from liked songs" : "Add to liked songs"}
                   aria-pressed={track.isLiked}
                   onClick={() => void useLibraryStore.getState().toggleLike(track.id)}
                 >
-                  <HeartIcon size={19} filled={track.isLiked} className={track.isLiked ? "text-danger" : ""} />
+                  <HeartIcon size={19} filled={track.isLiked} className={track.isLiked ? "text-accent" : ""} />
                 </button>
               </div>
 

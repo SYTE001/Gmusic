@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { SidebarContent } from "./Sidebar";
-import { TopBar } from "./TopBar";
+import { CloudBadge, MobileTopBar, OfflineBadge } from "./TopBar";
 import { MiniPlayer } from "./MiniPlayer";
 import { QueuePanel } from "./QueuePanel";
 import { usePlaybackStore } from "../stores/playbackStore";
@@ -15,6 +15,12 @@ const mobileNavClass = ({ isActive }: { isActive: boolean }) =>
     isActive ? "text-accent" : "text-text-secondary"
   }`;
 
+/**
+ * Two-column shell: fixed sidebar (240px) + independently scrolling main
+ * content, with the full-width player bar docked at the bottom. Below 900px
+ * the sidebar gives way to a top bar + bottom tab bar, and the player bar
+ * becomes a compact mini-player that expands to the full Now Playing view.
+ */
 export function AppShell() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -35,25 +41,29 @@ export function AppShell() {
 
       <div className="flex min-h-0 flex-1">
         {/* Desktop sidebar */}
-        <aside className="hidden w-[232px] shrink-0 flex-col border-r lg:flex" style={{ borderColor: "var(--border-subtle)" }}>
-          <Link to="/" className="flex items-center gap-2.5 px-5 py-4" aria-label={`${APP_NAME} home`}>
-            <span className="grid size-8 place-items-center rounded-lg bg-accent-strong text-accent-contrast" aria-hidden>
+        <aside className="hidden w-60 shrink-0 flex-col border-r bg-surface min-[900px]:flex" style={{ borderColor: "var(--border-subtle)" }}>
+          <Link to="/" className="flex items-center gap-2.5 px-5 pb-3 pt-5" aria-label={`${APP_NAME} home`}>
+            <span className="grid size-8 place-items-center rounded-lg bg-accent text-accent-contrast" aria-hidden>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M9 4.5v11.2a3.3 3.3 0 1 0 1.8 2.95V8.1l8-1.8v7.4a3.3 3.3 0 1 0 1.8 2.95V4z" />
               </svg>
             </span>
             <span className="text-[15px] font-semibold tracking-tight">{APP_NAME}</span>
           </Link>
-          <div className="min-h-0 flex-1">
+          <div className="flex min-h-0 flex-1 flex-col">
             <SidebarContent />
           </div>
-          <InstallHint />
+          <div className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
+            <CloudBadge compact />
+            <OfflineBadge compact />
+            <InstallHint />
+          </div>
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <TopBar onOpenSidebar={() => setDrawerOpen(true)} />
+          <MobileTopBar onOpenSidebar={() => setDrawerOpen(true)} />
           <main id="main-content" className="min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
-            <div className="mx-auto max-w-[1400px] px-4 pb-8 pt-5 md:px-7 md:pt-6 lg:pb-10">
+            <div className="mx-auto w-full max-w-[1400px] px-4 pb-8 pt-5 md:px-8 md:pt-7 lg:pb-10">
               <Outlet />
             </div>
           </main>
@@ -67,7 +77,7 @@ export function AppShell() {
       {/* Mobile bottom navigation */}
       <nav
         aria-label="Primary"
-        className="flex h-14 items-stretch border-t bg-app-bg lg:hidden"
+        className="flex h-14 min-[900px]:hidden items-stretch border-t bg-app-bg"
         style={{ borderColor: "var(--border-subtle)" }}
       >
         <NavLink to="/" className={mobileNavClass} end>
@@ -94,17 +104,17 @@ export function AppShell() {
 
       {/* Mobile navigation drawer */}
       {drawerOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden" role="dialog" aria-modal="true" aria-label="Navigation">
+        <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Navigation">
           <div className="absolute inset-0 animate-overlay-in" style={{ background: "var(--scrim)" }} onClick={() => setDrawerOpen(false)} />
-          <div className="absolute inset-y-0 left-0 w-[280px] animate-fade-in border-r bg-surface" style={{ borderColor: "var(--border-subtle)" }}>
+          <div className="absolute inset-y-0 left-0 flex w-[280px] flex-col animate-fade-in border-r bg-surface" style={{ borderColor: "var(--border-subtle)" }}>
             <div className="flex items-center justify-between px-4 py-3.5">
               <span className="text-sm font-semibold">{APP_NAME}</span>
               <button type="button" className="icon-btn size-8" aria-label="Close navigation" onClick={() => setDrawerOpen(false)}>
                 <CloseIcon size={16} />
               </button>
             </div>
-            <div className="h-[calc(100%-52px)]">
-              <SidebarContent onNavigate={() => setDrawerOpen(false)} />
+            <div className="min-h-0 flex-1">
+              <SidebarContent showSearch={false} />
             </div>
           </div>
         </div>

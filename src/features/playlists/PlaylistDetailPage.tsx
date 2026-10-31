@@ -8,6 +8,7 @@ import { Menu } from "../../components/Menu";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Modal } from "../../components/Modal";
 import { TrackRow } from "../../components/TrackRow";
+import { StickyPageHeader } from "../../components/StickyPageHeader";
 import { AddSongsToPlaylistDialog } from "./AddToPlaylistDialog";
 import {
   ChevronDownIcon,
@@ -79,20 +80,20 @@ export function PlaylistDetailPage() {
   return (
     <div className="space-y-5">
       {/* Header */}
-      <div className="flex flex-wrap items-end gap-5">
+      <div className="flex flex-wrap items-end gap-5 md:gap-6">
         <Artwork trackId={available[0]?.id ?? null} alt="" className="size-36 shadow-lg md:size-44" rounded="rounded-[var(--radius-tile)]" />
         <div className="min-w-0 flex-1">
-          <p className="text-xs uppercase tracking-wide text-text-muted">Playlist</p>
-          <h1 className="mt-0.5 truncate text-2xl font-semibold tracking-tight md:text-[32px]">{playlist.name}</h1>
-          <p className="mt-1 text-sm text-text-secondary">
+          <p className="text-xs font-semibold uppercase tracking-wider text-text-muted">Playlist</p>
+          <h1 className="mt-1.5 break-words text-[clamp(1.9rem,4.5vw,3rem)] font-bold leading-tight tracking-tight">{playlist.name}</h1>
+          <p className="mt-2 text-sm text-text-secondary">
             {available.length} song{available.length === 1 ? "" : "s"}
             {missingCount > 0 && <span className="text-danger"> · {missingCount} unavailable</span>}
             {available.length > 0 && ` · ${formatDurationLong(totalDurationMs)}`}
           </p>
-          <div className="mt-3 flex flex-wrap items-center gap-2">
+          <div className="mt-4 flex flex-wrap items-center gap-2">
             <button
               type="button"
-              className="inline-flex items-center gap-2 rounded-full bg-accent-strong px-5 py-2.5 text-sm font-medium text-accent-contrast transition-transform hover:scale-[1.03] disabled:opacity-40"
+              className="inline-flex items-center gap-2 rounded-full bg-accent px-6 py-2.5 text-sm font-semibold text-accent-contrast transition-transform hover:scale-[1.03] disabled:opacity-40"
               onClick={() => playAll(false)}
               disabled={available.length === 0}
             >
@@ -101,8 +102,9 @@ export function PlaylistDetailPage() {
             </button>
             <button
               type="button"
-              className="icon-btn border"
-              style={{ borderColor: "var(--border-subtle)" }}
+              className="icon-btn size-11 rounded-full border"
+              title="Shuffle play playlist"
+              style={{ borderColor: "var(--border-strong)" }}
               aria-label="Shuffle play playlist"
               onClick={() => playAll(true)}
               disabled={available.length === 0}
@@ -111,8 +113,9 @@ export function PlaylistDetailPage() {
             </button>
             <button
               type="button"
-              className="icon-btn border"
-              style={{ borderColor: "var(--border-subtle)" }}
+              className="icon-btn size-11 rounded-full border"
+              title="Add songs to this playlist"
+              style={{ borderColor: "var(--border-strong)" }}
               aria-label="Add songs to this playlist"
               onClick={() => setAddToPlaylistOpen(true)}
             >
@@ -143,6 +146,21 @@ export function PlaylistDetailPage() {
         </div>
       </div>
 
+      {/* Compact strip once the header scrolls away */}
+      <StickyPageHeader>
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold">{playlist.name}</span>
+        <button
+          type="button"
+          className="icon-btn size-9 rounded-full bg-accent text-accent-contrast hover:scale-105"
+          style={{ transition: "transform 100ms ease" }}
+          aria-label="Play playlist"
+          onClick={() => playAll(false)}
+          disabled={available.length === 0}
+        >
+          <PlayIcon size={15} />
+        </button>
+      </StickyPageHeader>
+
       {/* Tracks with drag reorder + keyboard alternative */}
       {available.length === 0 && missingCount === 0 ? (
         <EmptyState
@@ -156,7 +174,7 @@ export function PlaylistDetailPage() {
           }
         />
       ) : (
-        <div className="space-y-0.5">
+        <div role="list" aria-label={`Songs in ${playlist.name}`} className="space-y-0.5">
           {resolved.map((track, index) =>
             track ? (
               <PlaylistTrackRow
@@ -186,6 +204,7 @@ export function PlaylistDetailPage() {
               />
             ) : (
               <div
+                role="listitem"
                 key={`missing-${index}`}
                 className="flex h-14 items-center gap-3 rounded-lg px-3 text-sm text-text-muted"
                 style={{ background: "color-mix(in srgb, var(--danger) 6%, transparent)" }}
@@ -301,6 +320,7 @@ function PlaylistTrackRow({
 }) {
   return (
     <div
+      role="presentation"
       draggable
       onDragStart={onDragStart}
       onDragOver={onDragOverItem}

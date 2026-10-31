@@ -38,9 +38,9 @@ export function RecentPage() {
         />
       ) : (
         <>
-          <div className="space-y-0.5">
+          <div role="list" aria-label="Recently played songs" className="space-y-0.5">
             {visible.map((track, index) => (
-              <div key={track.id} className="flex items-center gap-3">
+              <div key={track.id} role="presentation" className="flex items-center gap-3">
                 <div className="min-w-0 flex-1">
                   <TrackRow
                     track={track}

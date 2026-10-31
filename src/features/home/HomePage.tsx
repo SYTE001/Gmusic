@@ -3,7 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { ArtworkCard } from "../../components/ArtworkCard";
-import { LibraryEmptyState } from "../library/ImportMusic";
+import { LibraryEmptyState, ImportMusicButtons } from "../library/ImportMusic";
 import { HeartIcon, MusicNoteIcon } from "../../components/Icons";
 import { greetingForNow } from "../../utils/misc";
 import { Link } from "react-router-dom";
@@ -11,6 +11,8 @@ import { Link } from "react-router-dom";
 /**
  * Home (PRD §7.2): greeting, Liked Songs tile, Recently Played, Your
  * Playlists, Recently Added — all from real local data, never fabricated.
+ * Import stays in the header so the primary action is reachable here
+ * without opening Settings.
  */
 export function HomePage() {
   const navigate = useNavigate();
@@ -32,7 +34,7 @@ export function HomePage() {
   if (tracks.length === 0) {
     return (
       <div className="space-y-6">
-        <h1 className="text-2xl font-semibold tracking-tight">{greetingForNow()}</h1>
+        <h1 className="text-2xl font-semibold tracking-tight md:text-[28px]">{greetingForNow()}</h1>
         <LibraryEmptyState />
       </div>
     );
@@ -44,8 +46,9 @@ export function HomePage() {
 
   return (
     <div className="space-y-9">
-      <div className="flex items-end justify-between gap-4">
+      <div className="flex flex-wrap items-end justify-between gap-4">
         <h1 className="text-2xl font-semibold tracking-tight md:text-[28px]">{greetingForNow()}</h1>
+        <ImportMusicButtons />
       </div>
 
       {/* Feature tiles */}
@@ -53,9 +56,9 @@ export function HomePage() {
         <Link
           to="/liked"
           className="group relative flex items-center gap-4 overflow-hidden rounded-[var(--radius-tile)] border p-4 transition-colors hover:bg-surface-hover"
-          style={{ borderColor: "var(--border-subtle)", background: "linear-gradient(135deg, color-mix(in srgb, var(--accent-strong) 22%, var(--surface)), var(--surface))" }}
+          style={{ borderColor: "var(--border-subtle)" }}
         >
-          <span className="grid size-14 shrink-0 place-items-center rounded-xl text-accent-contrast" style={{ background: "var(--accent-strong)" }} aria-hidden>
+          <span className="grid size-14 shrink-0 place-items-center rounded-xl bg-accent text-accent-contrast" aria-hidden>
             <HeartIcon size={24} filled />
           </span>
           <span>

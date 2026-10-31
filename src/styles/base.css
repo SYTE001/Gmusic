@@ -9,42 +9,46 @@
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
-  --bg: #090b12;
-  --surface: #111522;
-  --surface-raised: #191f2d;
-  --surface-hover: #232b3d;
-  --text-primary: #f4f6fb;
-  --text-secondary: #a4acbd;
-  --text-muted: #70798d;
-  --border-subtle: rgba(255, 255, 255, 0.08);
+  /* Neutral surfaces (no blue cast): main canvas is darkest, sidebar and
+     panels sit a step above it. One accent drives the five accent moments:
+     active nav indicator, play button, current-track highlight, progress
+     fill, liked heart. Swap the palette here only — never in components. */
+  --bg: #0f1012;
+  --surface: #141518;
+  --surface-raised: #1c1e22;
+  --surface-hover: #24262b;
+  --text-primary: #f5f6f7;
+  --text-secondary: #a6aab1;
+  --text-muted: #71757d;
+  --border-subtle: rgba(255, 255, 255, 0.07);
   --border-strong: rgba(255, 255, 255, 0.16);
-  --accent: #8da8ff;
-  --accent-strong: #6285ff;
-  --accent-contrast: #0b1020;
-  --success: #74d6b0;
-  --danger: #ff737d;
+  --accent: #2bd46b;
+  --accent-strong: #24bd5e;
+  --accent-contrast: #06180c;
+  --success: #4cc2a5;
+  --danger: #ff6b70;
   --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.55);
-  --scrim: rgba(4, 6, 12, 0.66);
+  --scrim: rgba(5, 6, 8, 0.66);
 }
 
 [data-theme="light"] {
   color-scheme: light;
-  --bg: #f5f6fa;
+  --bg: #f4f5f6;
   --surface: #ffffff;
   --surface-raised: #ffffff;
-  --surface-hover: #eceef5;
-  --text-primary: #171b26;
-  --text-secondary: #434c5e;
-  --text-muted: #5d667c;
-  --border-subtle: rgba(15, 20, 35, 0.1);
-  --border-strong: rgba(15, 20, 35, 0.22);
-  --accent: #4a6df0;
-  --accent-strong: #3556e0;
+  --surface-hover: #e8eaec;
+  --text-primary: #1a1c20;
+  --text-secondary: #4a4e56;
+  --text-muted: #6a6e76;
+  --border-subtle: rgba(15, 18, 22, 0.1);
+  --border-strong: rgba(15, 18, 22, 0.22);
+  --accent: #0e8a4d;
+  --accent-strong: #0c7a44;
   --accent-contrast: #ffffff;
   --success: #1d8f66;
   --danger: #d2454f;
-  --shadow-overlay: 0 16px 40px rgba(20, 26, 44, 0.18);
-  --scrim: rgba(240, 242, 248, 0.7);
+  --shadow-overlay: 0 16px 40px rgba(20, 24, 30, 0.18);
+  --scrim: rgba(240, 242, 244, 0.7);
 }
 
 @theme inline {
@@ -250,4 +254,98 @@ input[type="range"].app-range::-moz-range-thumb {
 }
 .animate-overlay-in {
   animation: overlay-in 160ms ease both;
+}
+
+/* Queue/lyrics panel slide (motion carries meaning: the panel's origin).
+   Registered as Tailwind theme animations so breakpoint variants
+   (md:animate-panel-right) apply on the responsive drawer. */
+@theme {
+  --animate-panel-right: panel-right 200ms ease both;
+  --animate-panel-up: panel-up 200ms ease both;
+
+  @keyframes panel-right {
+    from {
+      transform: translateX(100%);
+    }
+    to {
+      transform: none;
+    }
+  }
+  @keyframes panel-up {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: none;
+    }
+  }
+}
+
+/* Animated equalizer for the currently playing row. Bars freeze (animation
+   paused) when playback is paused so the state is never falsely animated. */
+.eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+}
+.eq i {
+  width: 3px;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--accent);
+  transform-origin: bottom;
+  animation: eq-bounce 1s ease-in-out infinite;
+}
+.eq i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+.eq i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+.eq[data-playing="false"] i {
+  animation-play-state: paused;
+  transform: scaleY(0.35);
+}
+@keyframes eq-bounce {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+  }
+  35% {
+    transform: scaleY(1);
+  }
+  65% {
+    transform: scaleY(0.55);
+  }
+}
+
+/* Active nav indicator: left accent bar + stronger text weight (set in Sidebar) */
+.nav-item[aria-current="page"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 50%;
+  translate: 0 -50%;
+  width: 3px;
+  height: 18px;
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+/* Keyboard-hint chip shown inside the sidebar search field */
+.kbd-hint {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.35rem;
+  height: 1.35rem;
+  padding: 0 0.3rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  font-size: 10.5px;
+  line-height: 1;
+  color: var(--text-muted);
+  background: var(--surface-raised);
+  flex: none;
 }
