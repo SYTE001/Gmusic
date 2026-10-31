@@ -1,6 +1,8 @@
+import { useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
+import { toast } from "../stores/toastStore";
 import { Artwork } from "./Artwork";
 import { SeekBar } from "./SeekBar";
 import {
@@ -29,6 +31,7 @@ import {
  */
 export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => void; queueOpen: boolean }) {
   const navigate = useNavigate();
+  const locateInputRef = useRef<HTMLInputElement>(null);
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const isBuffering = usePlaybackStore((state) => state.isBuffering);
@@ -68,13 +71,37 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
             </button>
           )}
           {error?.action === "relink" && (
-            <button
-              type="button"
-              className="shrink-0 underline underline-offset-2"
-              onClick={() => navigate("/library")}
-            >
-              Open Library to re-link
-            </button>
+            <>
+              {/* Direct recovery: pick the moved/renamed file right here — no
+                  detour through the Library — and re-attempt playback. */}
+              <input
+                ref={locateInputRef}
+                type="file"
+                accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac,.opus"
+                className="hidden"
+                aria-hidden
+                tabIndex={-1}
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  event.target.value = "";
+                  if (!file || !currentTrackId) return;
+                  void useLibraryStore
+                    .getState()
+                    .relinkTrack(currentTrackId, file)
+                    .then(() => {
+                      usePlaybackStore.getState().play(); // status is "error", so play() re-resolves the source
+                    })
+                    .catch(() => toast("error", "The file could not be linked. Try again from the song's ⋯ menu."));
+                }}
+              />
+              <button
+                type="button"
+                className="shrink-0 font-medium underline underline-offset-2"
+                onClick={() => locateInputRef.current?.click()}
+              >
+                Locate file…
+              </button>
+            </>
           )}
         </div>
       )}

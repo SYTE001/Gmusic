@@ -94,9 +94,20 @@ function releaseActiveUrl(): void {
 /**
  * Resolves a track into a playable object URL. Only one URL is kept alive at a
  * time; switching tracks revokes the previous one (rules §12: release object URLs).
+ *
+ * The chain is a safe fallback, not a strict ladder: a broken File System
+ * Access handle (file moved, renamed, or deleted) never masks a stored copy
+ * or the cloud copy, and a pending handle permission never blocks a copy
+ * that can play without any permission at all.
  */
 export async function resolveTrackSource(track: Track): Promise<ResolvedSource> {
+  // 1. Best local source: a granted File System Access handle. A broken
+  //    granted handle (file moved, renamed, or deleted) falls through to the
+  //    remaining sources instead of declaring the track missing; an
+  //    *ungranted* handle is remembered for the permission-required step
+  //    below, after the permission-free sources had their chance.
   const handle = await repository.getHandle(track.id);
+  let ungrantedPermission: "prompt" | "denied" | null = null;
   if (handle) {
     const permission = await queryHandlePermission(handle);
     if (permission === "granted") {
@@ -107,23 +118,15 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
         activeUrl = { url, release: () => URL.revokeObjectURL(url) };
         return { ok: true, url, release: releaseActiveUrl };
       } catch {
-        return {
-          ok: false,
-          reason: "missing",
-          detail: "The file could not be opened. It may have been moved, renamed, or deleted.",
-        };
+        // The handle is stale. Keep going: a stored copy or the cloud copy
+        // may still be playable.
       }
+    } else {
+      ungrantedPermission = permission;
     }
-    return {
-      ok: false,
-      reason: "permission-required",
-      detail:
-        permission === "denied"
-          ? "File access was denied. Grant access again or re-link the file."
-          : "This app needs permission to read the file again after reopening.",
-    };
   }
 
+  // 2. Audio bytes stored in IndexedDB.
   const storedBlob = await repository.getAudioBlob(track.id);
   if (storedBlob) {
     releaseActiveUrl();
@@ -132,6 +135,7 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
     return { ok: true, url, release: releaseActiveUrl };
   }
 
+  // 3. Transient file borrowed for this session.
   const sessionFile = sessionFiles.get(track.id);
   if (sessionFile) {
     releaseActiveUrl();
@@ -140,8 +144,22 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
     return { ok: true, url, release: releaseActiveUrl };
   }
 
-  // No local copy anywhere. Fall back to the cloud copy, which is a signed
-  // URL the Worker mints per object — it is never a persisted Track field.
+  // 4. No local bytes anywhere. A pending or denied handle permission is the
+  //    local-first recovery path — one click re-grants the real file — and
+  //    stays preferable to silently streaming the cloud copy.
+  if (handle && ungrantedPermission) {
+    return {
+      ok: false,
+      reason: "permission-required",
+      detail:
+        ungrantedPermission === "denied"
+          ? "File access was denied. Grant access again or re-link the file."
+          : "This app needs permission to read the file again after reopening.",
+    };
+  }
+
+  // 5. Cloud copy: a signed URL the Worker mints per object — never a
+  //    persisted Track field.
   if (track.objectKey) {
     if (deviceIsOffline()) {
       return {
@@ -179,8 +197,9 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
 
 /**
  * Re-validates access to every persisted track at startup and updates
- * availability. Handle tracks fall back to "permission-required" when the
- * permission prompt is pending; stored copies stay available.
+ * availability. Statuses stay accurate when several sources coexist: a
+ * pending or denied handle permission, or even a gone handle record, does
+ * not make a track unplayable while a stored copy (or session file) exists.
  */
 export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Track["availability"]>> {
   const updates = new Map<string, Track["availability"]>();
@@ -192,15 +211,20 @@ export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Tra
       continue;
     }
     if (track.accessMode === "handle") {
+      // getAudioBlob resolves to undefined when nothing is stored — keep the
+      // check truthy, never a null comparison.
+      const storedCopy = await repository.getAudioBlob(track.id);
+      const playableWithoutHandle = Boolean(storedCopy) || sessionFiles.has(track.id);
       const handle = await repository.getHandle(track.id);
-      if (!handle) {
-        updates.set(track.id, "missing");
+      if (handle) {
+        const permission = await queryHandlePermission(handle);
+        if (permission === "granted") updates.set(track.id, "available");
+        // Not granted — but a stored copy plays without any permission.
+        else updates.set(track.id, playableWithoutHandle ? "available" : "permission-required");
         continue;
       }
-      const permission = await queryHandlePermission(handle);
-      if (permission === "granted") updates.set(track.id, "available");
-      else if (permission === "denied") updates.set(track.id, "permission-required");
-      else updates.set(track.id, "permission-required");
+      // Handle record gone: the stored copy or session file still plays.
+      updates.set(track.id, playableWithoutHandle ? "available" : "missing");
       continue;
     }
     if (track.accessMode === "stored-copy") {
@@ -208,8 +232,18 @@ export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Tra
       updates.set(track.id, blob ? "available" : "missing");
       continue;
     }
-    // session-only tracks cannot survive a reload
-    updates.set(track.id, sessionFiles.has(track.id) ? "available" : (track.objectKey ? "offline" : "missing"));
+    // session-only tracks cannot survive a reload; the cloud copy decides
+    // what is honest: playable online, offline while disconnected.
+    updates.set(
+      track.id,
+      sessionFiles.has(track.id)
+        ? "available"
+        : track.objectKey
+          ? deviceIsOffline()
+            ? "offline"
+            : "available"
+          : "missing",
+    );
   }
   return updates;
 }

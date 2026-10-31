@@ -346,6 +346,11 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const engine = get().getEngine();
     engine.setSource(resolved.url);
 
+    // A successful resolution is the ground truth for availability: if an
+    // earlier attempt (or a stale startup check) marked the track missing or
+    // permission-required but a fallback source just played, heal the badge.
+    void playbackHelpers.markTrackAvailability(track.id, "available");
+
     void playbackHelpers.notifyTrackStarted(trackId);
 
     if (autoplay) {
@@ -660,7 +665,10 @@ const playbackHelpers: {
   getTrackForPlayback: (id: string) => Promise<Track | undefined>;
   currentTrack: () => Track | undefined;
   notifyTrackStarted: (trackId: string) => Promise<void>;
-  markTrackAvailability: (trackId: string, availability: "permission-required" | "missing" | "offline") => Promise<void>;
+  markTrackAvailability: (
+    trackId: string,
+    availability: "available" | "permission-required" | "missing" | "offline",
+  ) => Promise<void>;
   persistPrefs: () => void;
   persistPosition: () => void;
   resolveSource: typeof resolveTrackSource;

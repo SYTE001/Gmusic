@@ -127,7 +127,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       },
       markTrackAvailability: async (trackId, availability) => {
         const tracks = get().tracks;
-        if (!tracks.some((track) => track.id === trackId)) return;
+        const current = tracks.find((track) => track.id === trackId);
+        if (!current) return;
+        if (current.availability === availability) return; // nothing to mark or heal
         await repository.updateTrack(trackId, { availability });
         set({ tracks: tracks.map((track) => (track.id === trackId ? { ...track, availability } : track)) });
       },

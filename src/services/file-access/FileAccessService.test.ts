@@ -32,6 +32,24 @@ vi.mock("../cloud/r2StorageService", () => ({
   invalidatePlayUrl: () => undefined,
 }));
 
+/**
+ * File System Access handles are platform objects that cannot be built
+ * directly in tests, so handle-backed paths spy on the repository accessor
+ * with a minimal stand-in instead of persisting a real handle.
+ */
+function stubHandle(permission: "granted" | "prompt" | "denied", getFile: () => Promise<File>): FileSystemFileHandle {
+  return {
+    queryPermission: async () => permission,
+    getFile,
+  } as unknown as FileSystemFileHandle;
+}
+
+function brokenHandle(permission: "granted" | "prompt" | "denied"): FileSystemFileHandle {
+  return stubHandle(permission, async () => {
+    throw new DOMException("The file could not be found.", "NotFoundError");
+  });
+}
+
 function makeTrack(overrides: Partial<Track> = {}): Track {
   return {
     id: `t-${Math.random().toString(36).slice(2, 8)}`,
@@ -149,10 +167,74 @@ describe("resolution order (local first, cloud as fallback)", () => {
   });
 });
 
+describe("broken handle fallback (a stale handle never masks a playable copy)", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    playUrls.keyToUrl.clear();
+    playUrls.refreshCount = 0;
+    playUrls.failFor = null;
+    setOnline(true);
+    vi.restoreAllMocks();
+  });
+
+  it("plays from the stored copy when the granted handle's file is gone", async () => {
+    const track = makeTrack({ id: "stale-handle", accessMode: "handle" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(8)], { type: "audio/mpeg" }));
+    vi.spyOn(repository, "getHandle").mockResolvedValue(brokenHandle("granted"));
+
+    const resolved = await resolveTrackSource(track);
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) expect(resolved.url).toContain("blob:");
+  });
+
+  it("plays from the cloud when the handle's file is gone and nothing is stored", async () => {
+    const track = makeTrack({
+      id: "stale-handle-cloud",
+      accessMode: "handle",
+      objectKey: "users/u-1/tracks/stale-handle-cloud/audio.mp3",
+      cloudStatus: "ready",
+    });
+    await repository.putTracks([track]);
+    playUrls.keyToUrl.set(track.objectKey!, "https://r2/get?sig=b");
+    vi.spyOn(repository, "getHandle").mockResolvedValue(brokenHandle("granted"));
+
+    const resolved = await resolveTrackSource(track);
+    expect(resolved.ok).toBe(true);
+    if (resolved.ok) {
+      expect(resolved.url).toBe("https://r2/get?sig=b");
+      expect(playUrls.refreshCount).toBe(1);
+    }
+  });
+
+  it("plays the stored copy without any permission when the handle is not granted", async () => {
+    const track = makeTrack({ id: "prompt-handle", accessMode: "handle" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(8)]));
+    vi.spyOn(repository, "getHandle").mockResolvedValue(stubHandle("prompt", async () => new File([new Uint8Array(4)], "song.mp3")));
+
+    const resolved = await resolveTrackSource(track);
+    expect(resolved.ok).toBe(true);
+  });
+
+  it("still reports permission-required when the handle is ungranted and no other copy exists", async () => {
+    const track = makeTrack({ id: "prompt-only", accessMode: "handle" });
+    vi.spyOn(repository, "getHandle").mockResolvedValue(stubHandle("prompt", async () => new File([new Uint8Array(4)], "song.mp3")));
+
+    const resolved = await resolveTrackSource(track);
+    expect(resolved.ok).toBe(false);
+    if (!resolved.ok) {
+      expect(resolved.reason).toBe("permission-required");
+      expect(resolved.detail).toMatch(/permission|access/i);
+    }
+  });
+});
+
 describe("availability revalidation", () => {
   beforeEach(async () => {
     await repository.clearAllData();
     setOnline(true);
+    vi.restoreAllMocks();
   });
 
   it("marks a cloud-only track available while online, offline while offline", async () => {
@@ -193,5 +275,48 @@ describe("availability revalidation", () => {
     setOnline(false);
     const updates = await revalidateAccess([track]);
     expect(updates.get(track.id)).toBe("available");
+  });
+
+  it("keeps a handle track playable from its stored copy despite a pending permission", async () => {
+    const track = makeTrack({ id: "revalidate-prompt", accessMode: "handle" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(4)]));
+    vi.spyOn(repository, "getHandle").mockResolvedValue(stubHandle("prompt", async () => new File([new Uint8Array(4)], "song.mp3")));
+
+    const updates = await revalidateAccess([track]);
+    expect(updates.get(track.id)).toBe("available");
+  });
+
+  it("keeps reporting permission-required when the ungranted handle is the only source", async () => {
+    const track = makeTrack({ id: "revalidate-prompt-only", accessMode: "handle" });
+    vi.spyOn(repository, "getHandle").mockResolvedValue(stubHandle("prompt", async () => new File([new Uint8Array(4)], "song.mp3")));
+
+    const updates = await revalidateAccess([track]);
+    expect(updates.get(track.id)).toBe("permission-required");
+  });
+
+  it("marks a gone handle record available when a stored copy can still play", async () => {
+    const track = makeTrack({ id: "revalidate-gone-handle", accessMode: "handle" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(4)]));
+
+    const updates = await revalidateAccess([track]);
+    expect(updates.get(track.id)).toBe("available");
+  });
+
+  it("treats a session-only track's cloud copy by connectivity after a reload", async () => {
+    const track = makeTrack({
+      id: "session-cloud",
+      accessMode: "session-only",
+      objectKey: "users/u-1/tracks/session-cloud/audio.mp3",
+      cloudStatus: "ready",
+    });
+
+    const online = await revalidateAccess([track]);
+    expect(online.get(track.id)).toBe("available");
+
+    setOnline(false);
+    const offline = await revalidateAccess([track]);
+    expect(offline.get(track.id)).toBe("offline");
   });
 });
