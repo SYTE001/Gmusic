@@ -92,9 +92,101 @@ function requireClient() {
   return supabase;
 }
 
+/**
+ * The Supabase client returns `error` as a PLAIN OBJECT (not an Error) on the
+ * normal `{ data, error }` path, so `String(error)` renders "[object Object]"
+ * and the real database cause is lost. PostgREST errors carry `message`,
+ * `code`, `details`, and `hint`; this pulls whatever exists.
+ *
+ * `describeDatabaseError` is the concise, UI-safe form (what happened plus the
+ * stable code); `describeDatabaseErrorDetailed` adds `details`/`hint`, which
+ * the PostgREST docs themselves call the most useful field but which can carry
+ * raw SQL, so it is reserved for developer logs.
+ */
+export function describeDatabaseError(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+  if (typeof error === "object" && error !== null) {
+    const fields = error as Record<string, unknown>;
+    const message = typeof fields.message === "string" ? fields.message.trim() : "";
+    if (message) {
+      const code = typeof fields.code === "string" ? fields.code.trim() : "";
+      return code ? `${message} (code ${code})` : message;
+    }
+    // No message at all: code, then details/hint, are the only signal left.
+    const code = typeof fields.code === "string" ? fields.code.trim() : "";
+    if (code) return code;
+    for (const field of ["details", "hint"] as const) {
+      const value = typeof fields[field] === "string" ? (fields[field] as string).trim() : "";
+      if (value) return value;
+    }
+  }
+  if (error === null) return "null";
+  if (error === undefined) return "undefined";
+  return String(error);
+}
+
+export function describeDatabaseErrorDetailed(error: unknown): string {
+  if (typeof error !== "object" || error === null || error instanceof Error) {
+    return describeDatabaseError(error);
+  }
+  const fields = error as Record<string, unknown>;
+  const hint = typeof fields.hint === "string" ? fields.hint.trim() : "";
+  const details = typeof fields.details === "string" ? fields.details.trim() : "";
+  const base = describeDatabaseError(error);
+  if (!hint && !details) return base;
+  return `${base} — ${hint || details}`;
+}
+
+/**
+ * Text written to Postgres must be encodable as UTF-8 and may not contain NUL.
+ * Lone surrogates and raw NUL bytes arrive from corrupted tag frames and
+ * mis-decoded filenames; Postgres rejects the whole row for them. Valid text
+ * passes through byte-for-byte — this never rewrites a real filename, it only
+ * drops sequences that cannot be stored at all.
+ */
+export function sanitizeTextForDatabase(value: string): string {
+  let result = "";
+  let index = 0;
+  while (index < value.length) {
+    const code = value.charCodeAt(index);
+    if (code === 0) {
+      index += 1; // Postgres text cannot hold a NUL
+      continue;
+    }
+    const isHighSurrogate = code >= 0xd800 && code <= 0xdbff;
+    if (isHighSurrogate || (code >= 0xdc00 && code <= 0xdfff)) {
+      const next = value.charCodeAt(index + 1);
+      if (isHighSurrogate && next >= 0xdc00 && next <= 0xdfff) {
+        result += value.slice(index, index + 2); // a complete pair: a real character
+        index += 2;
+        continue;
+      }
+      index += 1; // lone surrogate half: not encodable as UTF-8
+      continue;
+    }
+    result += value.charAt(index);
+    index += 1;
+  }
+  return result;
+}
+
+/** Postgres `integer` columns reject anything outside int4; a corrupt tag frame can exceed it. */
+const INT4_MIN = -2147483648;
+const INT4_MAX = 2147483647;
+
+export function sanitizeInt4(value: number | null | undefined): number | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) return null;
+  const truncated = Math.trunc(value);
+  if (!Number.isSafeInteger(truncated) || truncated < INT4_MIN || truncated > INT4_MAX) return null;
+  return truncated;
+}
+
 async function denyOnAuthError(error: unknown, context: string): Promise<never> {
-  const message = error instanceof Error ? error.message : String(error);
-  throw new CloudLibraryError(`${context}: ${message}`);
+  // Developer log keeps the full object (message, code, details, hint) exactly
+  // as the PostgREST documentation asks; the thrown message stays concise.
+  console.error(`[cloudLibraryService] ${context}:`, error, describeDatabaseErrorDetailed(error));
+  throw new CloudLibraryError(`${context}: ${describeDatabaseError(error)}`);
 }
 
 function toIso(value: number | null | undefined): string | null {
@@ -113,15 +205,15 @@ export function trackToRow(track: Track, userId = ""): CloudTrackRow {
     user_id: userId,
     object_key: track.objectKey ?? null,
     artwork_object_key: track.artworkObjectKey ?? null,
-    title: track.title,
-    artist: track.artist,
-    album: track.album,
-    track_number: track.trackNumber,
-    album_track_count: track.albumTrackCount,
+    title: sanitizeTextForDatabase(track.title),
+    artist: sanitizeTextForDatabase(track.artist),
+    album: sanitizeTextForDatabase(track.album),
+    track_number: sanitizeInt4(track.trackNumber),
+    album_track_count: sanitizeInt4(track.albumTrackCount),
     duration_ms: track.durationMs,
-    file_name: track.fileName,
+    file_name: sanitizeTextForDatabase(track.fileName),
     file_size: track.fileSize,
-    mime_type: track.mimeType,
+    mime_type: sanitizeTextForDatabase(track.mimeType),
     fingerprint: track.fingerprint,
     metadata_from_filename: track.metadataFromFilename,
     is_liked: track.isLiked,

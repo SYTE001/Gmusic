@@ -46,7 +46,7 @@ export function App() {
   const startedRef = useRef(false);
 
   useEffect(() => {
-    if (startedRef.current) return; // React StrictMode double-invocation guard
+    if (startedRef.current) return; // one-time async init only; listeners live in their own effect
     startedRef.current = true;
 
     void useSettingsStore
@@ -67,7 +67,13 @@ export function App() {
       });
 
     registerServiceWorker();
+  }, []);
 
+  // Session listeners: subscribe/cleanup must stay symmetric so React
+  // StrictMode's dev double-invocation (mount → cleanup → mount) always ends
+  // with live subscriptions. A run-once guard here would leave the app with
+  // no lyrics prefetch, no drift watchdog, and no wake resync.
+  useEffect(() => {
     // Auto-discover lyrics when a track starts (respects the settings toggle;
     // never blocks playback — resolution is fully backgrounded).
     const stopLyricsPrefetch = startLyricsPrefetch();

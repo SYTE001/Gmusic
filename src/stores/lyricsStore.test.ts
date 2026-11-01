@@ -44,9 +44,11 @@ function makeTrack(id: string): Track {
 function candidate(id: number): RankedCandidate {
   return {
     record: { id, trackName: "x", artistName: "y", albumName: null, duration: 100, instrumental: false, hasWordSync: false, plainLyrics: "p", syncedLyrics: "[00:01.00]x", lyricsfile: null } as LrclibRecord,
-    quality: { score: 60, titleSimilarity: 0.9, artistSimilarity: 0.5, albumSimilarity: null, durationDeltaSeconds: 0, rejected: false },
+    quality: { score: 60, titleSimilarity: 0.9, artistSimilarity: 0.5, albumSimilarity: null, durationDeltaSeconds: 0, versionMismatch: false, rejected: false },
+    capability: "line",
     hasSynced: true,
     hasPlain: true,
+    autoAcceptable: false,
   };
 }
 
@@ -120,5 +122,33 @@ describe("lyricsStore race protection", () => {
     await useLyricsStore.getState().resolveForTrack(makeTrack("a"));
     expect(useLyricsStore.getState().status).toBe("error");
     expect(useLyricsStore.getState().errorMessage).toContain("busy");
+  });
+
+  it("does not re-resolve on its own after an error (no check/error loop)", async () => {
+    resolveMock.mockResolvedValue({ outcome: "error", message: "The lyrics service is busy." });
+    const track = makeTrack("a");
+    await useLyricsStore.getState().resolveForTrack(track);
+    expect(useLyricsStore.getState().status).toBe("error");
+    // The view calls resolveForTrack on every status change; a failed lookup
+    // must stay terminal instead of hammering the provider forever.
+    await useLyricsStore.getState().resolveForTrack(track);
+    await useLyricsStore.getState().resolveForTrack(track);
+    expect(resolveMock).toHaveBeenCalledTimes(1);
+    // Recovery is user-initiated and always queries.
+    resolveMock.mockResolvedValue({ outcome: "cached", lyrics: { trackId: "a", format: "txt", lines: [], offsetMs: 0, updatedAt: 0, skippedLines: 0, sourceName: "" } });
+    await useLyricsStore.getState().retry(track);
+    expect(resolveMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("updates resolution phases during discovery", async () => {
+    resolveMock.mockImplementation(async (_track, options) => {
+      options?.onProgress?.("identifying");
+      options?.onProgress?.("searching");
+      options?.onProgress?.("validating");
+      return { outcome: "attached", lyrics: { trackId: "a", format: "lrc", lines: [], offsetMs: 0, updatedAt: 0, skippedLines: 0, sourceName: "" } };
+    });
+    const track = makeTrack("a");
+    await useLyricsStore.getState().resolveForTrack(track);
+    expect(useLyricsStore.getState().phase).toBe("ready");
   });
 });

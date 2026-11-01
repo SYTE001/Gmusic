@@ -80,7 +80,7 @@ export const TrackRow = memo(function TrackRow({
     <>
       <div
         role="listitem"
-        className={`group grid h-14 cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 transition-colors hover:bg-surface-hover sm:gap-3 sm:px-3 ${
+        className={`group grid h-14 cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-lg px-2 transition-colors hover:bg-surface-hover sm:gap-3 sm:px-3 [content-visibility:auto] [contain-intrinsic-size:auto_3.5rem] ${
           isCurrent ? "bg-surface-raised" : ""
         }`}
         onClick={play}

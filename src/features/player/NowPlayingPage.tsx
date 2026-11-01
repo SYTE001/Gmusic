@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
-import { Artwork, getArtworkUrl, useArtworkUrl } from "../../components/Artwork";
+import { Artwork } from "../../components/Artwork";
 import { SeekBar } from "../../components/SeekBar";
+import LyricsAmbientBackground from "../lyrics/LyricsAmbientBackground";
 import { LyricsView } from "../lyrics/LyricsView";
 import {
   CloseIcon,
@@ -18,149 +19,9 @@ import {
   ShuffleIcon,
 } from "../../components/Icons";
 
-function checkReducedMotion(): boolean {
-  if (typeof window === "undefined") return false;
-  const override = document.documentElement.dataset.motion;
-  return override === "on" || (override !== "off" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-}
-
-/**
- * Zero-overhead hardware-accelerated blurred artwork background.
- * Draws the blurred artwork once onto a 200x200 canvas at track start (2-7ms),
- * completely eliminating live CSS blur filters (filter: none) from the GPU pipeline
- * during lyrics scrolling and music playback.
- */
-function BlurredCanvasBackdrop({
-  artworkUrl,
-  reducedMotion,
-}: {
-  artworkUrl: string | undefined;
-  reducedMotion: boolean;
-}) {
-  const currentCanvasRef = useRef<HTMLCanvasElement>(null);
-  const prevCanvasRef = useRef<HTMLCanvasElement>(null);
-  const [hasArtwork, setHasArtwork] = useState(() => Boolean(artworkUrl));
-  const [isCrossfading, setIsCrossfading] = useState(false);
-  const currentUrlRef = useRef<string | undefined>(undefined);
-
-  useEffect(() => {
-    if (artworkUrl === currentUrlRef.current) return;
-    const oldUrl = currentUrlRef.current;
-    currentUrlRef.current = artworkUrl;
-
-    if (!artworkUrl) {
-      if (oldUrl && !reducedMotion) {
-        setIsCrossfading(true);
-        const timer = setTimeout(() => {
-          setIsCrossfading(false);
-          setHasArtwork(false);
-        }, 500);
-        return () => clearTimeout(timer);
-      }
-      setHasArtwork(false);
-      return;
-    }
-
-    let cancelled = false;
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.src = artworkUrl;
-
-    const renderBlur = () => {
-      if (cancelled) return;
-      const curr = currentCanvasRef.current;
-      const prev = prevCanvasRef.current;
-      if (!curr) return;
-
-      // Copy curr -> prev before drawing new artwork to achieve seamless crossfade
-      if (oldUrl && !reducedMotion && prev) {
-        const pCtx = prev.getContext("2d");
-        if (pCtx) {
-          pCtx.clearRect(0, 0, prev.width, prev.height);
-          pCtx.drawImage(curr, 0, 0);
-        }
-      }
-
-      // Draw blurred artwork + dark overlay into current canvas once (ZERO runtime CSS filter on GPU!)
-      const cCtx = curr.getContext("2d");
-      if (cCtx) {
-        cCtx.filter = "none";
-        cCtx.fillStyle = "#090b12";
-        cCtx.fillRect(0, 0, curr.width, curr.height);
-        cCtx.filter = "blur(14px) brightness(0.75)";
-        cCtx.drawImage(img, -16, -16, curr.width + 32, curr.height + 32);
-        cCtx.filter = "none";
-        cCtx.fillStyle = "rgba(0, 0, 0, 0.52)";
-        cCtx.fillRect(0, 0, curr.width, curr.height);
-      }
-
-      setHasArtwork(true);
-
-      if (oldUrl && !reducedMotion) {
-        setIsCrossfading(true);
-        const timer = setTimeout(() => {
-          if (!cancelled) {
-            setIsCrossfading(false);
-          }
-        }, 400);
-        return () => clearTimeout(timer);
-      } else {
-        setIsCrossfading(false);
-      }
-    };
-
-    if (img.complete) {
-      renderBlur();
-    } else {
-      img.onload = renderBlur;
-      img.onerror = () => {
-        if (!cancelled) setHasArtwork(false);
-      };
-    }
-
-    return () => {
-      cancelled = true;
-    };
-  }, [artworkUrl, reducedMotion]);
-
-  return (
-    <div
-      className="fixed inset-0 overflow-hidden pointer-events-none select-none z-0"
-      style={{
-        contain: "strict",
-        opacity: hasArtwork || isCrossfading ? 1 : 0,
-        transition: reducedMotion ? "none" : "opacity 400ms ease",
-      }}
-      aria-hidden="true"
-    >
-      <canvas
-        ref={prevCanvasRef}
-        width={128}
-        height={128}
-        className="absolute inset-0 size-full object-cover"
-        style={{
-          display: isCrossfading ? "block" : "none",
-          transform: "scale(1.12)",
-        }}
-      />
-      <canvas
-        ref={currentCanvasRef}
-        width={128}
-        height={128}
-        className="absolute inset-0 size-full object-cover"
-        style={{
-          transform: "scale(1.12)",
-          opacity: hasArtwork ? 1 : 0,
-          animation: isCrossfading && !reducedMotion ? "overlay-in 400ms ease forwards" : undefined,
-        }}
-      />
-    </div>
-  );
-}
-
 /**
  * Immersive Now Playing (PRD §7.8): artwork-led, Apple Music-style layout
- * with blurred album-art background, centered/stacked controls under the artwork,
+ * with the liquid ambient background, centered/stacked controls under the artwork,
  * and side-by-side synchronized lyrics view.
  */
 export function NowPlayingPage() {
@@ -172,22 +33,6 @@ export function NowPlayingPage() {
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
-
-  // Reuse the exact artwork currently displayed by the active track
-  const artworkUrl = useArtworkUrl(track?.id ?? (track ? getArtworkUrl(track.id) : undefined));
-  const [reducedMotion, setReducedMotion] = useState(checkReducedMotion);
-
-  useEffect(() => {
-    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const onChange = () => setReducedMotion(checkReducedMotion());
-    media.addEventListener("change", onChange);
-    const observer = new MutationObserver(onChange);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-motion"] });
-    return () => {
-      media.removeEventListener("change", onChange);
-      observer.disconnect();
-    };
-  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -214,15 +59,9 @@ export function NowPlayingPage() {
 
   return (
     <>
-      {/* 1. Base neutral fallback background layer */}
-      <div
-        className="fixed inset-0 pointer-events-none select-none z-0"
-        style={{ backgroundColor: "var(--bg, #090b12)" }}
-        aria-hidden="true"
-      />
-
-      {/* 2. Zero-overhead pre-rendered blurred album artwork background */}
-      <BlurredCanvasBackdrop artworkUrl={artworkUrl} reducedMotion={reducedMotion} />
+      {/* Liquid ambient background: artwork first, theme-matched fallback
+          second; crossfades between songs, sources, and themes. */}
+      <LyricsAmbientBackground trackId={track.id} />
 
       {/* 3. Top UI Container (transparent background, z-10 above the background layer) */}
       <div

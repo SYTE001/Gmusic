@@ -7,7 +7,7 @@ import { QueuePanel } from "./QueuePanel";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { useLibraryStore } from "../stores/libraryStore";
 import { useToastStore } from "../stores/toastStore";
-import { CloseIcon, HeartIcon, HomeIcon, LibraryIcon, PlaylistIcon, SettingsIcon } from "./Icons";
+import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, HeartIcon, HomeIcon, LibraryIcon, PlaylistIcon, SettingsIcon } from "./Icons";
 import { APP_NAME } from "../types";
 
 const mobileNavClass = ({ isActive }: { isActive: boolean }) =>
@@ -15,16 +15,25 @@ const mobileNavClass = ({ isActive }: { isActive: boolean }) =>
     isActive ? "text-accent" : "text-text-secondary"
   }`;
 
+const SIDEBAR_COLLAPSED_KEY = "lm-sidebar-collapsed";
+
 /**
  * Two-column shell: fixed sidebar (240px) + independently scrolling main
  * content, with the full-width player bar docked at the bottom. Below 900px
  * the sidebar gives way to a top bar + bottom tab bar, and the player bar
  * becomes a compact mini-player that expands to the full Now Playing view.
+ * On desktop the sidebar collapses to an icon rail; the preference persists.
  */
 export function AppShell() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
   const location = useLocation();
+
+  const applySidebarCollapsed = (collapsed: boolean) => {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
+    setSidebarCollapsed(collapsed);
+  };
 
   // Close the mobile drawer on navigation.
   useEffect(() => {
@@ -40,24 +49,64 @@ export function AppShell() {
       </a>
 
       <div className="flex min-h-0 flex-1">
-        {/* Desktop sidebar */}
-        <aside className="hidden w-60 shrink-0 flex-col border-r bg-surface min-[900px]:flex" style={{ borderColor: "var(--border-subtle)" }}>
-          <Link to="/" className="flex items-center gap-2.5 px-5 pb-3 pt-5" aria-label={`${APP_NAME} home`}>
-            <span className="grid size-8 place-items-center rounded-lg bg-accent text-accent-contrast" aria-hidden>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M9 4.5v11.2a3.3 3.3 0 1 0 1.8 2.95V8.1l8-1.8v7.4a3.3 3.3 0 1 0 1.8 2.95V4z" />
-              </svg>
-            </span>
-            <span className="text-[15px] font-semibold tracking-tight">{APP_NAME}</span>
-          </Link>
+        {/* Desktop sidebar (collapsible to an icon rail) */}
+        <aside
+          className={`hidden shrink-0 flex-col border-r bg-surface transition-[width] duration-200 ease-out min-[900px]:flex ${
+            sidebarCollapsed ? "w-[76px]" : "w-60"
+          }`}
+          style={{ borderColor: "var(--border-subtle)" }}
+        >
+          {sidebarCollapsed ? (
+            <div className="flex flex-col items-center gap-1.5 pb-3 pt-5">
+              <Link to="/" className="grid size-9 place-items-center rounded-lg bg-accent text-accent-contrast" aria-label={`${APP_NAME} home`}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                  <path d="M9 4.5v11.2a3.3 3.3 0 1 0 1.8 2.95V8.1l8-1.8v7.4a3.3 3.3 0 1 0 1.8 2.95V4z" />
+                </svg>
+              </Link>
+              <button
+                type="button"
+                className="icon-btn"
+                aria-label="Expand sidebar"
+                title="Expand sidebar"
+                onClick={() => applySidebarCollapsed(false)}
+              >
+                <ChevronRightIcon size={17} />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center justify-between pb-3 pl-5 pr-3 pt-5">
+              <Link to="/" className="flex items-center gap-2.5" aria-label={`${APP_NAME} home`}>
+                <span className="grid size-8 place-items-center rounded-lg bg-accent text-accent-contrast" aria-hidden>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M9 4.5v11.2a3.3 3.3 0 1 0 1.8 2.95V8.1l8-1.8v7.4a3.3 3.3 0 1 0 1.8 2.95V4z" />
+                  </svg>
+                </span>
+                <span className="text-[15px] font-semibold tracking-tight">{APP_NAME}</span>
+              </Link>
+              <button
+                type="button"
+                className="icon-btn size-8"
+                aria-label="Collapse sidebar"
+                title="Collapse sidebar"
+                onClick={() => applySidebarCollapsed(true)}
+              >
+                <ChevronLeftIcon size={16} />
+              </button>
+            </div>
+          )}
           <div className="flex min-h-0 flex-1 flex-col">
-            <SidebarContent />
+            <SidebarContent
+              collapsed={sidebarCollapsed}
+              onExpand={() => applySidebarCollapsed(false)}
+            />
           </div>
-          <div className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
-            <CloudBadge compact />
-            <OfflineBadge compact />
-            <InstallHint />
-          </div>
+          {!sidebarCollapsed && (
+            <div className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
+              <CloudBadge compact />
+              <OfflineBadge compact />
+              <InstallHint />
+            </div>
+          )}
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">

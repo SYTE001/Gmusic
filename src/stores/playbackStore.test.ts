@@ -14,17 +14,27 @@ class FakeEngine implements AudioEngine {
   duration = 120;
   volume = 1;
   muted = false;
+  /** Source generation, bumped on every setSource like the real engine. */
+  sourceGen = 0;
+  /** When set, play() rejects with this value (AbortError simulations). */
+  playError: unknown = null;
   #events: EngineEvents;
 
   constructor(events: EngineEvents) {
     this.#events = events;
   }
 
+  get sourceGeneration(): number {
+    return this.sourceGen;
+  }
+
   setSource(url: string | null) {
+    this.sourceGen += 1;
     this.src = url;
     if (url !== null) this.#events.onDurationChange(this.duration);
   }
   async play() {
+    if (this.playError !== null) throw this.playError;
     this.playing = true;
     this.#events.onPlayStateChange(true);
   }
@@ -375,6 +385,87 @@ describe("playback store", () => {
     expect(state.currentTrackId).toBe("b");
     // The engine received the resume seek once duration was known.
     expect(usePlaybackStore.getState().currentTimeMs).toBeGreaterThanOrEqual(42000);
+  });
+
+  it("does not mark playback failed for an aborted load (code 1)", async () => {
+    usePlaybackStore.getState().playContext(["a"], 0, { type: "library", label: "L" });
+    await waitForStore(() => usePlaybackStore.getState().isPlaying);
+
+    engine.fail(1);
+    const state = usePlaybackStore.getState();
+    expect(state.status).toBe("ready");
+    expect(state.error).toBeNull();
+    expect(state.isPlaying).toBe(true);
+  });
+
+  it("ignores a stale media error that fires while the next track is resolving", async () => {
+    usePlaybackStore.getState().playContext(["a"], 0, { type: "library", label: "L" });
+    await waitForStore(() => usePlaybackStore.getState().isPlaying);
+
+    // startTrack("b") bumps the accepted generation synchronously, then
+    // awaits resolution. An error from the still-loaded "a" source fires
+    // inside that window and must not touch the new attempt.
+    void usePlaybackStore.getState().startTrack("b", { autoplay: true });
+    engine.fail(2);
+
+    await waitForStore(() => usePlaybackStore.getState().currentTrackId === "b" && usePlaybackStore.getState().isPlaying);
+    const state = usePlaybackStore.getState();
+    expect(state.error).toBeNull();
+    expect(state.status).toBe("ready");
+    expect(engine.src).toContain("blob:");
+  });
+
+  it("ignores an error event from a superseded source generation", async () => {
+    usePlaybackStore.getState().playContext(["a", "b"], 0, { type: "library", label: "L" });
+    await waitForStore(() => usePlaybackStore.getState().isPlaying);
+    usePlaybackStore.getState().next(true);
+    await waitForStore(() => usePlaybackStore.getState().currentTrackId === "b" && usePlaybackStore.getState().isPlaying);
+    const acceptedGeneration = engine.sourceGeneration;
+
+    // An event stamped with the previous source's generation (as if the old
+    // resource failed late) must not affect the current track.
+    engine.sourceGen = acceptedGeneration - 1;
+    engine.fail(3);
+    engine.sourceGen = acceptedGeneration;
+
+    const state = usePlaybackStore.getState();
+    expect(state.error).toBeNull();
+    expect(state.status).toBe("ready");
+    expect(state.isPlaying).toBe(true);
+  });
+
+  it("still reports genuine decode and network errors on the active source", async () => {
+    usePlaybackStore.getState().playContext(["a"], 0, { type: "library", label: "L" });
+    await waitForStore(() => usePlaybackStore.getState().isPlaying);
+
+    engine.fail(3);
+    let state = usePlaybackStore.getState();
+    expect(state.status).toBe("error");
+    expect(state.isPlaying).toBe(false);
+    expect(state.error?.title).toContain("Decod");
+
+    usePlaybackStore.getState().clearError();
+    usePlaybackStore.setState({ status: "ready" });
+    engine.fail(2);
+    state = usePlaybackStore.getState();
+    expect(state.status).toBe("error");
+    expect(state.error).not.toBeNull();
+  });
+
+  it("does not surface a playback error when play() is interrupted (AbortError)", async () => {
+    usePlaybackStore.getState().playContext(["a"], 0, { type: "library", label: "L" });
+    await waitForStore(() => usePlaybackStore.getState().isPlaying);
+
+    // Start track b, then pause() interrupts the in-flight play() request.
+    engine.playError = new DOMException("The play() request was interrupted", "AbortError");
+    void usePlaybackStore.getState().startTrack("b", { autoplay: true });
+    await waitForStore(() => usePlaybackStore.getState().currentTrackId === "b");
+    engine.playError = null;
+    await waitForStore(() => usePlaybackStore.getState().status !== "loading");
+
+    const state = usePlaybackStore.getState();
+    expect(state.status).toBe("ready");
+    expect(state.error).toBeNull();
   });
 });
 

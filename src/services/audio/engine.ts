@@ -23,6 +23,12 @@ export type EngineEvents = {
 
 export interface AudioEngine {
   readonly element: HTMLAudioElement | null;
+  /**
+   * Bumped on every setSource/dispose. Lets the store ignore media events
+   * that belong to a source the engine has already replaced. Optional so
+   * test doubles only implement it when they want that validation.
+   */
+  readonly sourceGeneration?: number;
   setSource(url: string | null): void;
   play(): Promise<void>;
   pause(): void;
@@ -59,6 +65,7 @@ export function describeMediaError(code: number): string {
 export class HtmlAudioEngine implements AudioEngine {
   private readonly audio: HTMLAudioElement;
   private readonly events: EngineEvents;
+  private sourceGenerationValue = 0;
 
   constructor(events: EngineEvents) {
     this.events = events;
@@ -69,6 +76,10 @@ export class HtmlAudioEngine implements AudioEngine {
 
   get element(): HTMLAudioElement {
     return this.audio;
+  }
+
+  get sourceGeneration(): number {
+    return this.sourceGenerationValue;
   }
 
   private bindEvents(): void {
@@ -83,11 +94,16 @@ export class HtmlAudioEngine implements AudioEngine {
     this.audio.addEventListener("seeked", () => this.events.onSeeked());
     this.audio.addEventListener("ended", () => this.events.onEnded());
     this.audio.addEventListener("error", () => {
+      // An error event without a MediaError carries no information about the
+      // current source — it surfaces from load() aborting an in-flight fetch
+      // and must never become a fabricated code 0.
       const mediaError = this.audio.error;
-      this.events.onError({
-        code: mediaError?.code ?? 0,
-        message: mediaError?.message ?? "",
-      });
+      if (!mediaError) return;
+      // Code 1 (MEDIA_ERR_ABORTED) is the signature of the shared element
+      // switching sources: the new source reports its own outcome, so an
+      // abort is a transition, not a playback failure.
+      if (mediaError.code === 1) return;
+      this.events.onError({ code: mediaError.code, message: mediaError.message });
     });
   }
 
@@ -96,6 +112,7 @@ export class HtmlAudioEngine implements AudioEngine {
   }
 
   setSource(url: string | null): void {
+    this.sourceGenerationValue += 1;
     if (url === null) {
       this.audio.removeAttribute("src");
       this.audio.load();
@@ -142,6 +159,7 @@ export class HtmlAudioEngine implements AudioEngine {
   }
 
   dispose(): void {
+    this.sourceGenerationValue += 1;
     this.audio.pause();
     this.audio.removeAttribute("src");
     this.audio.load();

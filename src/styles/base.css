@@ -333,9 +333,10 @@ input[type="range"].app-range::-moz-range-thumb {
   background: var(--accent);
 }
 
-/* Keyboard-hint chip shown inside the sidebar search field */
+/* Keyboard-hint chip shown inside the sidebar search field. No display here:
+   unlayered CSS would beat Tailwind's layered `hidden` utility and keep the
+   chip visible on mobile — visibility is set by utilities in the markup. */
 .kbd-hint {
-  display: inline-flex;
   align-items: center;
   justify-content: center;
   min-width: 1.35rem;

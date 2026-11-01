@@ -71,7 +71,9 @@ describe("lrcmuxClient basics", () => {
     expect(calls[0].url).toContain("duration=180");
     expect(calls[0].url).toContain("level=word");
     expect(calls[0].url).toContain("format=json");
-    expect(calls[0].headers["X-Client"]).toMatch(/^local-music\//);
+    // Requests must stay CORS-simple: a custom header like X-Client would
+    // trigger an OPTIONS preflight the API rejects, failing every lookup.
+    expect(Object.keys(calls[0].headers)).toEqual(["Accept"]);
   });
 
   it("returns null without making network requests if trackName or artistName is missing", async () => {

@@ -1,6 +1,7 @@
 import type { ImportOutcome, Track } from "../../types";
 import { createId, deriveArtistTitleFromFileName, looksLikeAudioFile } from "../../utils/misc";
 import { parseAudioTags, probeAudioFile } from "../metadata";
+import { normalizeTrackMetadata } from "../metadata/normalization";
 import { repository } from "../indexeddb/LibraryRepository";
 import { rememberSessionFile } from "../file-access/FileAccessService";
 
@@ -138,14 +139,24 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
 
       const tags = await parseAudioTags(file);
       const fallback = deriveArtistTitleFromFileName(file.name);
+      const normalized = normalizeTrackMetadata(
+        {
+          title: tags.title ?? fallback.title,
+          artist: tags.artist ?? fallback.artist,
+          album: tags.album ?? "",
+          durationMs: probe.durationMs,
+          fileName: file.name,
+        },
+        { libraryTracks: options.existingTracks },
+      );
       const isHandle = await itemIsHandle(item);
       const accessMode: Track["accessMode"] = isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only";
 
       const track: Track = {
         id: createId(),
-        title: tags.title ?? fallback.title,
-        artist: tags.artist ?? fallback.artist,
-        album: tags.album ?? "",
+        title: normalized.title || tags.title || fallback.title,
+        artist: normalized.artist || tags.artist || fallback.artist,
+        album: normalized.album ?? tags.album ?? "",
         trackNumber: tags.trackNumber ?? fallback.trackNumber ?? null,
         albumTrackCount: tags.albumTrackCount ?? null,
         durationMs: probe.durationMs,
@@ -186,5 +197,6 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
     done += 1;
   }
   options.onProgress?.({ done: items.length, total: items.length, currentName: "" });
+  outcome.newTracks = newTracks;
   return outcome;
 }

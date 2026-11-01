@@ -17,7 +17,7 @@ import { createId, debounce } from "../utils/misc";
 import { bindPlaybackHelpers, usePlaybackStore } from "./playbackStore";
 import { useSettingsStore } from "./settingsStore";
 import { toast } from "./toastStore";
-import { bindLyricsTrackLookup } from "./lyricsStore";
+import { bindLyricsTrackLookup, useLyricsStore } from "./lyricsStore";
 import { useCloudStore, removeTrackFromCloud } from "./cloudStore";
 import { invalidatePlayUrl } from "../services/cloud/r2StorageService";
 
@@ -193,6 +193,11 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       if (outcome.added > 0) {
         const fresh = await repository.listTracks();
         set({ tracks: fresh });
+        if (prefs.autoFetchLyrics && outcome.newTracks) {
+          for (const track of outcome.newTracks) {
+            void useLyricsStore.getState().resolveForTrack(track);
+          }
+        }
       }
       set({ lastImportOutcome: outcome });
       return outcome;

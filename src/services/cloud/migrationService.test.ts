@@ -93,10 +93,18 @@ vi.mock("../cloud/r2StorageService", () => ({
 
 const library = vi.hoisted(() => ({
   upserted: [] as Track[],
+  /** When set, the next upsertCloudTracks call throws, simulating a Postgres
+   *  failure arriving AFTER the R2 object was already verified. */
+  failNextUpsert: false,
 }));
 
 vi.mock("../cloud/cloudLibraryService", () => ({
   upsertCloudTracks: async (tracks: Track[]) => {
+    if (library.failNextUpsert) {
+      library.failNextUpsert = false;
+      // supabase-js returns `error` as a plain object; the service formats it.
+      throw new Error("Saving cloud tracks failed: null value in column \"file_name\" violates not-null constraint (code 23502)");
+    }
     library.upserted.push(...tracks);
     return tracks.map((track) => ({ objectKey: track.objectKey ?? null, reconciledWith: null }));
   },
@@ -498,6 +506,191 @@ describe("migration run", () => {
       expect(storage.artworkMimeByTrack.get("artwork-1")).toBe("image/png");
     } finally {
       spy.mockRestore();
+    }
+  });
+});
+
+describe("upload intent expiry and fresh-URL retries", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    storage.failingTrackIds.clear();
+    storage.verificationFailsFor.clear();
+    storage.uploads = 0;
+    storage.cleanedUpObjects = [];
+    library.upserted = [];
+    vi.stubGlobal("fetch", async () => new Response("", { status: 200 }));
+  });
+
+  it("requests a fresh upload URL and intent on every retry attempt", async () => {
+    // Regression: the URL and intent were minted ONCE outside the retry loop,
+    // so after a transient PUT failure the second attempt reused an expired
+    // intent and failed permanently with "The upload intent has expired."
+    const tracks = await storedTracks(1);
+    let putAttempts = 0;
+    vi.stubGlobal("fetch", async () => {
+      putAttempts += 1;
+      if (putAttempts === 1) throw new TypeError("network error"); // transient
+      return new Response("", { status: 200 });
+    });
+
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, progress);
+
+    expect(putAttempts).toBe(2);
+    // Two upload-url requests: one per attempt, never a reused URL.
+    expect(storage.uploads).toBe(2);
+    expect(progress.state).toBe("complete");
+    expect(progress.succeeded).toBe(1);
+    expect(library.upserted).toHaveLength(1);
+  });
+
+  it("treats an expired-intent 409 as a failure that a later retry recovers from", async () => {
+    const tracks = await storedTracks(1);
+    // Simulate the exact production error for Oladrys/Breakin' Dishes: the
+    // PUT succeeded but /complete rejected with 409 upload-unverified.
+    storage.verificationFailsFor.add(`users/u-1/tracks/${tracks[0]!.id}/audio.mp3`);
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, progress);
+
+    expect(progress.failed).toBe(1);
+    expect(progress.items[0]!.error).toBeTruthy();
+    // The unclaimed object was cleaned up; a retry can start clean.
+    expect(storage.cleanedUpObjects).toHaveLength(1);
+    // Local data untouched.
+    expect(await repository.getAudioBlob(tracks[0]!.id)).toBeTruthy();
+
+    // A retry with a fresh intent succeeds and converges to exactly one row.
+    storage.verificationFailsFor.clear();
+    retryFailedItems(progress);
+    await runMigration(tracks, progress);
+    expect(progress.state).toBe("complete");
+    expect(progress.succeeded).toBe(1);
+    expect(library.upserted.filter((t) => t.id === tracks[0]!.id)).toHaveLength(1);
+  });
+});
+
+describe("database failure after a successful storage upload", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    storage.failingTrackIds.clear();
+    storage.verificationFailsFor.clear();
+    storage.uploads = 0;
+    storage.cleanedUpObjects = [];
+    library.upserted = [];
+    library.failNextUpsert = false;
+    vi.stubGlobal("fetch", async () => new Response("", { status: 200 }));
+  });
+
+  it("fails the track without marking it uploaded, and local data survives", async () => {
+    const tracks = await storedTracks(1);
+    library.failNextUpsert = true; // R2 verified, then Postgres rejected the row
+
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, progress);
+
+    expect(progress.failed).toBe(1);
+    expect(progress.items[0]!.error).toMatch(/Saving cloud tracks failed/);
+    expect(progress.items[0]!.error).toMatch(/23502/);
+    // Storage upload DID happen (the object was verified) but the track is not
+    // "done" — the UI may offer a retry without claiming success.
+    expect(library.upserted).toHaveLength(0);
+    expect(await repository.getTrack(tracks[0]!.id)).toBeTruthy();
+    expect((await repository.getTrack(tracks[0]!.id))?.cloudStatus).toBeUndefined();
+    expect(await repository.getAudioBlob(tracks[0]!.id)).toBeTruthy();
+  });
+
+  it("retries the same track after the database failure and converges to one row", async () => {
+    const tracks = await storedTracks(1);
+    library.failNextUpsert = true;
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, progress);
+    expect(progress.failed).toBe(1);
+
+    library.failNextUpsert = false;
+    retryFailedItems(progress);
+    await runMigration(tracks, progress);
+
+    expect(progress.state).toBe("complete");
+    expect(progress.succeeded).toBe(1);
+    // No duplicate cloud record: one row per stable track id across the retry.
+    expect(library.upserted.filter((t) => t.id === tracks[0]!.id)).toHaveLength(1);
+  });
+});
+describe("format coverage and re-import safety", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    storage.failingTrackIds.clear();
+    storage.verificationFailsFor.clear();
+    storage.uploads = 0;
+    storage.cleanedUpObjects = [];
+    library.upserted = [];
+    vi.stubGlobal("fetch", async () => new Response("", { status: 200 }));
+  });
+
+  it("uploads a FLAC file with the canonical audio/flac type", async () => {
+    const track = makeTrack({ id: "stored-flac", fileName: "album.flac" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(1000)], { type: "audio/flac" }));
+    const tracks = [track];
+
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, progress);
+
+    expect(progress.succeeded).toBe(1);
+    expect(storage.audioMimeByTrack.get(track.id)).toBe("audio/flac");
+    const stored = await repository.getTrack(track.id);
+    expect(stored?.objectKey).toBe(`users/u-1/tracks/${track.id}/audio.flac`);
+  });
+
+  it("does not re-upload a track whose cloud copy is already verified", async () => {
+    const tracks = await storedTracks(1);
+    const first = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, first);
+    expect(storage.uploads).toBe(1);
+
+    // Re-planning from the freshly-synced local record classifies the track
+    // as done, so a second migration neither PUTs again nor writes a new row.
+    const refreshed = await repository.listTracks();
+    const second = { ...initialMigrationProgress(), items: (await planMigration(refreshed)).items };
+    expect(second.items[0]!.status).toBe("done");
+    await runMigration(refreshed, second);
+    expect(storage.uploads).toBe(1);
+    expect(library.upserted.filter((t) => t.id === tracks[0]!.id)).toHaveLength(1);
+  });
+
+  it("recovers an interrupted run without duplicating completed work", async () => {
+    const tracks = await storedTracks(3);
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+
+    // Cancel as soon as the first upload starts; runMigration resets the flag
+    // at entry, so arming it early would be a no-op (regression guard).
+    let started = false;
+    vi.stubGlobal("fetch", async () => {
+      started = true;
+      await new Promise((wait) => setTimeout(wait, 20));
+      return new Response("", { status: 200 });
+    });
+    const run = runMigration(tracks, progress, { concurrency: 1 });
+    while (!started) await new Promise((wait) => setTimeout(wait, 5));
+    cancelMigration();
+    await run;
+
+    expect(progress.state).toBe("cancelled");
+    const doneCount = progress.items.filter((i) => i.status === "done").length;
+    expect(doneCount).toBeGreaterThanOrEqual(1);
+    expect(doneCount).toBeLessThan(3);
+
+    // A fresh run resumes the same plan and uploads only what is still
+    // pending; finished items are never re-uploaded or duplicated.
+    const before = storage.uploads;
+    const resumed = { ...initialMigrationProgress(), items: progress.items };
+    await runMigration(tracks, resumed, { concurrency: 1 });
+
+    expect(resumed.state).toBe("complete");
+    expect(resumed.succeeded).toBe(3);
+    expect(storage.uploads).toBe(before + (3 - doneCount));
+    for (const track of tracks) {
+      expect(library.upserted.filter((t) => t.id === track.id)).toHaveLength(1);
     }
   });
 });

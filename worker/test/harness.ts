@@ -222,6 +222,30 @@ function envFor(overrides: Partial<Env> = {}): Env {
   return cleanBindings as unknown as Env;
 }
 
+/**
+ * Mints an HMAC-signed upload intent token with an arbitrary payload, using the
+ * same secret and format as the Worker's createUploadIntent. Tests use it to
+ * build intents that are already expired, so the expiry branch is exercised
+ * directly instead of waiting out a real TTL.
+ */
+export async function makeUploadIntent(
+  payload: Record<string, unknown>,
+  // getIntentSecret() prefers R2_SECRET_ACCESS_KEY before SUPABASE_JWT_SECRET.
+  secret: string = TEST_SECRET_ACCESS_KEY,
+): Promise<string> {
+  // createUploadIntent signs the raw JSON bytes, not the base64url segment.
+  const payloadJson = JSON.stringify(payload);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payloadJson)));
+  return `${base64UrlEncode(payloadJson)}.${base64UrlEncode(signature)}`;
+}
+
 export async function startWorker(overrides: Partial<Env> = {}): Promise<TestContext> {
   const env = envFor(overrides);
   const mf = new Miniflare({

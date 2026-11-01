@@ -15,88 +15,121 @@ import {
   MusicNoteIcon,
   PlaylistIcon,
   PlusIcon,
+  SearchIcon,
   SettingsIcon,
   TrashIcon,
 } from "./Icons";
 import type { Playlist } from "../types";
 
+const NAV_ITEMS = [
+  { to: "/", label: "Home", icon: HomeIcon, end: true },
+  { to: "/library", label: "Library", icon: LibraryIcon },
+  { to: "/liked", label: "Liked", icon: HeartIcon },
+  { to: "/playlists", label: "Playlists", icon: PlaylistIcon },
+  { to: "/recent", label: "Recent", icon: ClockIcon },
+  { to: "/settings", label: "Settings", icon: SettingsIcon },
+] as const;
+
 /**
  * Sidebar body (desktop rail and mobile drawer): search field, primary nav
  * with a left accent-bar active indicator, then the user's playlists with a
- * create button and per-playlist hover actions. Import lives on Home/Library
- * so the primary action stays reachable without opening Settings.
+ * create button and per-playlist hover actions. When `collapsed`, renders as
+ * a compact icon rail (reference-style) — every icon keeps its accessible
+ * name and a native tooltip; search and the playlists section expand on demand.
  */
-export function SidebarContent({ showSearch = true }: { showSearch?: boolean }) {
+export function SidebarContent({
+  showSearch = true,
+  collapsed = false,
+  onExpand,
+}: {
+  showSearch?: boolean;
+  collapsed?: boolean;
+  onExpand?: () => void;
+}) {
   const playlists = useLibraryStore((state) => state.playlists);
   const likedCount = useLibraryStore((state) => state.tracks.filter((track) => track.isLiked).length);
   const [creating, setCreating] = useState(false);
 
   const navClass = ({ isActive }: { isActive: boolean }) =>
-    `nav-item relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors ${
-      isActive
-        ? "font-medium text-text-primary"
-        : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
-    }`;
+    collapsed
+      ? `nav-item relative flex items-center justify-center rounded-lg py-2 transition-colors ${
+          isActive ? "bg-surface-raised text-text-primary" : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
+        }`
+      : `nav-item relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors ${
+          isActive
+            ? "font-medium text-text-primary"
+            : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
+        }`;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {showSearch && (
+      {showSearch && !collapsed && (
         <div className="px-3 pb-3 pt-1">
           <SearchField />
         </div>
       )}
-
-      <nav aria-label="Main" className="flex flex-col gap-0.5 px-3">
-        <NavLink to="/" className={navClass} end>
-          <HomeIcon size={19} />
-          Home
-        </NavLink>
-        <NavLink to="/library" className={navClass}>
-          <LibraryIcon size={19} />
-          Library
-        </NavLink>
-        <NavLink to="/liked" className={navClass}>
-          <HeartIcon size={19} />
-          Liked
-          {likedCount > 0 && <span className="ml-auto text-xs text-text-muted tabular-nums">{likedCount}</span>}
-        </NavLink>
-        <NavLink to="/playlists" className={navClass}>
-          <PlaylistIcon size={19} />
-          Playlists
-        </NavLink>
-        <NavLink to="/recent" className={navClass}>
-          <ClockIcon size={19} />
-          Recent
-        </NavLink>
-        <NavLink to="/settings" className={navClass}>
-          <SettingsIcon size={19} />
-          Settings
-        </NavLink>
-      </nav>
-
-      <div className="mt-5 flex min-h-0 flex-1 flex-col px-3">
-        <div className="flex items-center justify-between px-1 pb-1">
-          <span className="text-[11px] font-semibold uppercase tracking-wider text-text-muted">Playlists</span>
+      {showSearch && collapsed && (
+        <div className="flex justify-center pb-2 pt-1">
           <button
             type="button"
-            className="icon-btn size-7"
-            aria-label="Create playlist"
-            title="Create playlist"
-            onClick={(event) => {
-              event.stopPropagation();
-              setCreating(true);
+            className="icon-btn"
+            aria-label="Expand sidebar to search"
+            title="Search ( / )"
+            onClick={() => {
+              onExpand?.();
+              // Focus lands once the width transition has revealed the field.
+              window.setTimeout(() => document.querySelector<HTMLElement>("aside input[type='search']")?.focus(), 230);
             }}
           >
-            <PlusIcon size={15} />
+            <SearchIcon size={18} />
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto pb-2" role="list" aria-label="Your playlists">
-          {playlists.length === 0 && <p className="px-1 pb-2 text-xs text-text-muted">Playlists you create appear here.</p>}
-          {playlists.map((playlist) => (
-            <SidebarPlaylistRow key={playlist.id} playlist={playlist} />
-          ))}
+      )}
+
+      <nav aria-label="Main" className={`flex flex-col gap-0.5 ${collapsed ? "px-2" : "px-3"}`}>
+        {NAV_ITEMS.map(({ to, label, icon: Icon, ...rest }) => (
+          <NavLink
+            key={to}
+            to={to}
+            end={"end" in rest ? rest.end : undefined}
+            className={navClass}
+            aria-label={collapsed ? label : undefined}
+            title={collapsed ? label : undefined}
+          >
+            <Icon size={19} />
+            {!collapsed && <span>{label}</span>}
+            {!collapsed && label === "Liked" && likedCount > 0 && (
+              <span className="ml-auto text-xs text-text-muted tabular-nums">{likedCount}</span>
+            )}
+          </NavLink>
+        ))}
+      </nav>
+
+      {!collapsed && (
+        <div className="mt-5 flex min-h-0 flex-1 flex-col px-3">
+          <div className="flex items-center justify-between px-1 pb-1">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-text-muted">Playlists</span>
+            <button
+              type="button"
+              className="icon-btn size-7"
+              aria-label="Create playlist"
+              title="Create playlist"
+              onClick={(event) => {
+                event.stopPropagation();
+                setCreating(true);
+              }}
+            >
+              <PlusIcon size={15} />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto pb-2" role="list" aria-label="Your playlists">
+            {playlists.length === 0 && <p className="px-1 pb-2 text-xs text-text-muted">Playlists you create appear here.</p>}
+            {playlists.map((playlist) => (
+              <SidebarPlaylistRow key={playlist.id} playlist={playlist} />
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       <CreatePlaylistModal
         open={creating}
@@ -152,7 +185,7 @@ function SidebarPlaylistRow({ playlist }: { playlist: Playlist }) {
         <span className="min-w-0 flex-1 truncate">{playlist.name}</span>
       </NavLink>
       <div
-        className="absolute right-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
+        className="absolute right-0.5 top-1/2 -translate-y-1/2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"
         onClick={(event) => event.stopPropagation()}
       >
         <Menu items={menuItems} buttonLabel={`Playlist actions for ${playlist.name}`} />

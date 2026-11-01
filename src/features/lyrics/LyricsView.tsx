@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { useSettingsStore } from "../../stores/settingsStore";
@@ -7,17 +7,21 @@ import { repository } from "../../services/indexeddb/LibraryRepository";
 import { DB_SCHEMA_VERSION } from "../../types";
 import {
   clampLyricOffset,
-  findActiveLineIndex,
-  findActiveWordIndex,
   hasWordTimestamps,
   parseLyricFile,
   readLyricFileText,
 } from "../../services/lyrics/lyricsService";
 import type { TrackLyrics } from "../../types";
 import { formatClock } from "../../utils/misc";
+import { detectLyricsCapability } from "../../services/lyrics/capability";
+import { toAmllLines } from "../../services/lyrics/amllAdapter";
 import { ImportIcon, LyricsIcon, OfflineIcon, WarningIcon } from "../../components/Icons";
 import { MatchPickerDialog } from "./MatchPickerDialog";
 import { LyricLineItem } from "./LyricLineItem";
+
+// The AMLL renderer (and its stylesheet) is its own chunk, fetched only when
+// a timed lyrics document is actually shown.
+const AmllLyricPlayer = lazy(() => import("./AmllLyricPlayer"));
 
 const FONT_SIZES = {
   sm: "clamp(1.1rem, 2.6vw, 1.6rem)",
@@ -26,22 +30,19 @@ const FONT_SIZES = {
 } as const;
 
 const FOLLOW_TRANSITION = "transform 360ms cubic-bezier(0.22, 1, 0.36, 1)";
-const USER_SCROLL_IDLE_MS = 2500;
 
 /**
- * Synchronized lyrics view (feature spec §3, §7). The audio element's current
- * time is the timing authority; rAF is used only for visual interpolation
- * while playing, and stops when paused, hidden, or unmounted — so pausing,
- * seeking, background throttling, and stalls can never make lyrics drift on
- * an independent clock.
+ * Lyrics view (feature spec §3, §7). Timed lyrics are rendered and animated by
+ * the AMLL player (AmllLyricPlayer), fed imperatively from the audio element's
+ * clock — the timing authority — so pausing, seeking, background throttling,
+ * and stalls can never make lyrics drift on an independent clock. Plain and
+ * instrumental results keep this view's own static UI.
  */
 export function LyricsView() {
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const track = useLibraryStore((state) => state.tracks.find((item) => item.id === currentTrackId) ?? null);
   const [lyrics, setLyrics] = useState<TrackLyrics | null>(null);
   const [loading, setLoading] = useState(false);
-  const [activeIndex, setActiveIndex] = useState(-1);
-  const [activeWordIndex, setActiveWordIndex] = useState(-1);
   const [editorOpen, setEditorOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -54,16 +55,15 @@ export function LyricsView() {
   const lyricAlignment = useSettingsStore((state) => state.prefs.lyricAlignment);
   const lyricLineSpacing = useSettingsStore((state) => state.prefs.lyricLineSpacing);
   const discoveryStatus = useLyricsStore((state) => state.status);
+  const discoveryPhase = useLyricsStore((state) => state.phase);
   const discoveryTrackId = useLyricsStore((state) => state.trackId);
   const discoveryVersion = useLyricsStore((state) => state.lyricsVersion);
   const candidates = useLyricsStore((state) => state.candidates);
   const errorMessage = useLyricsStore((state) => state.errorMessage);
   const resolveForTrack = useLyricsStore((state) => state.resolveForTrack);
 
-  const lastUserScrollTimeRef = useRef<number>(-10000);
   const currentYRef = useRef<number>(0);
   const lastTransitionRef = useRef<string>("none");
-  const prevActiveIndexRef = useRef<number>(-1);
   const touchStartYRef = useRef<number | null>(null);
   const pointerDragRef = useRef<{ active: boolean; pointerId: number; lastY: number; moved: boolean }>({
     active: false,
@@ -101,10 +101,6 @@ export function LyricsView() {
   // a new one (lyricsVersion).
   useEffect(() => {
     let cancelled = false;
-    setActiveIndex(-1);
-    setActiveWordIndex(-1);
-    prevActiveIndexRef.current = -1;
-    lastUserScrollTimeRef.current = -10000;
     currentYRef.current = 0;
     lastTransitionRef.current = "none";
     if (listRef.current) {
@@ -138,16 +134,16 @@ export function LyricsView() {
 
   // Trigger discovery when the view opens for a track nothing has resolved
   // yet (covers first open and the auto-fetch setting being off at start).
+  // Errors stay terminal — auto re-triggering from here would loop
+  // checking→error forever; the "Try again" button retries on purpose.
   useEffect(() => {
     if (!track || loading) return;
     if (lyrics) return;
-    if (discoveryTrackId === track.id && discoveryStatus !== "idle" && discoveryStatus !== "error") return;
+    if (discoveryTrackId === track.id && discoveryStatus !== "idle") return;
     void resolveForTrack(track);
   }, [track, loading, lyrics, discoveryTrackId, discoveryStatus, resolveForTrack]);
 
   const timedLines = lyrics?.format === "lrc";
-  const wordTimed = useMemo(() => (lyrics ? hasWordTimestamps(lyrics.lines) : false), [lyrics]);
-  const effectiveWordTimed = wordTimed && lyricsStyle === "word";
 
   // Maintain line-geometry cache with zero layout reads in the hot path.
   const updateGeometryCache = useCallback(() => {
@@ -207,35 +203,8 @@ export function LyricsView() {
     };
   }, [updateGeometryCache]);
 
-  const scrollToLine = useCallback(
-    (index: number, forceInstant = false) => {
-      const geom = geometryRef.current;
-      if (!geom || index < 0 || index >= geom.tops.length) return;
-
-      const rawTarget = geom.tops[index] - geom.containerHeight / 2 + geom.heights[index] / 2;
-      const target = Math.round(Math.max(0, geom.maxScroll > 0 ? Math.min(geom.maxScroll, rawTarget) : rawTarget));
-      const distance = Math.abs(target - currentYRef.current);
-
-      // Do not fight the user: skip auto-follow if manually scrolled in the last 2.5s
-      if (!forceInstant && performance.now() - lastUserScrollTimeRef.current < USER_SCROLL_IDLE_MS) {
-        return;
-      }
-
-      // Reduced motion (system or manual override) or far jumps (>1.5 viewport heights) snap instantly.
-      const override = document.documentElement.dataset.motion;
-      const reduced =
-        override === "on" || (override !== "off" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
-      const isFarJump = geom.containerHeight > 0 && distance > geom.containerHeight * 1.5;
-      const snap = forceInstant || reduced || isFarJump;
-
-      applyTransform(target, !snap);
-    },
-    [applyTransform],
-  );
-
   const nudgeManualScroll = useCallback(
     (deltaY: number) => {
-      lastUserScrollTimeRef.current = performance.now();
       applyTransform(currentYRef.current + deltaY, false);
     },
     [applyTransform],
@@ -252,7 +221,6 @@ export function LyricsView() {
   const onTouchStart = useCallback((e: React.TouchEvent<HTMLDivElement>) => {
     if (e.touches.length === 1) {
       touchStartYRef.current = e.touches[0].clientY;
-      lastUserScrollTimeRef.current = performance.now();
     }
   }, []);
 
@@ -319,154 +287,40 @@ export function LyricsView() {
         nudgeManualScroll(-pageStep);
       } else if (e.key === "Home") {
         e.preventDefault();
-        lastUserScrollTimeRef.current = performance.now();
         applyTransform(0, false);
       } else if (e.key === "End" && geom) {
         e.preventDefault();
-        lastUserScrollTimeRef.current = performance.now();
         applyTransform(geom.maxScroll, false);
       }
     },
     [nudgeManualScroll, applyTransform],
   );
 
-  // Keep keyboard-focused lyric buttons in view within the overflow-hidden container
-  const onFocusCapture = useCallback(
-    (e: React.FocusEvent<HTMLDivElement>) => {
-      if (containerRef.current && containerRef.current.scrollTop !== 0) {
-        containerRef.current.scrollTop = 0;
-      }
-      const target = e.target as HTMLElement | null;
-      if (!target || typeof target.matches !== "function" || !target.matches(":focus-visible")) return;
-      const indexAttr = target.getAttribute("data-line-index");
-      if (indexAttr === null || indexAttr === undefined) return;
-      const index = Number(indexAttr);
-      const geom = geometryRef.current;
-      if (!geom || Number.isNaN(index) || index < 0 || index >= geom.tops.length) return;
-
-      const lineTop = geom.tops[index];
-      const lineBottom = lineTop + geom.heights[index];
-      const viewTop = currentYRef.current;
-      const viewBottom = viewTop + geom.containerHeight;
-      if (geom.containerHeight > 0 && (lineTop < viewTop + 24 || lineBottom > viewBottom - 24)) {
-        lastUserScrollTimeRef.current = performance.now();
-        const centered = lineTop - geom.containerHeight / 2 + geom.heights[index] / 2;
-        applyTransform(centered, false);
-      }
-    },
-    [applyTransform],
-  );
-
-  const rafAliveRef = useRef(0);
-
-  // Commit the compositor transform in the exact same synchronous layout pass
-  // as the activeIndex DOM update so the browser never receives two separate
-  // commits on consecutive frames for a single line change.
-  useLayoutEffect(() => {
-    if (activeIndex >= 0) {
-      const wasUnset = prevActiveIndexRef.current === -1;
-      prevActiveIndexRef.current = activeIndex;
-      scrollToLine(activeIndex, wasUnset && activeIndex > 0);
-    } else {
-      prevActiveIndexRef.current = activeIndex;
+  // Keep the overflow-hidden container from scrolling natively when focus moves inside it.
+  const onFocusCapture = useCallback(() => {
+    if (containerRef.current && containerRef.current.scrollTop !== 0) {
+      containerRef.current.scrollTop = 0;
     }
-  }, [activeIndex, scrollToLine]);
+  }, []);
 
-  // Timing loop: read the audio clock while playing. Covers seek, resume,
-  // rate changes, and stalls — every frame recomputes from currentTime.
-  useEffect(() => {
-    if (!isPlaying || !timedLines || !lyrics) return;
-    let frame = 0;
-    let lastIndex = -2;
-    let lastWord = -1;
-    const tick = () => {
-      rafAliveRef.current = Date.now();
-      const engine = usePlaybackStore.getState().getEngine();
-      const positionMs = engine.element ? engine.currentTimeSec * 1000 : usePlaybackStore.getState().currentTimeMs;
-      const index = findActiveLineIndex(lyrics.lines, positionMs, lyrics.offsetMs);
-      if (index !== lastIndex) {
-        lastIndex = index;
-        setActiveIndex(index);
-        if (effectiveWordTimed) {
-          const line = lyrics.lines[index];
-          const nextWord = line && line.words ? findActiveWordIndex(line, positionMs, lyrics.offsetMs) : -1;
-          lastWord = nextWord;
-          setActiveWordIndex(nextWord);
-        } else if (lastWord !== -1) {
-          lastWord = -1;
-          setActiveWordIndex(-1);
-        }
-      } else if (effectiveWordTimed) {
-        const line = lyrics.lines[index];
-        if (line?.words) {
-          const wordIndex = findActiveWordIndex(line, positionMs, lyrics.offsetMs);
-          if (wordIndex !== lastWord) {
-            lastWord = wordIndex;
-            setActiveWordIndex(wordIndex);
-          }
-        }
-      }
-      frame = requestAnimationFrame(tick);
-    };
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [isPlaying, timedLines, lyrics, effectiveWordTimed]);
-
-  // Store-time fallback: keeps the highlighted line correct while paused or
-  // ended (seeking updates the store), and when rAF is throttled in
-  // unfocused/background windows while audio keeps playing — without subscribing
-  // LyricsView render state to 200ms timeupdate ticks.
-  useEffect(() => {
-    if (!timedLines || !lyrics) return;
-    const syncFromTime = (timeMs: number, playing: boolean) => {
-      if (playing && Date.now() - rafAliveRef.current < 500) return;
-      const nextIndex = findActiveLineIndex(lyrics.lines, timeMs, lyrics.offsetMs);
-      setActiveIndex((prev) => (prev === nextIndex ? prev : nextIndex));
-      if (effectiveWordTimed) {
-        const line = lyrics.lines[nextIndex];
-        const nextWord = line && line.words ? findActiveWordIndex(line, timeMs, lyrics.offsetMs) : -1;
-        setActiveWordIndex((prev) => (prev === nextWord ? prev : nextWord));
-      } else {
-        setActiveWordIndex((prev) => (prev === -1 ? prev : -1));
-      }
-    };
-
-    const initial = usePlaybackStore.getState();
-    syncFromTime(initial.currentTimeMs, initial.isPlaying);
-
-    return usePlaybackStore.subscribe((state) => {
-      syncFromTime(state.currentTimeMs, state.isPlaying);
-    });
-  }, [timedLines, lyrics, effectiveWordTimed]);
-
-  const seekToLine = useCallback(
-    (index: number) => {
-      if (pointerDragRef.current.moved) {
-        pointerDragRef.current.moved = false;
-        return;
-      }
-      if (!lyrics || !timedLines) return;
-      const line = lyrics.lines[index];
-      if (!line || line.timeMs === null) return;
-      lastUserScrollTimeRef.current = -10000;
-      usePlaybackStore.getState().seek(Math.max(0, line.timeMs + lyrics.offsetMs));
-    },
-    [lyrics, timedLines],
-  );
+  // Click on a timed line (reported by the AMLL player as an audio-clock
+  // position with the offset applied) seeks the actual playback engine.
+  const seekToAudioMs = useCallback((audioMs: number) => {
+    usePlaybackStore.getState().seek(audioMs);
+  }, []);
 
   const adjustOffset = async (deltaMs: number) => {
     if (!lyrics || !currentTrackId) return;
     const next = clampLyricOffset(lyrics.offsetMs + deltaMs);
     const updated = { ...lyrics, offsetMs: next, updatedAt: Date.now() };
+    // The player re-syncs from the new offset immediately; the stored lines
+    // are shared by reference and never rewritten.
     setLyrics(updated);
     try {
       await repository.putLyrics(updated);
     } catch {
       return;
     }
-    // Re-evaluate immediately under the new offset.
-    const positionMs = usePlaybackStore.getState().currentTimeMs;
-    setActiveIndex(findActiveLineIndex(updated.lines, positionMs, next));
   };
 
   const importLyricFile = async (file: File) => {
@@ -513,6 +367,19 @@ export function LyricsView() {
     }
   };
 
+  // Capability is read from the actual payload — never from provider flags —
+  // so the UI never implies synchronization the data cannot deliver.
+  const payloadCapability = useMemo(() => (lyrics ? detectLyricsCapability(lyrics) : null), [lyrics]);
+
+  // Converted once per lyric lines + style + track duration. The offset is not
+  // an input: it is applied to the player clock, so nudging it never rebuilds lines.
+  const lyricLines = lyrics?.lines ?? null;
+  const trackDurationMs = track?.durationMs ?? null;
+  const amllLines = useMemo(
+    () => (lyricLines && timedLines ? toAmllLines({ lines: lyricLines }, { style: lyricsStyle, durationMs: trackDurationMs }) : []),
+    [lyricLines, timedLines, lyricsStyle, trackDurationMs],
+  );
+
   if (!track) {
     return (
       <div className="grid h-full place-items-center text-sm text-text-muted">Play a song to see its lyrics here.</div>
@@ -529,13 +396,18 @@ export function LyricsView() {
       : "Manual import"
     : null;
   const capabilityBadge =
-    lyrics?.origin?.capability === "word"
+    payloadCapability === "word"
       ? "word sync"
-      : lyrics?.origin?.capability === "line" || (timedLines && lyrics)
+      : payloadCapability === "line"
         ? "line sync"
-        : isInstrumental
+        : payloadCapability === "instrumental"
           ? "instrumental"
-          : "plain text";
+          : payloadCapability === "plain"
+            ? "plain text"
+            : "no content";
+  // Honesty hint: the word-by-word preference is saved, but this song's data
+  // cannot deliver it — say so instead of silently doing nothing.
+  const wordStyleInactive = lyricsStyle === "word" && payloadCapability === "line";
 
   return (
     <div className="group/lyrics relative flex h-full min-h-0 flex-col">
@@ -560,12 +432,18 @@ export function LyricsView() {
           <div>
             <p className="text-sm font-medium text-text-primary">
               {checking
-                ? "Searching lrcmux…"
+                ? discoveryPhase === "identifying"
+                  ? "Identifying track…"
+                  : discoveryPhase === "validating"
+                    ? "Validating lyrics…"
+                    : "Searching lyrics…"
                 : discoveryTrackId === track.id && discoveryStatus === "error"
                   ? "Couldn’t load lyrics"
                   : discoveryTrackId === track.id && discoveryStatus === "offline"
                     ? "Offline — nothing cached for this song"
-                    : "No lyrics yet"}
+                    : discoveryTrackId === track.id && discoveryStatus === "not-found"
+                      ? "No reliable match found"
+                      : "No lyrics yet"}
             </p>
             <p className="mt-1 max-w-sm text-xs text-text-secondary">
               Import an <code>.lrc</code> file with timestamps for synced lyrics, or a <code>.txt</code> for plain text.
@@ -603,6 +481,18 @@ export function LyricsView() {
             )}
           </div>
         </div>
+      ) : timedLines ? (
+        <div className="min-h-0 flex-1" aria-label="Synced lyrics">
+          <Suspense fallback={<div className="grid h-full place-items-center text-sm text-text-muted">Loading…</div>}>
+            <AmllLyricPlayer
+              lines={amllLines}
+              offsetMs={lyrics.offsetMs}
+              isPlaying={isPlaying}
+              fontSize={FONT_SIZES[lyricFontSize]}
+              onSeek={seekToAudioMs}
+            />
+          </Suspense>
+        </div>
       ) : (
         <div
           ref={containerRef}
@@ -623,8 +513,7 @@ export function LyricsView() {
             lineHeight: lyricLineSpacing,
             contain: "layout paint style",
           }}
-          role={timedLines ? "list" : undefined}
-          aria-label={timedLines ? "Synced lyrics" : "Lyrics"}
+          aria-label="Lyrics"
         >
           <div
             ref={listRef}
@@ -636,17 +525,7 @@ export function LyricsView() {
             }}
           >
             {lyrics.lines.map((line, index) => (
-              <LyricLineItem
-                key={index}
-                index={index}
-                line={line}
-                isActive={index === activeIndex}
-                activeWordIndex={activeWordIndex}
-                timedLines={timedLines}
-                lyricsStyle={lyricsStyle}
-                fontSize={FONT_SIZES[lyricFontSize]}
-                onSeek={seekToLine}
-              />
+              <LyricLineItem key={index} line={line} fontSize={FONT_SIZES[lyricFontSize]} />
             ))}
           </div>
         </div>
@@ -663,7 +542,13 @@ export function LyricsView() {
         >
           <span className="flex min-w-0 items-center gap-1.5 text-text-muted">
             {checking ? (
-              <span className="animate-pulse">Finding lyrics on lrcmux…</span>
+              <span className="animate-pulse">
+                {discoveryPhase === "identifying"
+                  ? "Identifying track…"
+                  : discoveryPhase === "validating"
+                    ? "Validating lyrics…"
+                    : "Searching lyrics…"}
+              </span>
             ) : lyrics ? (
               <>
                 <span>
@@ -673,6 +558,11 @@ export function LyricsView() {
                       ? `Synced lyrics · ${capabilityBadge}`
                       : "Plain text — not synchronized"}
                 </span>
+                {wordStyleInactive && (
+                  <span className="rounded-full border px-2 py-0.5" style={{ borderColor: "var(--border-subtle)" }} role="note">
+                    word style inactive — line sync only
+                  </span>
+                )}
                 {sourceBadge && (
                   <span className="rounded-full border px-2 py-0.5" style={{ borderColor: "var(--border-subtle)" }}>
                     {sourceBadge}
@@ -692,6 +582,8 @@ export function LyricsView() {
               </span>
             ) : discoveryTrackId === track.id && discoveryStatus === "error" ? (
               <span className="text-danger">{errorMessage ?? "Lyrics lookup failed"}</span>
+            ) : discoveryTrackId === track.id && discoveryStatus === "not-found" ? (
+              <span>No reliable match found</span>
             ) : (
               <span>No lyrics for this song yet</span>
             )}

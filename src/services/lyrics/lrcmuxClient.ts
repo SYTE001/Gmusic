@@ -1,4 +1,3 @@
-import { APP_VERSION } from "../../types";
 import type { LyricLine, LyricWord } from "../../types";
 
 /**
@@ -6,7 +5,10 @@ import type { LyricLine, LyricWord } from "../../types";
  *
  * Reliability and politeness rules:
  * - One sequential request queue with a 300 ms gap — never parallel requests.
- * - Identifies itself with User-Agent / client identifier.
+ * - CORS-safe simple requests only: no custom headers (a header like
+ *   `X-Client` triggers an OPTIONS preflight, which the API rejects, making
+ *   every lookup fail from the browser). Identification relies on the
+ *   User-Agent the browser sends automatically.
  * - Per-request timeout (10 s), cancellation via AbortSignal, bounded retries
  *   for transient failures (up to 3 attempts), `Retry-After` respected on 429.
  * - Offline is detected before any network attempt.
@@ -94,6 +96,7 @@ export type LrcmuxQuery = {
   albumName?: string;
   /** Seconds. */
   duration?: number;
+  q?: string;
 };
 
 export class LrcmuxError extends Error {
@@ -208,7 +211,6 @@ async function fetchWithTimeout(url: string, signal: AbortSignal | undefined): P
       method: "GET",
       headers: {
         Accept: "application/json",
-        "X-Client": `local-music/${APP_VERSION}`,
       },
       signal: controller.signal,
     });
@@ -384,10 +386,11 @@ export async function lrcmuxGet(query: LrcmuxQuery, signal?: AbortSignal): Promi
 
 /** Fallback search via /compat/lrclib/api/search. Returns ranked candidates. */
 export async function lrcmuxSearch(query: LrcmuxQuery, signal?: AbortSignal): Promise<LrcmuxRecord[]> {
-  if (!query.trackName && !query.artistName) return [];
+  if (!query.trackName && !query.artistName && !query.q) return [];
   const data = await requestJson<LrcmuxCompatResponse[]>(
     "/compat/lrclib/api/search",
     {
+      q: query.q,
       track_name: query.trackName,
       artist_name: query.artistName,
       album_name: query.albumName,

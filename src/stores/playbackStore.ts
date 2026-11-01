@@ -114,6 +114,25 @@ const SEEK_PREVIOUS_THRESHOLD_MS = 3000;
 let loadToken = 0;
 let pendingSeekMs: number | null = null;
 
+/**
+ * Generation-based stale-event guard. `acceptedSourceGeneration` is the
+ * engine generation the store currently believes the element's source is on
+ * (or the one the in-flight startTrack is about to load). A media error
+ * whose generation differs belongs to a replaced source and must never
+ * affect the current track (PRD §7.6: one shared element, no stale races).
+ */
+let acceptedSourceGeneration: number | null = null;
+
+function expectNextSourceGeneration(): number | null {
+  const engine = usePlaybackStore.getState().engine;
+  return typeof engine?.sourceGeneration === "number" ? engine.sourceGeneration + 1 : null;
+}
+
+function recordActiveSourceGeneration(): void {
+  const engine = usePlaybackStore.getState().engine;
+  acceptedSourceGeneration = typeof engine?.sourceGeneration === "number" ? engine.sourceGeneration : null;
+}
+
 function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
   return {
     onTimeUpdate: (sec) => {
@@ -200,6 +219,7 @@ async function retryWithFreshSource(): Promise<void> {
   const resumeAtMs = state.currentTimeMs;
   const engine = state.getEngine();
   engine.setSource(resolved.url);
+  recordActiveSourceGeneration();
   if (state.isPlaying) {
     try {
       await engine.play();
@@ -241,6 +261,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
   setEngineForTests: (engine) => {
     const current = get().engine;
     current?.dispose();
+    acceptedSourceGeneration = null; // fresh engine, fresh generation space
     set({ engine });
   },
 
@@ -250,6 +271,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       engine = new HtmlAudioEngine(makeEngineEvents(get));
       engine.setVolume(get().volume);
       engine.setMuted(get().isMuted);
+      acceptedSourceGeneration = null;
       set({ engine });
     }
     return engine;
@@ -275,6 +297,9 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
   startTrack: async (trackId, options) => {
     const token = ++loadToken;
+    // From this moment, any media event from the still-loaded previous
+    // source is stale: this attempt owns the engine's next generation.
+    acceptedSourceGeneration = expectNextSourceGeneration();
     const { autoplay = true, startPositionMs, requestPermission } = options ?? {};
     pendingSeekMs = startPositionMs ?? null;
     // Any explicit start consumes a pending session-resume so a later Play
@@ -345,6 +370,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
     const engine = get().getEngine();
     engine.setSource(resolved.url);
+    recordActiveSourceGeneration();
 
     // A successful resolution is the ground truth for availability: if an
     // earlier attempt (or a stale startup check) marked the track missing or
@@ -371,6 +397,10 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
             status: "ready",
             announcement: "Playback blocked by the browser. Press play to start.",
           });
+        } else if (error instanceof DOMException && error.name === "AbortError") {
+          // play() was interrupted by a load() or pause() — a transition, not
+          // a playback failure. The element's own events keep state honest.
+          set({ isPlaying: false, status: "ready" });
         } else {
           get().handleEngineError({ code: 0, message: error instanceof Error ? error.message : String(error) });
         }
@@ -421,6 +451,10 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       .catch((error: unknown) => {
         if (error instanceof AutoplayBlockedError) {
           set({ isPlaying: false, autoplayBlocked: true, announcement: "Playback blocked by the browser. Press play to start." });
+        } else if (error instanceof DOMException && error.name === "AbortError") {
+          // play() interrupted by a load()/pause() — a transition, not a
+          // failure (e.g. pressing Play then Pause in quick succession).
+          set({ isPlaying: false });
         } else {
           get().handleEngineError({ code: 0, message: error instanceof Error ? error.message : String(error) });
         }
@@ -611,6 +645,20 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
   },
 
   handleEngineError: (failure) => {
+    // Code 1 (MEDIA_ERR_ABORTED) is how the shared element reports a load
+    // aborted by the next setSource — a transition, never a failure. The
+    // new source reports its own outcome.
+    if (failure.code === 1) return;
+    // Stale media event: the engine has already moved past the source this
+    // failure belongs to, so it must not touch the current track's state.
+    const engine = get().engine;
+    if (
+      engine?.sourceGeneration !== undefined &&
+      acceptedSourceGeneration !== null &&
+      engine.sourceGeneration !== acceptedSourceGeneration
+    ) {
+      return;
+    }
     const track = playbackHelpers.currentTrack();
     loadToken += 1; // invalidate any in-flight loads
     set({

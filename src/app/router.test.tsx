@@ -126,3 +126,44 @@ describe("persistent playback across route changes", () => {
     expect(usePlaybackStore.getState().isPlaying).toBe(true);
   });
 });
+
+describe("collapsible sidebar", () => {
+  beforeEach(() => localStorage.clear());
+  afterEach(() => localStorage.clear());
+
+  function renderShell() {
+    return render(
+      <MemoryRouter initialEntries={["/"]}>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route index element={<HomePage />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  it("collapses to the icon rail and persists the preference", () => {
+    renderShell();
+    const aside = document.querySelector("aside");
+    expect(aside?.className).toContain("w-60");
+
+    fireEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(localStorage.getItem("lm-sidebar-collapsed")).toBe("1");
+    expect(document.querySelector("aside")?.className).toContain("w-[76px]");
+
+    // The rail keeps every nav item reachable by accessible name.
+    expect(screen.getAllByRole("link", { name: "Library" }).length).toBeGreaterThan(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(localStorage.getItem("lm-sidebar-collapsed")).toBe("0");
+    expect(document.querySelector("aside")?.className).toContain("w-60");
+  });
+
+  it("starts collapsed when the persisted preference says so", () => {
+    localStorage.setItem("lm-sidebar-collapsed", "1");
+    renderShell();
+    expect(document.querySelector("aside")?.className).toContain("w-[76px]");
+    expect(screen.getAllByRole("link", { name: "Settings" }).length).toBeGreaterThan(0);
+  });
+});

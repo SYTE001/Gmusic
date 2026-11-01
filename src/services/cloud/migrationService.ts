@@ -202,6 +202,12 @@ function recompute(progress: MigrationProgress): void {
  * Uploads one object (audio or artwork) with a bounded retry. Presigning
  * alone proves nothing — the Worker verifies the stored object before the
  * caller is allowed to treat the upload as complete.
+ *
+ * Every attempt mints a fresh upload URL and a fresh signed intent: the
+ * presigned PUT and the intent carry the same short expiry (120s by default),
+ * and reusing either one after a retry delay fails the whole upload with
+ * "The upload intent has expired." One URL must never outlive the attempt
+ * that requested it.
  */
 async function uploadOne(
   track: Track,
@@ -209,16 +215,19 @@ async function uploadOne(
   mimeType: string,
   kind: "audio" | "artwork",
 ): Promise<string> {
-  const { objectKey, uploadUrl, uploadIntent, requiredHeaders } = await requestUploadUrl({
-    trackId: track.id,
-    fileName: kind === "audio" ? track.fileName : "artwork",
-    mimeType,
-    sizeBytes: file.size,
-    kind,
-  });
-
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt += 1) {
+    // A fresh intent and URL per attempt. `requestUploadUrl` also re-checks
+    // size and MIME against the Worker's allow-list, so a retry can never
+    // reuse a URL whose terms no longer match the file.
+    const { objectKey, uploadUrl, uploadIntent, requiredHeaders } = await requestUploadUrl({
+      trackId: track.id,
+      fileName: kind === "audio" ? track.fileName : "artwork",
+      mimeType,
+      sizeBytes: file.size,
+      kind,
+    });
+
     let response: Response;
     try {
       response = await fetch(uploadUrl, {
@@ -230,7 +239,7 @@ async function uploadOne(
       });
     } catch (error) {
       lastError = error;
-      // Transient network failure: retry once, then report.
+      // Transient network failure: retry once with a fresh URL, then report.
       if (attempt < UPLOAD_ATTEMPTS) continue;
       throw new CloudStorageError("network", "The file could not be uploaded. Check your connection and try again.");
     }

@@ -15,6 +15,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "@applemusic-like-lyrics/core": "0.6.0",
     "@supabase/supabase-js": "^2.118.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

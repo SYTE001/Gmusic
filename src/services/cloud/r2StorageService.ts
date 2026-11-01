@@ -110,6 +110,18 @@ async function postJson(path: string, body: unknown): Promise<unknown> {
   if (response.status === 404) {
     throw new CloudStorageError("not-found", await describeProblem(response), response.status);
   }
+  if (response.status === 409) {
+    // 409 upload-unverified: the intent expired (or the object never landed).
+    // This is retryable with a freshly minted URL, not an auth or server fault.
+    const message = await describeProblem(response);
+    throw new CloudStorageError(
+      "server",
+      /expired/i.test(message)
+        ? "The upload link expired before the file was sent. Retrying requests a fresh one."
+        : message,
+      response.status,
+    );
+  }
   if (!response.ok) {
     throw new CloudStorageError("server", await describeProblem(response), response.status);
   }

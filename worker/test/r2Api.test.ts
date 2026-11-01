@@ -1,5 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startWorker, USER_A, USER_B, type TestContext, type WorkerResponse } from "./harness";
+import { makeUploadIntent, startWorker, USER_A, USER_B, type TestContext, type WorkerResponse } from "./harness";
+
+/** Decodes the base64url payload segment of an upload intent token. */
+function base64UrlDecode(segment: string): Uint8Array {
+  const padded = segment.replace(/-/g, "+").replace(/_/g, "/") + "===".slice(0, (4 - (segment.length % 4)) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
 
 let ctx: TestContext | null = null;
 
@@ -261,6 +270,44 @@ describe("complete (upload verification)", () => {
       }),
     });
     expect(response.status).toBe(400);
+  });
+
+  it("rejects an expired upload intent with the documented expiry message", async () => {
+    // Reproduces the reported failure for tracks like "Oladrys (128k)": the
+    // PUT succeeded but /complete rejected because the intent had lapsed.
+    const { body } = await requestUploadUrl({ trackId: "track-intent-expired", fileName: "song.mp3", mimeType: "audio/mpeg", sizeBytes: 600 });
+    const intent = body!.uploadIntent;
+
+    // Decode the signed payload, shift its expiry into the past, re-sign.
+    const encoded = intent.split(".")[0]!;
+    const payload = JSON.parse(
+      new TextDecoder().decode(base64UrlDecode(encoded)),
+    ) as { expiresAt: number };
+    const expired = await makeUploadIntent({ ...payload, expiresAt: Math.floor(Date.now() / 1000) - 60 });
+
+    await ctx!.bucket.put(body!.objectKey, new Uint8Array(600), { httpMetadata: { contentType: "audio/mpeg" } });
+    const response = await ctx!.api("/api/audio/complete", {
+      userId: USER_A,
+      body: JSON.stringify({ uploadIntent: expired, objectKey: body!.objectKey }),
+    });
+    expect(response.status).toBe(409);
+    const result = (await response.json()) as { error: { code: string; message: string } };
+    expect(result.error.code).toBe("upload-unverified");
+    expect(result.error.message).toMatch(/upload intent has expired/i);
+  });
+
+  it("accepts a freshly minted intent for the same object after an expiry", async () => {
+    // The retry path: a new upload-url request issues a new intent, and the
+    // already-stored object completes against it — no re-upload required.
+    const { body } = await requestUploadUrl({ trackId: "track-intent-refresh", fileName: "song.mp3", mimeType: "audio/mpeg", sizeBytes: 700 });
+    await ctx!.bucket.put(body!.objectKey, new Uint8Array(700), { httpMetadata: { contentType: "audio/mpeg" } });
+
+    const refreshed = await requestUploadUrl({ trackId: "track-intent-refresh", fileName: "song.mp3", mimeType: "audio/mpeg", sizeBytes: 700 });
+    const response = await ctx!.api("/api/audio/complete", {
+      userId: USER_A,
+      body: JSON.stringify({ uploadIntent: refreshed.body!.uploadIntent, objectKey: refreshed.body!.objectKey }),
+    });
+    expect(response.status).toBe(200);
   });
 
   it("rejects completion when uploadIntent was issued to a different user", async () => {

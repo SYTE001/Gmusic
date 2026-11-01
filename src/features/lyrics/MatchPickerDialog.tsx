@@ -38,12 +38,16 @@ export function MatchPickerDialog({
               <span className="min-w-0 flex-1 truncate text-sm text-text-primary">
                 {candidate.record.trackName || "Unknown title"}
               </span>
-              {candidate.record.hasWordSync && (
+              {candidate.capability === "word" && (
                 <span className="shrink-0 rounded-full bg-surface-raised px-2 py-0.5 text-[10px] text-accent">word sync</span>
               )}
-              {candidate.hasSynced ? (
+              {candidate.capability === "line" && (
                 <span className="shrink-0 rounded-full bg-surface-raised px-2 py-0.5 text-[10px] text-success">synced</span>
-              ) : (
+              )}
+              {candidate.capability === "instrumental" && (
+                <span className="shrink-0 rounded-full bg-surface-raised px-2 py-0.5 text-[10px] text-text-muted">instrumental</span>
+              )}
+              {candidate.capability === "plain" && (
                 <span className="shrink-0 rounded-full bg-surface-raised px-2 py-0.5 text-[10px] text-text-muted">plain</span>
               )}
             </span>

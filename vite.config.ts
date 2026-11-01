@@ -8,6 +8,17 @@ export default defineConfig({
   build: {
     sourcemap: false,
     target: "es2020",
+    rollupOptions: {
+      output: {
+        // Stable vendor chunks: the framework and the optional cloud SDK
+        // cache independently of app code, and the browser fetches them in
+        // parallel instead of one monolithic parse.
+        manualChunks: {
+          "react-vendor": ["react", "react-dom", "react-router-dom", "zustand"],
+          supabase: ["@supabase/supabase-js"],
+        },
+      },
+    },
   },
   test: {
     environment: "jsdom",

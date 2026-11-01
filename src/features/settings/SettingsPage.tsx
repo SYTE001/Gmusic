@@ -484,11 +484,14 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (val
       role="switch"
       aria-checked={checked}
       aria-label={label}
-      className={`relative h-6 w-11 rounded-full transition-colors ${checked ? "bg-accent-strong" : "bg-surface-hover"}`}
+      title={label}
+      className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors ${checked ? "bg-accent-strong" : "bg-surface-hover"}`}
       onClick={() => onChange(!checked)}
     >
+      {/* In-flow flex knob: pinned 2px from the edges in both states, so the
+          position can never drift with the host's static-position layout. */}
       <span
-        className={`absolute top-0.5 size-5 rounded-full bg-text-primary transition-transform ${checked ? "translate-x-[22px]" : "translate-x-0.5"}`}
+        className={`size-5 rounded-full bg-text-primary shadow-sm transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`}
       />
     </button>
   );

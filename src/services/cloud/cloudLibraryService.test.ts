@@ -19,6 +19,9 @@ const table = vi.hoisted(() => ({
    *  survives its own deletion (RLS row not owned, trigger, partitioning). */
   keepRowsOnDelete: false,
   actingUserId: "11111111-1111-1111-1111-111111111111",
+  /** When set, the next tracks upsert returns this plain-object PostgREST error
+   *  instead of writing — mirroring supabase-js's non-Error `error` field. */
+  rejectNextUpsert: null as { message: string; code: string } | null,
 }));
 
 function resetTable() {
@@ -31,6 +34,7 @@ function resetTable() {
   table.calls.length = 0;
   table.keepRowsOnDelete = false;
   table.actingUserId = "11111111-1111-1111-1111-111111111111";
+  table.rejectNextUpsert = null;
 }
 
 vi.mock("./cloudAuthService", () => ({
@@ -118,6 +122,12 @@ const fakeClient = {
 
       if (builder._pending.length > 0) {
         // One upsert per builder instance; apply exactly the rows it captured.
+        if (tableName === "tracks" && table.rejectNextUpsert) {
+          // Mirrors supabase-js: `error` is a PLAIN OBJECT, not an Error.
+          const rejection = table.rejectNextUpsert;
+          table.rejectNextUpsert = null;
+          return { data: null, error: { ...rejection } as never };
+        }
         try {
           applyWrites(tableName, builder._pending, onConflict);
           return { data: builder._pending, error: null };
@@ -215,9 +225,13 @@ function storeFor(tableName: string): Map<string, Record<string, unknown>> {
 
 import {
   deleteCloudTrackMetadata,
+  describeDatabaseError,
+  describeDatabaseErrorDetailed,
   fetchCloudLibrary,
   playlistToRow,
   rowToTrack,
+  sanitizeInt4,
+  sanitizeTextForDatabase,
   snapshotToLocalEntities,
   trackToRow,
   upsertCloudLyrics,
@@ -597,5 +611,91 @@ describe("Priority 1: Cloud metadata ownership enforcement", () => {
     expect(stored?.file_size).toBe(1000);
     expect(stored?.mime_type).toBe("audio/mpeg");
     expect(stored?.last_synced_at).toBeTruthy();
+  });
+});
+
+describe("Priority 2: error serialization for database failures", () => {
+  beforeEach(() => resetTable());
+
+  it("renders the PostgREST message and code instead of [object Object]", async () => {
+    // Supabase returns `error` as a PLAIN OBJECT on the { data, error } path.
+    // The old code did String(error) and the UI showed "[object Object]".
+    const plainObject = { message: "duplicate key value violates unique constraint", code: "23505", details: "Key (id)=(t-1) already exists.", hint: "" } as never;
+    const err = plainObject as unknown as { message: string };
+    expect(describeDatabaseError(err)).toBe("duplicate key value violates unique constraint (code 23505)");
+    expect(describeDatabaseError(err)).not.toBe("[object Object]");
+  });
+
+  it("includes the PostgREST hint in the developer-facing description", async () => {
+    const err = { message: "permission denied", code: "42501", details: "", hint: "Grant the required privileges to the current role with: GRANT SELECT ON public.tracks TO anon;" } as never;
+    expect(describeDatabaseErrorDetailed(err)).toContain("GRANT SELECT");
+    expect(describeDatabaseError(err)).not.toContain("GRANT");
+  });
+
+  it("handles a string error, an Error instance, and a bare object without message", () => {
+    expect(describeDatabaseError("network reset")).toBe("network reset");
+    expect(describeDatabaseError(new Error("boom"))).toBe("boom");
+    // No message field: the code alone is the most specific thing available.
+    expect(describeDatabaseError({ code: "PGRST301" } as never)).toBe("PGRST301");
+    expect(describeDatabaseError({ details: "Results contain 2 rows" } as never)).toBe("Results contain 2 rows");
+    // An object with no usable field still degrades to a stable string.
+    expect(describeDatabaseError({} as never)).toBe("[object Object]");
+    expect(describeDatabaseError(null)).toBe("null");
+    expect(describeDatabaseError(undefined)).toBe("undefined");
+  });
+
+  it("surfaces the real database cause when saving cloud tracks fails", async () => {
+    // Simulate the exact production failure: the object is already in R2 but
+    // the upsert is rejected. The thrown message must name the database cause.
+    table.rejectNextUpsert = { message: 'null value in column "file_name" violates not-null constraint', code: "23502" };
+
+    const track = makeTrack({ id: "t-db-fail", objectKey: "users/u-1/tracks/t-db-fail/audio.mp3" });
+    // The mock consumes the rejection on the first call, so re-arm it per
+    // expectation while asserting every part of the formatted message.
+    await expect(upsertCloudTracks([track])).rejects.toThrow(/Saving cloud tracks failed/);
+    table.rejectNextUpsert = { message: 'null value in column "file_name" violates not-null constraint', code: "23502" };
+    await expect(upsertCloudTracks([track])).rejects.toThrow(/null value in column "file_name"/);
+    table.rejectNextUpsert = { message: 'null value in column "file_name" violates not-null constraint', code: "23502" };
+    await expect(upsertCloudTracks([track])).rejects.toThrow(/23502/);
+  });
+});
+
+describe("Priority 3: Unicode and corrupt filename handling", () => {
+  beforeEach(() => resetTable());
+
+  it("round-trips a UTF-8 filename through the cloud row without transformation", async () => {
+    const track = makeTrack({ id: "t-unicode", fileName: "Björk — Jóga (白).flac", title: "Jóga", artist: "Björk", album: "Homogenic" });
+    const row = trackToRow(track);
+    expect(row.file_name).toBe("Björk — Jóga (白).flac");
+    expect(row.title).toBe("Jóga");
+    expect(row.artist).toBe("Björk");
+  });
+
+  it("drops lone surrogates and NUL bytes that Postgres cannot store, keeping valid text", () => {
+    // A corrupt tag frame can produce a lone surrogate; Postgres rejects the
+    // whole row for it. Valid characters must survive untouched.
+    const corrupt = "caf\u{E9}\u{D800} \u0000 null";
+    const cleaned = sanitizeTextForDatabase(corrupt);
+    expect(cleaned).toBe("café  null");
+    // A well-formed surrogate pair (a real emoji) is preserved.
+    expect(sanitizeTextForDatabase("music \u{1F3B5}.mp3")).toBe("music \u{1F3B5}.mp3");
+  });
+
+  it("nulls out track numbers that cannot fit a Postgres integer", () => {
+    expect(sanitizeInt4(7)).toBe(7);
+    expect(sanitizeInt4(null)).toBe(null);
+    expect(sanitizeInt4(2147483648)).toBe(null); // int4 max + 1
+    expect(sanitizeInt4(Number.NaN)).toBe(null);
+  });
+
+  it("uploads and persists a track whose filename contains non-ASCII characters", async () => {
+    const track = makeTrack({ id: "t-unicode-upload", fileName: "穿越時空 - 思念.mp3", title: "思念", artist: "穿越時空", objectKey: "users/u-1/tracks/t-unicode-upload/audio.mp3" });
+    const outcome = await upsertCloudTracks([track]);
+
+    expect(outcome[0]?.objectKey).toBe("users/u-1/tracks/t-unicode-upload/audio.mp3");
+    const stored = table.rows.get("t-unicode-upload");
+    expect(stored?.file_name).toBe("穿越時空 - 思念.mp3");
+    expect(stored?.title).toBe("思念");
+    expect(stored?.artist).toBe("穿越時空");
   });
 });

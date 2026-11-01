@@ -1,10 +1,12 @@
 import type { LyricLine, LyricWord, Track, TrackLyrics } from "../../types";
 import { DB_SCHEMA_VERSION } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
-import { describeLrcmuxError, lrcmuxGet, lrcmuxSearch, type LrcmuxRecord } from "./lrcmuxClient";
+import { CAPABILITY_RANK, detectLyricsCapability, type LyricCapabilityLevel } from "./capability";
+import { describeLrcmuxError, lrcmuxGet, lrcmuxSearch, type LrcmuxQuery, type LrcmuxRecord } from "./lrcmuxClient";
 import type { LrclibRecord } from "./lrclibClient";
 import { decideMatch, rankCandidates, type RankedCandidate } from "./matching";
 import { parseLyricsfile } from "./lyricsfile";
+import { normalizeTrackMetadata } from "../metadata/normalization";
 
 /**
  * LyricsService — parses .lrc / .txt lyrics, applies per-track offsets, and
@@ -160,9 +162,13 @@ export function parseLyricFile(trackId: string, fileName: string, content: strin
   };
 }
 
-/** True when at least one line carries per-word timestamps. */
+/** True when at least one line carries usable per-word timestamps — a word
+ * entry with a finite start and non-empty text. Provider or parser artifacts
+ * (empty text, NaN starts) never enable word-by-word mode. */
 export function hasWordTimestamps(lines: LyricLine[]): boolean {
-  return lines.some((line) => line.words !== undefined && line.words.length > 0);
+  return lines.some((line) =>
+    line.words?.some((word) => Number.isFinite(word.startMs) && word.text.trim().length > 0),
+  );
 }
 
 /**
@@ -247,10 +253,6 @@ export type LyricsResolution =
   | { outcome: "skipped-recently" }
   | { outcome: "offline" }
   | { outcome: "error"; message: string };
-
-function roundDurationForApi(durationMs: number): number {
-  return Math.round(durationMs / 1000);
-}
 
 /**
  * Converts an LRCLIB record into a TrackLyrics document. Capability
@@ -347,7 +349,9 @@ export function buildLyricsFromRecord(
     };
   }
 
-  // Records with no payload at all behave like instrumental: nothing to show.
+  // Records with no payload at all carry no lyrics: capability "none" — the
+  // resolver never attaches them (they are not instrumental; that requires
+  // the provider to say so explicitly).
   return {
     trackId,
     format: "txt",
@@ -356,7 +360,7 @@ export function buildLyricsFromRecord(
     updatedAt: Date.now(),
     skippedLines: 0,
     sourceName: sourceLabel,
-    origin: { ...origin, capability: "instrumental" },
+    origin: { ...origin, capability: "none" },
     schemaVersion: DB_SCHEMA_VERSION,
   };
 }
@@ -379,22 +383,294 @@ export async function attachLrcmuxRecord(track: Track, record: LrcmuxRecord | Lr
 export const attachLrclibRecord = attachLrcmuxRecord;
 
 /**
- * Full discovery flow for one track: local cache → negative cache →
- * /api/get (validated) → /api/search (ranked) → auto-accept or candidate list.
+ * Full discovery flow for one track (task §6):
+ *
+ * 1. Local lyrics + cache metadata are read first.
+ * 2. Manual/imported lyrics are returned untouched (never silently replaced).
+ * 3. Cached word sync returns immediately — already the best quality.
+ * 4. Cached line sync allows a bounded upgrade lookup for word sync only.
+ * 5. Cached plain text allows a bounded upgrade lookup for line/word sync.
+ * 6. With no cache: exact /api/get lookup (metadata- AND capability-
+ *    validated) → /api/search ranking → auto-accept or candidate list.
+ *
+ * An attach is only ever a strict quality upgrade (or an explicit force
+ * refresh with at least equal quality). If nothing better exists — including
+ * API failures or empty payloads — the existing lyrics are kept and reported
+ * as "cached", so the UI never loses visible lyrics.
  * Never blocks or touches playback; all failures return typed outcomes.
  */
-export async function resolveLyricsForTrack(
+
+/** Upgrade attempts back off for a day after finding nothing better. */
+export const LYRICS_UPGRADE_RETRY_MS = 24 * 60 * 60 * 1000;
+
+function roundDurationForApi(durationMs: number): number {
+  return Math.round(durationMs / 1000);
+}
+
+/**
+ * Validates one record against the track and the currently cached lyrics.
+ * Returns the built document only when it is metadata-validated (strict
+ * thresholds), carries a usable payload, and satisfies the quality floor:
+ * - fresh (no cache): any usable capability,
+ * - force refresh: equal or better than the cache,
+ * - upgrade: strictly better than the cache.
+ */
+function considerRecord(
   track: Track,
-  options: { force?: boolean; signal?: AbortSignal } = {},
+  record: LrcmuxRecord | LrclibRecord,
+  cached: TrackLyrics | null,
+  minCapabilityRank: number,
+): { lyrics: TrackLyrics; capability: LyricCapabilityLevel } | null {
+  if (!decideMatch(track, record).autoAccept) return null;
+  const lyrics = buildLyricsFromRecord(track.id, record, cached?.offsetMs ?? 0);
+  const capability = detectLyricsCapability(lyrics);
+  if (capability === "none") return null; // empty or malformed payload
+  if (CAPABILITY_RANK[capability] < minCapabilityRank) return null;
+  return { lyrics, capability };
+}
+
+async function persistAttached(track: Track, lyrics: TrackLyrics, record: LrcmuxRecord | LrclibRecord): Promise<TrackLyrics> {
+  await repository.putLyrics(lyrics);
+  await repository.putLyricsCacheMeta({
+    trackId: track.id,
+    status: "accepted",
+    checkedAt: Date.now(),
+    recordId: typeof record.id === "number" ? record.id : null,
+    schemaVersion: DB_SCHEMA_VERSION,
+  });
+  return lyrics;
+}
+
+/** Fresh accepted marker used as the upgrade backoff; never touches lyrics. */
+async function markUpgradeChecked(trackId: string): Promise<void> {
+  const meta = await repository.getLyricsCacheMeta(trackId);
+  await repository.putLyricsCacheMeta({
+    trackId,
+    status: "accepted",
+    checkedAt: Date.now(),
+    recordId: meta?.recordId ?? null,
+    schemaVersion: DB_SCHEMA_VERSION,
+  });
+}
+
+async function upgradeBackoffActive(trackId: string): Promise<boolean> {
+  const meta = await repository.getLyricsCacheMeta(trackId);
+  return meta?.status === "accepted" && Date.now() - meta.checkedAt < LYRICS_UPGRADE_RETRY_MS;
+}
+
+export type ResolutionPhase = "identifying" | "searching" | "validating";
+
+export type ResolveLyricsOptions = {
+  force?: boolean;
+  signal?: AbortSignal;
+  onProgress?: (phase: ResolutionPhase) => void;
+  libraryTracks?: Track[];
+};
+
+async function resolveLyrics(
+  track: Track,
+  options: ResolveLyricsOptions,
+  context: {
+    cached: TrackLyrics | null;
+    /** Quality floor for an attach, as a capability rank. */
+    minCapabilityRank: number;
+    /** When true, an unsuccessful search keeps existing lyrics instead of a chooser. */
+    keepOnMiss: boolean;
+  },
 ): Promise<LyricsResolution> {
-  // 1. Cached lyrics win — no network (feature spec §6.1).
-  const cached = await repository.getLyrics(track.id);
-  if (cached && !options.force) {
+  const { cached, minCapabilityRank, keepOnMiss } = context;
+
+  // 0. Metadata Normalization Layer (PRD §1, §3)
+  options.onProgress?.("identifying");
+  const normalized = normalizeTrackMetadata(track, { libraryTracks: options.libraryTracks });
+  const canonicalTrack: Track = {
+    ...track,
+    title: normalized.title,
+    artist: normalized.artist,
+    album: normalized.album ?? track.album,
+  };
+
+  options.onProgress?.("searching");
+
+  let plainFallback: { lyrics: TrackLyrics; record: LrcmuxRecord | LrclibRecord } | null = null;
+  const allCollectedRecords: LrcmuxRecord[] = [];
+  const seenQueries = new Set<string>();
+  const markQueryKey = (q: LrcmuxQuery) =>
+    `${q.trackName ?? ""}|${q.artistName ?? ""}|${q.albumName ?? ""}|${q.q ?? ""}`;
+
+  // Stage A — Exact identity (PRD §4)
+  // Query /get with normalized title and artist
+  const queryA: LrcmuxQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+    duration: track.durationMs != null ? roundDurationForApi(track.durationMs) : undefined,
+  };
+
+  let exactRecord: LrcmuxRecord | null = null;
+  try {
+    exactRecord = await lrcmuxGet(queryA, options.signal);
+  } catch (error) {
+    if (isAborted(error)) throw error;
+  }
+
+  if (exactRecord) {
+    const consideration = considerRecord(canonicalTrack, exactRecord, cached, minCapabilityRank);
+    if (consideration) {
+      options.onProgress?.("validating");
+      if (consideration.capability === "plain") {
+        plainFallback = { lyrics: consideration.lyrics, record: exactRecord };
+      } else {
+        return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, exactRecord) };
+      }
+    }
+  }
+
+  // Stage B — Structured discovery (PRD §4)
+  // Query /search with normalized track name and artist name
+  const queryB: LrcmuxQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+  };
+  seenQueries.add(markQueryKey(queryB));
+
+  let lastSearchError: unknown = null;
+  try {
+    const resultsB = await lrcmuxSearch(queryB, options.signal);
+    if (resultsB && resultsB.length > 0) {
+      allCollectedRecords.push(...resultsB);
+      const candidatesB = rankCandidates(canonicalTrack, resultsB);
+      for (const candidate of candidatesB) {
+        const consideration = considerRecord(canonicalTrack, candidate.record, cached, minCapabilityRank);
+        if (!consideration) continue;
+        if (consideration.capability === "plain") continue;
+        options.onProgress?.("validating");
+        return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, candidate.record) };
+      }
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastSearchError = error;
+  }
+
+  // Stage C — Alternative query generation (PRD §4)
+  // Swapped order, cleaned title, original title, primary artist, and free query
+  for (const alt of normalized.alternateQueries) {
+    if (options.signal?.aborted) throw new DOMException("AbortError", "AbortError");
+    const altQuery: LrcmuxQuery = {
+      trackName: alt.trackName || undefined,
+      artistName: alt.artistName || undefined,
+      q: alt.q || undefined,
+    };
+    const key = markQueryKey(altQuery);
+    if (seenQueries.has(key)) continue;
+    seenQueries.add(key);
+
+    try {
+      const altResults = await lrcmuxSearch(altQuery, options.signal);
+      if (altResults && altResults.length > 0) {
+        allCollectedRecords.push(...altResults);
+        const altCandidates = rankCandidates(canonicalTrack, altResults);
+        for (const candidate of altCandidates) {
+          const consideration = considerRecord(canonicalTrack, candidate.record, cached, minCapabilityRank);
+          if (!consideration) continue;
+          if (consideration.capability === "plain") continue;
+          options.onProgress?.("validating");
+          return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, candidate.record) };
+        }
+      }
+    } catch (error) {
+      if (isAborted(error)) throw error;
+      lastSearchError = error;
+    }
+  }
+
+  // Fallbacks & results evaluation
+  if (plainFallback) {
+    options.onProgress?.("validating");
+    return { outcome: "attached", lyrics: await persistAttached(track, plainFallback.lyrics, plainFallback.record) };
+  }
+
+  if (keepOnMiss && cached) {
     return { outcome: "cached", lyrics: cached };
   }
 
-  // 2. Negative cache: skip recently failed lookups instead of hammering the API.
-  if (!options.force) {
+  // Deduplicate collected candidates
+  const recordMap = new Map<string | number, LrcmuxRecord>();
+  for (const r of allCollectedRecords) {
+    recordMap.set(r.id, r);
+  }
+  const finalCandidates = rankCandidates(canonicalTrack, Array.from(recordMap.values()));
+
+  if (finalCandidates.length === 0) {
+    if (lastSearchError && allCollectedRecords.length === 0) {
+      return { outcome: "error", message: describeLrcmuxError(lastSearchError) };
+    }
+    await repository.putLyricsCacheMeta({
+      trackId: track.id,
+      status: "not-found",
+      checkedAt: Date.now(),
+      recordId: null,
+      schemaVersion: DB_SCHEMA_VERSION,
+    });
+    return { outcome: "not-found" };
+  }
+
+  // Ambiguous or plain-only best match: offer in chooser
+  await repository.putLyricsCacheMeta({
+    trackId: track.id,
+    status: "needs-selection",
+    checkedAt: Date.now(),
+    recordId: null,
+    schemaVersion: DB_SCHEMA_VERSION,
+  });
+  return { outcome: "needs-selection", candidates: finalCandidates };
+}
+
+export async function resolveLyricsForTrack(
+  track: Track,
+  options: ResolveLyricsOptions = {},
+): Promise<LyricsResolution> {
+  const { force = false } = options;
+
+  // 1. Local lyrics are the starting point.
+  const cached = (await repository.getLyrics(track.id)) ?? null;
+  const cachedCapability = cached ? detectLyricsCapability(cached) : null;
+  // Explicit manual origin marks user-imported lyrics — the API must never
+  // silently replace them. Records without any origin are legacy API caches:
+  // their capability is inferred from the payload and they remain upgradable.
+  const cachedIsManual = cached?.origin?.kind === "manual";
+
+  if (cached && !force) {
+    // Manual lyrics and already-best-quality caches never touch the network.
+    if (cachedIsManual || cachedCapability === "word" || cachedCapability === "instrumental") {
+      return { outcome: "cached", lyrics: cached };
+    }
+    if (cachedCapability === "line" || cachedCapability === "plain") {
+      // Quality-upgrade lookup, bounded by a daily backoff so replaying a
+      // track does not re-query the API every time.
+      if (await upgradeBackoffActive(track.id)) {
+        return { outcome: "cached", lyrics: cached };
+      }
+      const upgraded = await resolveLyrics(track, options, {
+        cached,
+        minCapabilityRank: CAPABILITY_RANK[cachedCapability] + 1,
+        keepOnMiss: true,
+      });
+      if (upgraded.outcome === "attached") return upgraded;
+      // Nothing better exists (or the attempt failed): keep the cache, and
+      // back off so replaying the track does not re-query.
+      await markUpgradeChecked(track.id);
+      return { outcome: "cached", lyrics: cached };
+    }
+    // "none": the cached document has no usable content — fall through to a
+    // full discovery below.
+  }
+
+  // 2. Negative cache: skip recently failed lookups instead of hammering the
+  //    API. Only meaningful when there are no (usable) lyrics to protect.
+  if (!force) {
     const meta = await repository.getLyricsCacheMeta(track.id);
     if (meta) {
       if (meta.status === "accepted" && !cached) {
@@ -411,61 +687,13 @@ export async function resolveLyricsForTrack(
     return { outcome: "offline" };
   }
 
-  const query = {
-    trackName: track.title || undefined,
-    artistName: track.artist || undefined,
-    albumName: track.album || undefined,
-    duration: track.durationMs != null ? roundDurationForApi(track.durationMs) : undefined,
-  };
-
-  // 3. Exact lookup — still validated client-side (the API's duration
-  //    matching is loose and can return a different recording).
-  try {
-    const exact = await lrcmuxGet(query, options.signal);
-    if (exact) {
-      const decision = decideMatch(track, exact);
-      if (decision.autoAccept) {
-        const lyrics = await attachLrcmuxRecord(track, exact);
-        return { outcome: "attached", lyrics };
-      }
-    }
-  } catch (error) {
-    if (isAborted(error)) throw error;
-    // Fall through to search; both paths share error reporting below.
-  }
-
-  // 4. Search + rank.
-  try {
-    const results = await lrcmuxSearch(query, options.signal);
-    const candidates = rankCandidates(track, results);
-    if (candidates.length === 0) {
-      await repository.putLyricsCacheMeta({
-        trackId: track.id,
-        status: "not-found",
-        checkedAt: Date.now(),
-        recordId: null,
-        schemaVersion: DB_SCHEMA_VERSION,
-      });
-      return { outcome: "not-found" };
-    }
-    const best = decideMatch(track, candidates[0].record);
-    if (best.autoAccept && candidates[0].hasSynced) {
-      const lyrics = await attachLrcmuxRecord(track, candidates[0].record as LrcmuxRecord);
-      return { outcome: "attached", lyrics };
-    }
-    // Ambiguous or plain-only best match: let the user choose.
-    await repository.putLyricsCacheMeta({
-      trackId: track.id,
-      status: "needs-selection",
-      checkedAt: Date.now(),
-      recordId: null,
-      schemaVersion: DB_SCHEMA_VERSION,
-    });
-    return { outcome: "needs-selection", candidates };
-  } catch (error) {
-    if (isAborted(error)) throw error;
-    return { outcome: "error", message: describeLrcmuxError(error) };
-  }
+  // 3. Full discovery. Force refreshes must reach at least the quality the
+  //    user already has; a fresh (cache-less) track accepts any usable result.
+  return resolveLyrics(track, options, {
+    cached,
+    minCapabilityRank: cached ? CAPABILITY_RANK[cachedCapability!] : CAPABILITY_RANK.plain,
+    keepOnMiss: Boolean(cached),
+  });
 }
 
 function isAborted(error: unknown): boolean {

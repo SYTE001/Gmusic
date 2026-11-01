@@ -1,0 +1,135 @@
+/*
+ * Gmusic — Solid Lyrics Spin Transition & Theme Bridge
+ *
+ * Replaces the default rubber-like, bouncy spring physics and staggered per-word
+ * transitions with a unified solid 3D spin transition (Apple/Spotify/Liner style).
+ * The entire line animates as ONE visual element while word-by-word mask highlighting
+ * remains fully synchronized and intact.
+ *
+ * Performance Contract:
+ * - Purely transform and opacity animated (GPU-composited).
+ * - No layout-triggering animated properties (width, height, top/left, margin, padding, blur).
+ * - No per-word entrance/exit float animations; word spans are immobilized.
+ * - Easing: cubic-bezier(0.22, 1, 0.36, 1) with zero overshoot.
+ * - Rotation: 10deg 3D tilt.
+ * - Duration: 280ms.
+ */
+
+.gm-amll {
+  height: 100%;
+  min-height: 0;
+  perspective: 1200px;
+  perspective-origin: center center;
+}
+
+.gm-amll .amll-lyric-player {
+  --amll-lp-color: var(--text-primary);
+  --amll-lp-hover-bg-color: var(--surface-hover);
+  --amll-lp-font-size: var(--gm-lyric-font-size);
+  /* AMLL defaults to plus-lighter, which turns text invisible on a light theme. */
+  mix-blend-mode: normal;
+  transform-style: preserve-3d;
+}
+
+/*
+ * Line scrolling wrapper:
+ * Smooth GPU transform scrolling without spring overshoot or bouncy oscillation.
+ */
+.gm-amll .FmKaba_lyricLineWrapper {
+  transition:
+    transform 280ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 280ms cubic-bezier(0.22, 1, 0.36, 1) !important;
+  will-change: transform;
+  filter: none !important;
+}
+
+/*
+ * Remove nested layout-triggering filter and box-shadow transitions from line containers.
+ */
+.gm-amll .FmKaba_lyricLine {
+  filter: none !important;
+  box-shadow: none !important;
+  transition: none !important;
+}
+
+/*
+ * Lock all inner word and character spans to prevent sequential entrance/exit,
+ * rubber-like bouncing, or independent motion. Word-by-word highlight sync uses
+ * CSS mask-image (WebMaskAnimator), which remains 100% active and unhindered.
+ */
+.gm-amll .FmKaba_lyricMainLine span,
+.gm-amll .FmKaba_lyricMainLine .FmKaba_emphasizeWrapper,
+.gm-amll .FmKaba_lyricMainLine .FmKaba_emphasize,
+.gm-amll .FmKaba_lyricMainLine .FmKaba_romanWord,
+.gm-amll .FmKaba_lyricMainLine .FmKaba_rubyWord {
+  transform: none !important;
+  transition: none !important;
+  animation: none !important;
+}
+
+/*
+ * Unified Solid 3D Spin Transition:
+ * The entire line rotates and fades as ONE single visual element.
+ *
+ * Inactive / past lines: subtle 10-degree tilt, slight scale decrease, subtle opacity fade.
+ */
+.gm-amll .FmKaba_lyricMainLine {
+  display: block;
+  transform-origin: center center;
+  backface-visibility: hidden;
+  transform: perspective(1000px) rotateX(-10deg) scale(0.96);
+  opacity: 0.4;
+  transition:
+    transform 280ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 280ms cubic-bezier(0.22, 1, 0.36, 1) !important;
+  will-change: transform, opacity;
+}
+
+/*
+ * Upcoming inactive lines (after active line): tilted slightly forward (+10deg).
+ */
+.gm-amll .FmKaba_lyricLineWrapper:has(.FmKaba_active) ~ .FmKaba_lyricLineWrapper .FmKaba_lyricMainLine {
+  transform: perspective(1000px) rotateX(10deg) scale(0.96);
+  opacity: 0.4;
+}
+
+/*
+ * Active line: settles smoothly into stable flat position (0deg), full scale, full opacity.
+ */
+.gm-amll .FmKaba_active .FmKaba_lyricMainLine,
+.gm-amll .FmKaba_lyricMainLine.FmKaba_active {
+  transform: perspective(1000px) rotateX(0deg) scale(1);
+  opacity: 1;
+}
+
+/* Background lines (duet / background vocals) */
+.gm-amll .FmKaba_lyricBgLine .FmKaba_lyricMainLine,
+.gm-amll .FmKaba_lyricSubLine {
+  opacity: 0.35;
+  transition: opacity 280ms cubic-bezier(0.22, 1, 0.36, 1) !important;
+}
+
+/*
+ * Respect prefers-reduced-motion and in-app data-motion="on":
+ * Disables the 3D spin rotation and simplifies to a clean, subtle opacity crossfade.
+ */
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="off"]) .gm-amll .FmKaba_lyricMainLine {
+    transform: none !important;
+    transition: opacity 160ms ease !important;
+    will-change: opacity;
+  }
+  html:not([data-motion="off"]) .gm-amll .FmKaba_lyricLineWrapper {
+    transition: transform 160ms ease !important;
+  }
+}
+
+html[data-motion="on"] .gm-amll .FmKaba_lyricMainLine {
+  transform: none !important;
+  transition: opacity 160ms ease !important;
+  will-change: opacity;
+}
+
+html[data-motion="on"] .gm-amll .FmKaba_lyricLineWrapper {
+  transition: transform 160ms ease !important;
+}

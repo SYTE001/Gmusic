@@ -90,6 +90,37 @@ describe("evaluateMatch", () => {
     const decision = decideMatch(track, record({ duration: 200 }));
     expect(decision.quality.rejected).toBe(false);
   });
+
+  it("canonicalizes featured-artist, bracketed and punctuation qualifiers", () => {
+    const withFeature = decideMatch(track, record({ trackName: "Gentle Rise (feat. Someone Else)" }));
+    expect(withFeature.quality.titleSimilarity).toBe(1);
+    expect(withFeature.autoAccept).toBe(true);
+
+    const punctuated = decideMatch(track, record({ trackName: "Gentle Rise!" }));
+    expect(punctuated.quality.titleSimilarity).toBe(1);
+    expect(punctuated.autoAccept).toBe(true);
+
+    const remasterSuffix = decideMatch(track, record({ trackName: "Gentle Rise - Remastered 2011" }));
+    expect(remasterSuffix.quality.titleSimilarity).toBe(1);
+    expect(remasterSuffix.autoAccept).toBe(true);
+  });
+
+  it("canonicalizes the local side too without changing match thresholds", () => {
+    const local: Pick<Track, "title" | "artist" | "album" | "durationMs"> = {
+      title: "Gentle Rise (2011 Remaster)",
+      artist: "Aurora Fields",
+      album: "Northern Lights (Deluxe Edition)",
+      durationMs: 212000,
+    };
+    const decision = decideMatch(local, record());
+    expect(decision.quality.titleSimilarity).toBe(1);
+    expect(decision.autoAccept).toBe(true);
+  });
+
+  it("still rejects a wildly different recording whose qualifiers were stripped", () => {
+    const decision = decideMatch(track, record({ trackName: "Gentle Rise (Live 12 Minute Version)", duration: 721 }));
+    expect(decision.quality.rejected).toBe(true);
+  });
 });
 
 describe("rankCandidates", () => {
@@ -98,9 +129,30 @@ describe("rankCandidates", () => {
       record({ id: 10, syncedLyrics: null }), // plain only
       record({ id: 11, trackName: "Totally Unrelated" }), // rejected
       record({ id: 12 }), // line sync
-      record({ id: 13, hasWordSync: true }), // word sync
+      // Word sync must be proven by the payload, not the hasWordSync flag.
+      record({ id: 13, hasWordSync: true, syncedLyrics: "[00:01.00]<00:01.00>te <00:01.50>xt" }), // word sync
     ]);
     expect(ranked.map((entry) => entry.record.id)).toEqual([13, 12, 10]);
+  });
+
+  it("never lets a flagged-but-plain payload outrank real line sync", () => {
+    const ranked = rankCandidates(track, [
+      record({ id: 20, hasWordSync: true }), // flag lies: the payload is line-level only
+      record({ id: 21 }), // genuine line sync
+    ]);
+    // Same capability and score — the flag alone must not win the tie.
+    expect(ranked.map((entry) => entry.record.id)).toEqual([20, 21]);
+    expect(ranked[0].capability).toBe("line");
+  });
+
+  it("ranks a wrong-artist record below auto-acceptable matches regardless of capability", () => {
+    const ranked = rankCandidates(track, [
+      // Same title, different artist: plausible cover — never auto-accepted.
+      record({ id: 30, artistName: "Cover Band", hasWordSync: true, syncedLyrics: "[00:01.00]<00:01.00>te <00:01.50>xt" }),
+      record({ id: 31 }), // correct artist, plain + line payload
+    ]);
+    expect(ranked[0].record.id).toBe(31);
+    expect(ranked[0].autoAcceptable).toBe(true);
   });
 
   it("breaks sync ties by score", () => {
@@ -123,5 +175,39 @@ describe("low-confidence handling", () => {
     const decision = decideMatch(track, record({ artistName: "Cover Band", albumName: "Covers", duration: 213 }));
     expect(decision.autoAccept).toBe(false);
     expect(decision.candidate).toBe(true);
+  });
+
+  it("never auto-accepts a studio version onto a live acoustic recording (Case D)", () => {
+    const liveAcousticTrack: Pick<Track, "title" | "artist" | "album" | "durationMs"> = {
+      title: "Ocean Eyes (Live Acoustic)",
+      artist: "Billie Eilish",
+      album: "",
+      durationMs: 200000,
+    };
+    const studioRecord = record({
+      trackName: "Ocean Eyes",
+      artistName: "Billie Eilish",
+      duration: 200,
+    });
+    const decision = decideMatch(liveAcousticTrack, studioRecord);
+    expect(decision.quality.versionMismatch).toBe(true);
+    expect(decision.autoAccept).toBe(false);
+  });
+
+  it("matches artist with featured artist appropriately", () => {
+    const featTrack: Pick<Track, "title" | "artist" | "album" | "durationMs"> = {
+      title: "Lovely",
+      artist: "Billie Eilish feat. Khalid",
+      album: "",
+      durationMs: 200000,
+    };
+    const soloRecord = record({
+      trackName: "Lovely",
+      artistName: "Billie Eilish",
+      duration: 200,
+    });
+    const decision = decideMatch(featTrack, soloRecord);
+    expect(decision.quality.artistSimilarity).toBeGreaterThanOrEqual(0.95);
+    expect(decision.autoAccept).toBe(true);
   });
 });

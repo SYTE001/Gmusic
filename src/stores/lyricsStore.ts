@@ -24,9 +24,20 @@ export type DiscoveryStatus =
   | "offline" // device offline, nothing cached
   | "error"; // request failed
 
+export type DiscoveryPhase =
+  | "idle"
+  | "identifying"
+  | "searching"
+  | "validating"
+  | "ready"
+  | "not-found"
+  | "offline"
+  | "error";
+
 type LyricsState = {
   trackId: string | null;
   status: DiscoveryStatus;
+  phase: DiscoveryPhase;
   /** Bumped whenever lyrics are written, so views reload the document. */
   lyricsVersion: number;
   candidates: RankedCandidate[];
@@ -55,43 +66,59 @@ export const useLyricsStore = create<LyricsState>((set, get) => {
     activeController = new AbortController();
     const controller = activeController;
 
-    set({ trackId: track.id, status: "checking", candidates: [], errorMessage: null, fromCache: false });
+    set({
+      trackId: track.id,
+      status: "checking",
+      phase: "identifying",
+      candidates: [],
+      errorMessage: null,
+      fromCache: false,
+    });
 
     try {
-      const result = await resolveLyricsForTrack(track, { force, signal: controller.signal });
+      const result = await resolveLyricsForTrack(track, {
+        force,
+        signal: controller.signal,
+        onProgress: (phase) => {
+          if (token === resolutionToken) {
+            set({ phase });
+          }
+        },
+      });
       if (token !== resolutionToken) return; // a newer resolution took over
       switch (result.outcome) {
         case "cached":
-          set({ status: "ready", fromCache: true });
+          set({ status: "ready", phase: "ready", fromCache: true });
           break;
         case "attached":
-          set({ status: "ready", fromCache: false, lyricsVersion: get().lyricsVersion + 1 });
+          set({ status: "ready", phase: "ready", fromCache: false, lyricsVersion: get().lyricsVersion + 1 });
           break;
         case "needs-selection":
-          set({ status: "needs-selection", candidates: result.candidates });
+          set({ status: "needs-selection", phase: "not-found", candidates: result.candidates });
           break;
         case "not-found":
         case "skipped-recently":
-          set({ status: "not-found" });
+          set({ status: "not-found", phase: "not-found" });
           break;
         case "offline":
-          set({ status: "offline" });
+          set({ status: "offline", phase: "offline" });
           break;
         case "error":
-          set({ status: "error", errorMessage: result.message });
+          set({ status: "error", phase: "error", errorMessage: result.message });
           break;
       }
     } catch (error) {
       if (token !== resolutionToken) return;
       // Aborted resolutions belong to a superseded track; never surface them.
       if ((error as { kind?: string })?.kind === "aborted" || (error as DOMException)?.name === "AbortError") return;
-      set({ status: "error", errorMessage: describeLrcmuxError(error) });
+      set({ status: "error", phase: "error", errorMessage: describeLrcmuxError(error) });
     }
   };
 
   return {
     trackId: null,
     status: "idle",
+    phase: "idle",
     lyricsVersion: 0,
     candidates: [],
     errorMessage: null,
@@ -101,8 +128,11 @@ export const useLyricsStore = create<LyricsState>((set, get) => {
       const state = get();
       const force = options?.force ?? false;
       // Deduplicate: same track already resolving or resolved → nothing to do,
-      // unless the user explicitly asked for a fresh lookup.
-      if (!force && state.trackId === track.id && state.status !== "idle" && state.status !== "error") return;
+      // unless the user explicitly asked for a fresh lookup. An "error" status
+      // is terminal here too: re-running automatically would loop check→error
+      // forever (the view re-triggers on every status change) and hammer the
+      // provider. Recovery is user-initiated via retry()/searchAgain().
+      if (!force && state.trackId === track.id && state.status !== "idle") return;
       await run(track, force);
     },
 
@@ -113,9 +143,9 @@ export const useLyricsStore = create<LyricsState>((set, get) => {
       if (!track) return;
       try {
         await attachLrclibRecord(track, candidate.record);
-        set({ status: "ready", candidates: [], lyricsVersion: get().lyricsVersion + 1, fromCache: false });
+        set({ status: "ready", phase: "ready", candidates: [], lyricsVersion: get().lyricsVersion + 1, fromCache: false });
       } catch {
-        set({ status: "error", errorMessage: "Could not save the selected lyrics." });
+        set({ status: "error", phase: "error", errorMessage: "Could not save the selected lyrics." });
       }
     },
 

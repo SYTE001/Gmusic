@@ -91,8 +91,9 @@ export type LyricLine = {
   words?: LyricWord[];
 };
 
-/** What a lyrics record is capable of synchronizing. */
-export type LyricCapability = "word" | "line" | "plain" | "instrumental";
+/** What a lyrics record is capable of synchronizing. "none" marks a payload
+ * with no usable lyric content; such records are never attached or stored. */
+export type LyricCapability = "word" | "line" | "plain" | "instrumental" | "none";
 
 export type LyricOrigin = {
   kind: "lrcmux" | "lrclib" | "manual";
@@ -171,6 +172,8 @@ export type ImportOutcome = {
   /** Tracks added without a persisted handle or stored copy — they stop
    * playing after the app reloads. */
   sessionOnlyAdded: number;
+  /** The newly created Track records. */
+  newTracks?: Track[];
 };
 
 export const APP_NAME = "Local Music";
