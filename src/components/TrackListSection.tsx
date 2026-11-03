@@ -1,7 +1,8 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 import type { PlaybackContext, Track } from "../types";
 import { TrackRow } from "./TrackRow";
 import { normalizeForSearch } from "../utils/misc";
+import { recordComponentRender } from "../utils/perf";
 
 export type SortKey = "title" | "artist" | "album" | "addedAt" | "duration" | "recentlyPlayed";
 
@@ -14,16 +15,25 @@ const SORT_LABELS: Record<SortKey, string> = {
   recentlyPlayed: "Recently played",
 };
 
+const trackSortCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+
 export function sortTracks(tracks: Track[], key: SortKey): Track[] {
-  const collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
   const copy = [...tracks];
   switch (key) {
     case "title":
-      return copy.sort((a, b) => collator.compare(a.title, b.title));
+      return copy.sort((a, b) => trackSortCollator.compare(a.title, b.title));
     case "artist":
-      return copy.sort((a, b) => collator.compare(a.artist || "unknown artist", b.artist || "unknown artist") || collator.compare(a.title, b.title));
+      return copy.sort(
+        (a, b) =>
+          trackSortCollator.compare(a.artist || "unknown artist", b.artist || "unknown artist") ||
+          trackSortCollator.compare(a.title, b.title),
+      );
     case "album":
-      return copy.sort((a, b) => collator.compare(a.album || "unknown album", b.album || "unknown album") || (a.trackNumber ?? 0) - (b.trackNumber ?? 0));
+      return copy.sort(
+        (a, b) =>
+          trackSortCollator.compare(a.album || "unknown album", b.album || "unknown album") ||
+          (a.trackNumber ?? 0) - (b.trackNumber ?? 0),
+      );
     case "addedAt":
       return copy.sort((a, b) => b.addedAt - a.addedAt);
     case "duration":
@@ -40,6 +50,34 @@ export function sortTracks(tracks: Track[], key: SortKey): Track[] {
  * Liked Songs, Recently Played, and Playlist detail so conventions match
  * (PRD §7.5).
  */
+function isSortAndRowVisualsUnchanged(prev: Track[], next: Track[]): boolean {
+  if (prev === next) return true;
+  if (prev.length !== next.length) return false;
+  for (let i = 0; i < prev.length; i++) {
+    const a = prev[i];
+    const b = next[i];
+    if (a === b) continue;
+    if (
+      a.id !== b.id ||
+      a.title !== b.title ||
+      a.artist !== b.artist ||
+      a.album !== b.album ||
+      a.fileName !== b.fileName ||
+      a.trackNumber !== b.trackNumber ||
+      a.durationMs !== b.durationMs ||
+      a.addedAt !== b.addedAt ||
+      a.isLiked !== b.isLiked ||
+      a.availability !== b.availability ||
+      a.accessMode !== b.accessMode ||
+      a.cloudStatus !== b.cloudStatus ||
+      a.objectKey !== b.objectKey
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function TrackListSection({
   tracks,
   context,
@@ -65,11 +103,24 @@ export function TrackListSection({
   headerRight?: ReactNode;
   maxRowsWithoutVirtualization?: number;
 }) {
+  recordComponentRender("TrackListSection");
   const [sortKey, setSortKey] = useState<SortKey>(defaultSort);
   const [localQuery, setLocalQuery] = useState("");
   const query = externalQuery !== undefined ? externalQuery : localQuery;
 
+  const prevFilterInputsRef = useRef<{ tracks: Track[]; query: string; sortKey: SortKey; result: Track[] } | null>(null);
   const filtered = useMemo(() => {
+    const prev = prevFilterInputsRef.current;
+    if (
+      prev &&
+      prev.query === query &&
+      prev.sortKey === sortKey &&
+      sortKey !== "recentlyPlayed" &&
+      isSortAndRowVisualsUnchanged(prev.tracks, tracks)
+    ) {
+      prev.tracks = tracks;
+      return prev.result;
+    }
     const normalized = normalizeForSearch(query);
     const base = normalized.length > 0
       ? tracks.filter(
@@ -80,10 +131,21 @@ export function TrackListSection({
             normalizeForSearch(track.fileName).includes(normalized),
         )
       : tracks;
-    return sortTracks(base, sortKey);
+    const result = sortTracks(base, sortKey);
+    prevFilterInputsRef.current = { tracks, query, sortKey, result };
+    return result;
   }, [tracks, query, sortKey]);
 
-  const contextTrackIds = useMemo(() => filtered.map((item) => item.id), [filtered]);
+  const prevContextIdsRef = useRef<string[]>([]);
+  const contextTrackIds = useMemo(() => {
+    const prev = prevContextIdsRef.current;
+    if (prev.length === filtered.length && filtered.every((item, i) => item.id === prev[i])) {
+      return prev;
+    }
+    const next = filtered.map((item) => item.id);
+    prevContextIdsRef.current = next;
+    return next;
+  }, [filtered]);
 
   if (tracks.length === 0) {
     return <>{emptyState}</>;

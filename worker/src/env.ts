@@ -41,4 +41,6 @@ export interface Env {
   /** Presigned URL lifetimes in seconds. */
   PUT_URL_TTL_SECONDS: string;
   GET_URL_TTL_SECONDS: string;
+  /** Optional MusicBrainz WS/2 base URL override (used by local test harness; defaults to https://musicbrainz.org/ws/2). */
+  MUSICBRAINZ_BASE_URL?: string;
 }

@@ -27,6 +27,9 @@ class FakePlayer extends EventTarget {
   springEnabled = true;
   scaleEnabled = true;
   blurEnabled = true;
+  autoSeekDetection = true;
+  overscanPx = 300;
+  lyricProcessConfig: unknown = null;
   constructor() {
     super();
     this.element.setAttribute("data-testid", "amll");
@@ -43,6 +46,15 @@ class FakePlayer extends EventTarget {
   }
   setEnableSpring(enable: boolean) {
     this.springEnabled = enable;
+  }
+  setEnableAutoSeekDetection(enable: boolean) {
+    this.autoSeekDetection = enable;
+  }
+  setOverscanPx(px: number) {
+    this.overscanPx = px;
+  }
+  setLyricProcessConfig(config: unknown) {
+    this.lyricProcessConfig = config;
   }
   setLyricLines(lines: FakeLine[]) {
     this.lines = lines;
@@ -299,15 +311,26 @@ describe("LyricsView with the AMLL player", () => {
     expect(players).toHaveLength(0);
   });
 
-  it("disables AMLL spring simulation, scale loops, and staggered delays for solid line transitions", async () => {
+  it("disables AMLL spring simulation, scale loops, timestamp advance, and virtualization for zero-shift sync", async () => {
     await renderView(wordLyrics, "word");
     await screen.findByText("Word up now");
     expect(players[0].springEnabled).toBe(false);
     expect(players[0].scaleEnabled).toBe(false);
     expect(players[0].blurEnabled).toBe(false);
+    expect(players[0].autoSeekDetection).toBe(false);
+    expect(players[0].overscanPx).toBe(100000);
+    expect(players[0].lyricProcessConfig).toEqual({
+      optimizeOptions: {
+        tryAdvanceStartTime: false,
+        resetLineTimestamps: false,
+        cleanUnintentionalOverlaps: false,
+        syncMainAndBackgroundLines: false,
+        normalizeSpaces: false,
+      },
+    });
   });
 
-  it("intercepts float-word and emphasize-word-float animations while preserving regular animations", async () => {
+  it("intercepts float-word and all emphasize-word-* animations while preserving regular animations", async () => {
     await renderView(wordLyrics, "word");
     await screen.findByText("Word up now");
 
@@ -322,10 +345,14 @@ describe("LyricsView with the AMLL player", () => {
     expect(floatAni.playState).toBe("idle");
     expect(floatAni.currentTime).toBe(0);
 
-    // emphasize-word-float is intercepted
+    // emphasize-word-float and per-character emphasize-word-char-0 are intercepted
     const empAni = testEl.animate([], { id: "emphasize-word-float" });
     expect(empAni.id).toBe("emphasize-word-float");
     expect(empAni.playState).toBe("idle");
+
+    const glowAni = testEl.animate([], { id: "emphasize-word-a-0" });
+    expect(glowAni.id).toBe("emphasize-word-a-0");
+    expect(glowAni.playState).toBe("idle");
 
     testEl.remove();
   });

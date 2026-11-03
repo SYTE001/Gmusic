@@ -15,7 +15,15 @@ import type { ImportOutcome } from "../../types";
 
 /** Human-readable summary of an import run, including everything skipped. */
 export function ImportOutcomeDialog({ outcome, onClose }: { outcome: ImportOutcome; onClose: () => void }) {
-  if (outcome.duplicatesSkipped === 0 && outcome.unsupported.length === 0 && outcome.failed.length === 0) {
+  const updatedCount = outcome.updated ?? 0;
+  const needsReviewCount = outcome.needsReview?.length ?? 0;
+  if (
+    outcome.duplicatesSkipped === 0 &&
+    outcome.unsupported.length === 0 &&
+    outcome.failed.length === 0 &&
+    updatedCount === 0 &&
+    needsReviewCount === 0
+  ) {
     return null;
   }
   return (
@@ -24,6 +32,13 @@ export function ImportOutcomeDialog({ outcome, onClose }: { outcome: ImportOutco
         <p className="text-text-secondary">
           Added <strong className="text-text-primary">{outcome.added}</strong> track
           {outcome.added === 1 ? "" : "s"}.
+          {updatedCount > 0 && (
+            <>
+              {" "}
+              Updated <strong className="text-text-primary">{updatedCount}</strong> existing track
+              {updatedCount === 1 ? "" : "s"}.
+            </>
+          )}
           {outcome.duplicatesSkipped > 0 && (
             <>
               {" "}
@@ -32,6 +47,18 @@ export function ImportOutcomeDialog({ outcome, onClose }: { outcome: ImportOutco
             </>
           )}
         </p>
+        {outcome.needsReview && outcome.needsReview.length > 0 && (
+          <div>
+            <h3 className="mb-1 font-medium text-text-primary">Tracks to review</h3>
+            <ul className="max-h-32 space-y-1 overflow-y-auto text-xs text-text-muted">
+              {outcome.needsReview.map((item, idx) => (
+                <li key={idx} className="truncate">
+                  {item.fileName} — {item.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {outcome.unsupported.length > 0 && (
           <div>
             <h3 className="mb-1 font-medium text-text-primary">Unsupported or undecodable files</h3>
@@ -89,9 +116,13 @@ export function useImportFlow() {
     try {
       const result = await importItems(items);
       const skippedTotal = result.duplicatesSkipped + result.unsupported.length + result.failed.length;
-      if (result.added > 0 && skippedTotal === 0) {
+      const updatedTotal = result.updated ?? 0;
+      const reviewTotal = result.needsReview?.length ?? 0;
+      if (result.added > 0 && skippedTotal === 0 && updatedTotal === 0 && reviewTotal === 0) {
         toast("success", `Added ${result.added} track${result.added === 1 ? "" : "s"} to your library.`);
-      } else if (skippedTotal > 0) {
+      } else if (result.added === 0 && skippedTotal === 0 && updatedTotal > 0 && reviewTotal === 0) {
+        toast("success", `Updated ${updatedTotal} existing track${updatedTotal === 1 ? "" : "s"}.`);
+      } else if (skippedTotal > 0 || updatedTotal > 0 || reviewTotal > 0) {
         setOutcome(result);
       } else if (result.added === 0) {
         toast("info", "Nothing new was imported.");

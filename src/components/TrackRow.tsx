@@ -7,6 +7,7 @@ import { formatClock, formatDate } from "../utils/misc";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { useTrackActions } from "../features/library/useTrackActions";
+import { recordComponentRender } from "../utils/perf";
 
 /**
  * Animated equalizer for the currently playing row. Freezes while paused so
@@ -38,6 +39,50 @@ function RowBadge({ icon, label }: { icon: ReactNode; label: string }) {
  * playback (PRD §7.3). File-access and cloud states appear as small badges
  * with explanatory tooltips.
  */
+type TrackRowProps = {
+  track: Track;
+  contextTrackIds: string[];
+  context: PlaybackContext;
+  showAlbum?: boolean;
+  showAdded?: boolean;
+  index?: number;
+  playlistId?: string;
+  leading?: ReactNode;
+  trailing?: ReactNode;
+};
+
+function areTrackRowPropsEqual(prev: TrackRowProps, next: TrackRowProps): boolean {
+  if (
+    prev.index !== next.index ||
+    prev.showAlbum !== next.showAlbum ||
+    prev.showAdded !== next.showAdded ||
+    prev.playlistId !== next.playlistId ||
+    prev.leading !== next.leading ||
+    prev.trailing !== next.trailing ||
+    prev.contextTrackIds !== next.contextTrackIds ||
+    prev.context.type !== next.context.type ||
+    prev.context.label !== next.context.label
+  ) {
+    return false;
+  }
+  if (prev.track === next.track) return true;
+  const a = prev.track;
+  const b = next.track;
+  return (
+    a.id === b.id &&
+    a.title === b.title &&
+    a.artist === b.artist &&
+    a.album === b.album &&
+    a.durationMs === b.durationMs &&
+    a.addedAt === b.addedAt &&
+    a.isLiked === b.isLiked &&
+    a.availability === b.availability &&
+    a.accessMode === b.accessMode &&
+    a.cloudStatus === b.cloudStatus &&
+    a.objectKey === b.objectKey
+  );
+}
+
 export const TrackRow = memo(function TrackRow({
   track,
   contextTrackIds,
@@ -48,21 +93,12 @@ export const TrackRow = memo(function TrackRow({
   playlistId,
   leading,
   trailing,
-}: {
-  track: Track;
-  contextTrackIds: string[];
-  context: PlaybackContext;
-  showAlbum?: boolean;
-  showAdded?: boolean;
-  index?: number;
-  playlistId?: string;
-  leading?: ReactNode;
-  trailing?: ReactNode;
-}) {
+}: TrackRowProps) {
+  recordComponentRender("TrackRow");
   const isLiked = track.isLiked;
   const toggleLike = useLibraryStore((state) => state.toggleLike);
   const isCurrent = usePlaybackStore((state) => state.currentTrackId === track.id);
-  const isPlaying = usePlaybackStore((state) => state.isPlaying);
+  const isPlaying = usePlaybackStore((state) => state.currentTrackId === track.id && state.isPlaying);
   const { buildMenuItems, dialogs } = useTrackActions();
 
   const unavailable =
@@ -159,10 +195,10 @@ export const TrackRow = memo(function TrackRow({
 
         <div className="flex items-center gap-1" onClick={(event) => event.stopPropagation()}>
           {trailing}
-          <Menu items={buildMenuItems(track, { playlistId })} buttonLabel={`More actions for ${track.title}`} />
+          <Menu items={() => buildMenuItems(track, { playlistId })} buttonLabel={`More actions for ${track.title}`} />
         </div>
       </div>
       {dialogs}
     </>
   );
-});
+}, areTrackRowPropsEqual);

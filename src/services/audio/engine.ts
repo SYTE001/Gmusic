@@ -118,8 +118,9 @@ export class HtmlAudioEngine implements AudioEngine {
       this.audio.load();
       return;
     }
-    this.audio.src = url;
-    this.audio.load();
+    if (this.audio.src !== url) {
+      this.audio.src = url;
+    }
   }
 
   async play(): Promise<void> {

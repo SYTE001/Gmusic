@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { repository } from "../services/indexeddb/LibraryRepository";
 import { useLibraryStore } from "../stores/libraryStore";
-import { resolveArtworkForTrack } from "../services/artwork/artworkService";
+import { invalidateArtworkCacheForTrack, resolveArtworkForTrack } from "../services/artwork/artworkService";
 import type { Track } from "../types";
 import { MusicNoteIcon } from "./Icons";
+import { perfMark, perfMeasure } from "../utils/perf";
 
 /**
- * Artwork rendering with a bounded object-URL cache and iTunes online fallback.
+ * Artwork rendering with a bounded object-URL cache and MusicBrainz / Cover Art Archive
+ * primary online resolution + iTunes Search API fallback.
  * Object URLs are revoked when evicted (rules §12: release object URLs, bound decode dimensions).
- * External URLs (such as iTunes Search API art) are never revoked with URL.revokeObjectURL.
+ * External URLs (CAA / iTunes) are never revoked with URL.revokeObjectURL.
  */
 
 const urlCache = new Map<string, string>();
@@ -33,6 +35,20 @@ function notifyArtworkLoaded(trackId: string, url: string | undefined): void {
   }
 }
 
+export function setCachedArtworkForTrack(trackId: string, url: string): void {
+  if (!trackId || !url) return;
+  if (!urlCache.has(trackId) && urlCache.size >= MAX_CACHE) {
+    const oldest = urlCache.keys().next().value;
+    if (oldest !== undefined) {
+      const evicted = urlCache.get(oldest);
+      urlCache.delete(oldest);
+      if (evicted && evicted.startsWith("blob:")) URL.revokeObjectURL(evicted);
+    }
+  }
+  urlCache.set(trackId, url);
+  notifyArtworkLoaded(trackId, url);
+}
+
 export function getArtworkUrl(trackId: string): string | undefined {
   return urlCache.get(trackId);
 }
@@ -48,6 +64,7 @@ export async function loadArtworkUrl(trackOrId: string | Track): Promise<string 
   if (existingPromise) return existingPromise;
 
   const loadPromise = (async (): Promise<string | undefined> => {
+    perfMark(`skip:artwork:start:${trackId}`);
     try {
       // 1. Check embedded artwork in IndexedDB
       try {
@@ -62,8 +79,15 @@ export async function loadArtworkUrl(trackOrId: string | Track): Promise<string 
             }
           }
           const url = URL.createObjectURL(blob);
+          if (typeof Image !== "undefined" && typeof Image.prototype.decode === "function") {
+            const img = new Image();
+            img.decoding = "async";
+            img.src = url;
+            await img.decode().catch(() => undefined);
+          }
           urlCache.set(trackId, url);
           notifyArtworkLoaded(trackId, url);
+          perfMeasure("skip:artwork-work", `skip:artwork:start:${trackId}`, `skip:artwork:end:${trackId}`);
           return url;
         }
       } catch {
@@ -153,8 +177,9 @@ export function useArtworkUrl(trackOrId: Track | string | null | undefined): str
 
 export function Artwork({ trackId, alt, className, rounded = "rounded-lg" }: ArtworkProps) {
   const url = useArtworkUrl(trackId);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
-  if (!url) {
+  if (!url || failedUrl === url) {
     return (
       <div
         className={`flex items-center justify-center bg-surface-raised text-text-muted ${rounded} ${className ?? ""}`}
@@ -165,7 +190,26 @@ export function Artwork({ trackId, alt, className, rounded = "rounded-lg" }: Art
       </div>
     );
   }
-  return <img src={url} alt={alt} loading="lazy" decoding="async" className={`object-cover ${rounded} ${className ?? ""}`} />;
+  return (
+    <img
+      src={url}
+      alt={alt}
+      loading="lazy"
+      decoding="async"
+      onError={() => {
+        setFailedUrl(url);
+        if (trackId) {
+          urlCache.delete(trackId);
+          const trackObj = useLibraryStore.getState().tracks.find((t) => t.id === trackId);
+          if (trackObj) {
+            invalidateArtworkCacheForTrack(trackObj);
+          }
+          notifyArtworkLoaded(trackId, undefined);
+        }
+      }}
+      className={`object-cover ${rounded} ${className ?? ""}`}
+    />
+  );
 }
 
 /**

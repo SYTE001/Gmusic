@@ -40,6 +40,18 @@ const persist = debounce((prefs: AppPreferences) => {
   });
 }, 400);
 
+/**
+ * Synchronous cache of the theme choice so the startup script in index.html
+ * can apply it before first paint (redesign PRD §4: no theme flash). The
+ * authoritative copy stays in IndexedDB; this mirror only carries one
+ * short string, never large data (rules §6).
+ */
+export const THEME_CACHE_KEY = "lm-theme";
+const MOTION_CACHE_KEY = "lm-motion";
+
+/** Theme-color meta values, kept in sync with the --theme-color CSS token. */
+const THEME_COLORS: Record<"dark" | "light", string> = { dark: "#09090b", light: "#f5f5f7" };
+
 export function flushSettingsPersistence(): void {
   persist.cancel();
 }
@@ -52,6 +64,15 @@ function applyThemeToDocument(theme: AppPreferences["theme"], motion: AppPrefere
   root.dataset.theme = resolved;
   if (motion === "system") delete root.dataset.motion;
   else root.dataset.motion = motion === "on" ? "on" : "off";
+  // Match the browser chrome / taskbar tint to the active surface.
+  document.querySelector('meta[name="theme-color"]')?.setAttribute("content", THEME_COLORS[resolved]);
+  // Keep the pre-paint cache in step so reloads never flash the wrong theme.
+  try {
+    localStorage.setItem(THEME_CACHE_KEY, theme);
+    localStorage.setItem(MOTION_CACHE_KEY, motion);
+  } catch {
+    // Private-mode or disabled storage: the IndexedDB copy still works.
+  }
   // Components that derive colors from artwork read the resolved theme.
   useSettingsStore.setState({ resolvedTheme: resolved });
 }

@@ -1,6 +1,7 @@
 import type { Track } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
 import { getPlayUrl } from "../cloud/r2StorageService";
+import { perfMark, perfMeasure, recordObjectUrlCreated, recordObjectUrlRevoked } from "../../utils/perf";
 
 /**
  * FileAccessService — resolves tracks to playable object URLs and manages
@@ -82,18 +83,111 @@ export async function requestHandlePermission(handle: FileSystemFileHandle): Pro
   }
 }
 
-let activeUrl: { url: string; release: () => void } | null = null;
+let activeUrl: { trackId: string; url: string; release: () => void } | null = null;
+let preloadedUrl: { trackId: string; url: string; release: () => void } | null = null;
 
 function releaseActiveUrl(): void {
   if (activeUrl) {
-    activeUrl.release();
+    const current = activeUrl;
     activeUrl = null;
+    current.release();
+  }
+}
+
+export function clearPreloadedTrackSource(): void {
+  if (preloadedUrl) {
+    const current = preloadedUrl;
+    preloadedUrl = null;
+    current.release();
+  }
+}
+
+export function releaseActiveTrackSource(): void {
+  releaseActiveUrl();
+  clearPreloadedTrackSource();
+}
+
+function createManagedBlobUrl(blob: Blob): { url: string; release: () => void } {
+  const url = URL.createObjectURL(blob);
+  recordObjectUrlCreated();
+  let revoked = false;
+  const release = () => {
+    if (revoked) return;
+    revoked = true;
+    URL.revokeObjectURL(url);
+    recordObjectUrlRevoked();
+    if (activeUrl?.url === url) {
+      activeUrl = null;
+    }
+    if (preloadedUrl?.url === url) {
+      preloadedUrl = null;
+    }
+  };
+  return { url, release };
+}
+
+function activateBlobSource(trackId: string, blob: Blob): ResolvedSource {
+  perfMark("skip:blob-url:start");
+  releaseActiveUrl();
+  const managed = createManagedBlobUrl(blob);
+  activeUrl = { trackId, url: managed.url, release: managed.release };
+  perfMeasure("skip:blob-url-creation", "skip:blob-url:start", "skip:blob-url:end");
+  return { ok: true, url: managed.url, release: managed.release };
+}
+
+/**
+ * Preloads the next track's playable object URL (without decoding audio into
+ * memory) bounded to a single track ahead. Cloud tracks are skipped on
+ * cellular / Data Saver connections.
+ */
+export async function preloadTrackSource(track: Track): Promise<void> {
+  if (!track?.id) return;
+  if (activeUrl?.trackId === track.id || preloadedUrl?.trackId === track.id) return;
+
+  // Never preload cloud streams over Data Saver or cellular connections; keep
+  // preloading strictly to cheap local sources.
+  if (track.accessMode === "cloud") return;
+
+  const sessionFile = sessionFiles.get(track.id);
+  if (sessionFile) {
+    clearPreloadedTrackSource();
+    const managed = createManagedBlobUrl(sessionFile);
+    preloadedUrl = { trackId: track.id, url: managed.url, release: managed.release };
+    return;
+  }
+
+  if (track.accessMode === "stored-copy") {
+    const storedBlob = await repository.getAudioBlob(track.id);
+    if (storedBlob && activeUrl?.trackId !== track.id) {
+      clearPreloadedTrackSource();
+      const managed = createManagedBlobUrl(storedBlob);
+      preloadedUrl = { trackId: track.id, url: managed.url, release: managed.release };
+      return;
+    }
+  }
+
+  if (track.accessMode === "handle") {
+    const handle = await repository.getHandle(track.id);
+    if (handle && (await queryHandlePermission(handle)) === "granted") {
+      try {
+        const file = await handle.getFile();
+        if (activeUrl?.trackId !== track.id) {
+          clearPreloadedTrackSource();
+          const managed = createManagedBlobUrl(file);
+          preloadedUrl = { trackId: track.id, url: managed.url, release: managed.release };
+        }
+        return;
+      } catch {
+        // Fall through silently on preload
+      }
+    }
   }
 }
 
 /**
- * Resolves a track into a playable object URL. Only one URL is kept alive at a
- * time; switching tracks revokes the previous one (rules §12: release object URLs).
+ * Resolves a track into a playable object URL. Only one active playback URL is
+ * kept alive at a time; switching tracks revokes the previous one (rules §12:
+ * release object URLs).
  *
  * The chain is a safe fallback, not a strict ladder: a broken File System
  * Access handle (file moved, renamed, or deleted) never masks a stored copy
@@ -101,6 +195,33 @@ function releaseActiveUrl(): void {
  * that can play without any permission at all.
  */
 export async function resolveTrackSource(track: Track): Promise<ResolvedSource> {
+  // 0. Fast-path: promote a preloaded object URL for this track in 0ms.
+  if (preloadedUrl && preloadedUrl.trackId === track.id) {
+    const promoted = preloadedUrl;
+    preloadedUrl = null;
+    releaseActiveUrl();
+    activeUrl = promoted;
+    return { ok: true, url: promoted.url, release: promoted.release };
+  }
+  clearPreloadedTrackSource();
+
+  // Fast-path for session-only tracks: check in-memory Map before hitting IDB.
+  if (track.accessMode === "session-only") {
+    const sessionFile = sessionFiles.get(track.id);
+    if (sessionFile) {
+      return activateBlobSource(track.id, sessionFile);
+    }
+  }
+
+  // Fast-path for stored-copy tracks: read audio blob directly without a
+  // redundant handles store round-trip first.
+  if (track.accessMode === "stored-copy") {
+    const storedBlob = await repository.getAudioBlob(track.id);
+    if (storedBlob) {
+      return activateBlobSource(track.id, storedBlob);
+    }
+  }
+
   // 1. Best local source: a granted File System Access handle. A broken
   //    granted handle (file moved, renamed, or deleted) falls through to the
   //    remaining sources instead of declaring the track missing; an
@@ -113,10 +234,7 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
     if (permission === "granted") {
       try {
         const file = await handle.getFile();
-        releaseActiveUrl();
-        const url = URL.createObjectURL(file);
-        activeUrl = { url, release: () => URL.revokeObjectURL(url) };
-        return { ok: true, url, release: releaseActiveUrl };
+        return activateBlobSource(track.id, file);
       } catch {
         // The handle is stale. Keep going: a stored copy or the cloud copy
         // may still be playable.
@@ -126,22 +244,20 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
     }
   }
 
-  // 2. Audio bytes stored in IndexedDB.
-  const storedBlob = await repository.getAudioBlob(track.id);
-  if (storedBlob) {
-    releaseActiveUrl();
-    const url = URL.createObjectURL(storedBlob);
-    activeUrl = { url, release: () => URL.revokeObjectURL(url) };
-    return { ok: true, url, release: releaseActiveUrl };
+  // 2. Audio bytes stored in IndexedDB (if not already checked above).
+  if (track.accessMode !== "stored-copy") {
+    const storedBlob = await repository.getAudioBlob(track.id);
+    if (storedBlob) {
+      return activateBlobSource(track.id, storedBlob);
+    }
   }
 
-  // 3. Transient file borrowed for this session.
-  const sessionFile = sessionFiles.get(track.id);
-  if (sessionFile) {
-    releaseActiveUrl();
-    const url = URL.createObjectURL(sessionFile);
-    activeUrl = { url, release: () => URL.revokeObjectURL(url) };
-    return { ok: true, url, release: releaseActiveUrl };
+  // 3. Transient file borrowed for this session (if not already checked above).
+  if (track.accessMode !== "session-only") {
+    const sessionFile = sessionFiles.get(track.id);
+    if (sessionFile) {
+      return activateBlobSource(track.id, sessionFile);
+    }
   }
 
   // 4. No local bytes anywhere. A pending or denied handle permission is the
@@ -204,6 +320,11 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
 export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Track["availability"]>> {
   const updates = new Map<string, Track["availability"]>();
   for (const track of tracks) {
+    // Broken tracks stay broken across reloads until retried or restored.
+    if (track.broken?.isBroken || track.availability === "broken") {
+      updates.set(track.id, "broken");
+      continue;
+    }
     // Cloud-backed tracks with a live local copy are validated by the local
     // branch below; a cloud-only track is as good as its connectivity.
     if (track.accessMode === "cloud" && !(await hasLocalCopy(track.id))) {

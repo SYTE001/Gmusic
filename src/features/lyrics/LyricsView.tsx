@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { usePlaybackStore } from "../../stores/playbackStore";
-import { useLibraryStore } from "../../stores/libraryStore";
+import { useTrackById } from "../../stores/libraryStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useLyricsStore } from "../../stores/lyricsStore";
 import { repository } from "../../services/indexeddb/LibraryRepository";
@@ -40,8 +40,12 @@ const FOLLOW_TRANSITION = "transform 360ms cubic-bezier(0.22, 1, 0.36, 1)";
  */
 export function LyricsView() {
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
-  const track = useLibraryStore((state) => state.tracks.find((item) => item.id === currentTrackId) ?? null);
-  const [lyrics, setLyrics] = useState<TrackLyrics | null>(null);
+  const playbackStatus = usePlaybackStore((state) => state.status);
+  const track = useTrackById(currentTrackId);
+  const [loadedLyrics, setLyrics] = useState<TrackLyrics | null>(null);
+  // Clear previous track's lyrics on the very first frame of a track change so
+  // old lines never flash on the new song while the next lookup is deferred.
+  const lyrics = loadedLyrics && loadedLyrics.trackId === currentTrackId ? loadedLyrics : null;
   const [loading, setLoading] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -50,6 +54,7 @@ export function LyricsView() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
+  const playbackDurationMs = usePlaybackStore((state) => state.durationMs);
   const lyricsStyle = useSettingsStore((state) => state.prefs.lyricsStyle);
   const lyricFontSize = useSettingsStore((state) => state.prefs.lyricFontSize);
   const lyricAlignment = useSettingsStore((state) => state.prefs.lyricAlignment);
@@ -98,7 +103,8 @@ export function LyricsView() {
   }, []);
 
   // Load the lyrics document whenever the track changes or discovery writes
-  // a new one (lyricsVersion).
+  // a new one (lyricsVersion), deferred until audio has started so cache reads
+  // and lookups never compete with track-change audio start or first render.
   useEffect(() => {
     let cancelled = false;
     currentYRef.current = 0;
@@ -112,36 +118,48 @@ export function LyricsView() {
       setLoading(false);
       return;
     }
+    setLyrics((prev) => (prev?.trackId === currentTrackId ? prev : null));
     setLoading(true);
-    void repository
-      .getLyrics(currentTrackId)
-      .then((loaded) => {
-        if (!cancelled) {
-          setLyrics(loaded ?? null);
-          setLoading(false);
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setLyrics(null);
-          setLoading(false);
-        }
-      });
+    if (playbackStatus === "loading") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const timer = setTimeout(() => {
+      void repository
+        .getLyrics(currentTrackId)
+        .then((loaded) => {
+          if (!cancelled) {
+            setLyrics(loaded ?? null);
+            setLoading(false);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLyrics(null);
+            setLoading(false);
+          }
+        });
+    }, 0);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
-  }, [currentTrackId, discoveryVersion]);
+  }, [currentTrackId, discoveryVersion, playbackStatus]);
 
   // Trigger discovery when the view opens for a track nothing has resolved
   // yet (covers first open and the auto-fetch setting being off at start).
   // Errors stay terminal — auto re-triggering from here would loop
   // checking→error forever; the "Try again" button retries on purpose.
   useEffect(() => {
-    if (!track || loading) return;
+    if (!track || loading || playbackStatus === "loading") return;
     if (lyrics) return;
     if (discoveryTrackId === track.id && discoveryStatus !== "idle") return;
-    void resolveForTrack(track);
-  }, [track, loading, lyrics, discoveryTrackId, discoveryStatus, resolveForTrack]);
+    const timer = setTimeout(() => {
+      void resolveForTrack(track);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [track, loading, playbackStatus, lyrics, discoveryTrackId, discoveryStatus, resolveForTrack]);
 
   const timedLines = lyrics?.format === "lrc";
 
@@ -180,13 +198,18 @@ export function LyricsView() {
     };
   }, [lyrics]);
 
-  // Measure geometry after DOM changes or typography setting changes
+  // Measure geometry after DOM changes or typography setting changes (plain lyrics only)
   useLayoutEffect(() => {
+    if (timedLines) {
+      geometryRef.current = null;
+      return;
+    }
     updateGeometryCache();
-  }, [lyrics, loading, lyricFontSize, lyricLineSpacing, lyricAlignment, updateGeometryCache]);
+  }, [timedLines, lyrics, loading, lyricFontSize, lyricLineSpacing, lyricAlignment, updateGeometryCache]);
 
-  // Update geometry cache on container resize (debounced via rAF)
+  // Update geometry cache on container resize (debounced via rAF, plain lyrics only)
   useEffect(() => {
+    if (timedLines) return;
     const container = containerRef.current;
     if (!container || typeof ResizeObserver === "undefined") return;
     let rafId = 0;
@@ -201,7 +224,7 @@ export function LyricsView() {
       cancelAnimationFrame(rafId);
       observer.disconnect();
     };
-  }, [updateGeometryCache]);
+  }, [timedLines, updateGeometryCache]);
 
   const nudgeManualScroll = useCallback(
     (deltaY: number) => {
@@ -374,7 +397,7 @@ export function LyricsView() {
   // Converted once per lyric lines + style + track duration. The offset is not
   // an input: it is applied to the player clock, so nudging it never rebuilds lines.
   const lyricLines = lyrics?.lines ?? null;
-  const trackDurationMs = track?.durationMs ?? null;
+  const trackDurationMs = playbackDurationMs ?? track?.durationMs ?? null;
   const amllLines = useMemo(
     () => (lyricLines && timedLines ? toAmllLines({ lines: lyricLines }, { style: lyricsStyle, durationMs: trackDurationMs }) : []),
     [lyricLines, timedLines, lyricsStyle, trackDurationMs],

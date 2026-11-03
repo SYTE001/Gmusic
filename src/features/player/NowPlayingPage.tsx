@@ -1,9 +1,11 @@
 import { useEffect } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
-import { useLibraryStore } from "../../stores/libraryStore";
+import { useLibraryStore, useTrackById } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
+import { recordComponentRender } from "../../utils/perf";
 import { Artwork } from "../../components/Artwork";
 import { SeekBar } from "../../components/SeekBar";
+import { TransportToggle } from "../../components/TransportToggle";
 import LyricsAmbientBackground from "../lyrics/LyricsAmbientBackground";
 import { LyricsView } from "../lyrics/LyricsView";
 import {
@@ -25,11 +27,12 @@ import {
  * and side-by-side synchronized lyrics view.
  */
 export function NowPlayingPage() {
+  recordComponentRender("NowPlayingPage");
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const lyricsMode = searchParams.get("lyrics") === "1";
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
-  const track = useLibraryStore((state) => state.tracks.find((item) => item.id === currentTrackId) ?? null);
+  const track = useTrackById(currentTrackId);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
@@ -158,15 +161,14 @@ export function NowPlayingPage() {
 
               {/* 3. Transport row, centered */}
               <div className="flex items-center justify-center gap-2 sm:gap-3 w-full">
-                <button
-                  type="button"
-                  className="icon-btn"
-                  aria-label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
-                  aria-pressed={shuffleEnabled}
+                <TransportToggle
+                  active={shuffleEnabled}
+                  label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
+                  title="Shuffle (S)"
                   onClick={() => usePlaybackStore.getState().toggleShuffle()}
                 >
-                  <ShuffleIcon size={18} className={shuffleEnabled ? "text-accent" : ""} />
-                </button>
+                  <ShuffleIcon size={18} />
+                </TransportToggle>
                 <button
                   type="button"
                   className="icon-btn"
@@ -177,17 +179,12 @@ export function NowPlayingPage() {
                 </button>
                 <button
                   type="button"
-                  className="grid size-13 place-items-center rounded-full bg-text-primary text-app-bg hover:scale-105 active:scale-95 shrink-0"
-                  style={{
-                    width: 52,
-                    height: 52,
-                    transition: "transform 100ms ease",
-                    willChange: "transform",
-                  }}
+                  className="grid size-14 place-items-center rounded-full bg-accent text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
+                  title="Play/Pause (Space)"
                   aria-label={isPlaying ? "Pause" : "Play"}
                   onClick={() => usePlaybackStore.getState().togglePlay()}
                 >
-                  {isPlaying ? <PauseIcon size={22} /> : <PlayIcon size={22} />}
+                  {isPlaying ? <PauseIcon size={24} /> : <PlayIcon size={24} />}
                 </button>
                 <button
                   type="button"
@@ -197,24 +194,20 @@ export function NowPlayingPage() {
                 >
                   <NextIcon size={22} />
                 </button>
-                <button
-                  type="button"
-                  className="icon-btn"
-                  aria-label={
+                <TransportToggle
+                  active={repeatMode !== "off"}
+                  label={
                     repeatMode === "off"
                       ? "Enable repeat all"
                       : repeatMode === "all"
-                      ? "Enable repeat one"
-                      : "Disable repeat"
+                        ? "Enable repeat one"
+                        : "Disable repeat"
                   }
+                  title="Repeat (R)"
                   onClick={() => usePlaybackStore.getState().cycleRepeat()}
                 >
-                  {repeatMode === "one" ? (
-                    <RepeatOneIcon size={18} className="text-accent" />
-                  ) : (
-                    <RepeatIcon size={18} className={repeatMode === "off" ? "" : "text-accent"} />
-                  )}
-                </button>
+                  {repeatMode === "one" ? <RepeatOneIcon size={18} /> : <RepeatIcon size={18} />}
+                </TransportToggle>
               </div>
             </div>
           </div>

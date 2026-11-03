@@ -8,8 +8,24 @@ export type TrackAvailability =
   | "permission-required"
   | "missing"
   | "unsupported"
+  | "broken"
   /** Cloud-backed track whose audio cannot be fetched while the device is offline. */
   | "offline";
+
+export type BrokenCategory =
+  | "corrupted"
+  | "unsupported"
+  | "unreadable"
+  | "missing"
+  | "decoding";
+
+export type BrokenInfo = {
+  isBroken: boolean;
+  category: BrokenCategory;
+  description: string;
+  failedAt: number;
+  retryCount?: number;
+};
 
 /**
  * How the audio bytes for a track can be reached:
@@ -54,6 +70,8 @@ export type Track = {
   fingerprint: string | null;
   /** True when title/artist came from the filename rather than tags. */
   metadataFromFilename: boolean;
+  /** Broken status details if playback permanently failed. */
+  broken?: BrokenInfo | null;
 
   // ---- Cloud fields (all optional: every pre-existing record is a valid cloud-less record) ----
 
@@ -166,7 +184,9 @@ export type PlaybackContext = {
 
 export type ImportOutcome = {
   added: number;
+  updated?: number;
   duplicatesSkipped: number;
+  needsReview?: { fileName: string; reason: string }[];
   unsupported: string[];
   failed: { fileName: string; reason: string }[];
   /** Tracks added without a persisted handle or stored copy — they stop
@@ -174,9 +194,11 @@ export type ImportOutcome = {
   sessionOnlyAdded: number;
   /** The newly created Track records. */
   newTracks?: Track[];
+  /** The updated Track records. */
+  updatedTracks?: Track[];
 };
 
-export const APP_NAME = "Local Music";
+export const APP_NAME = "Gmusic";
 export const APP_VERSION = "1.1.0";
 export const DB_NAME = "local-music";
 export const DB_SCHEMA_VERSION = 2;

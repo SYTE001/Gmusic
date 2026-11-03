@@ -3,10 +3,13 @@ import { useNavigate } from "react-router-dom";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { normalizeForSearch } from "../utils/misc";
-import type { Track } from "../types";
+import type { Playlist, Track } from "../types";
 import { Artwork } from "./Artwork";
 import { CloseIcon, LibraryIcon, PlaylistIcon, SearchIcon } from "./Icons";
 import { useCloudStore } from "../stores/cloudStore";
+
+const EMPTY_SEARCH_TRACKS: Track[] = [];
+const EMPTY_SEARCH_PLAYLISTS: Playlist[] = [];
 
 /**
  * Local-only search over the indexed library and playlists (PRD §7.10).
@@ -21,8 +24,9 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
   const [focused, setFocused] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
-  const tracks = useLibraryStore((state) => state.tracks);
-  const playlists = useLibraryStore((state) => state.playlists);
+  const hasQuery = query.trim().length > 0;
+  const tracks = useLibraryStore((state) => (hasQuery ? state.tracks : EMPTY_SEARCH_TRACKS));
+  const playlists = useLibraryStore((state) => (hasQuery ? state.playlists : EMPTY_SEARCH_PLAYLISTS));
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

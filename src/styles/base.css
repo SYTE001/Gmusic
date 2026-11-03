@@ -1,54 +1,55 @@
 @import "tailwindcss";
 
 /*
- * Design tokens (PRD §8.2). Semantic variables are defined per theme on
- * :root/[data-theme], then mapped into Tailwind via @theme inline so utilities
- * like bg-surface / text-secondary follow runtime theme switches.
+ * Design tokens (redesign §3): one neutral grayscale palette, two themes.
+ * Semantic variables are defined per theme on :root/[data-theme], then mapped
+ * into Tailwind via @theme inline so utilities like bg-surface / text-secondary
+ * follow runtime theme switches. The accent is monochrome by design: light
+ * mode puts dark controls on a bright surface, dark mode bright controls on a
+ * dark one. Swap the palette here only, never in components.
  */
 
 :root,
 [data-theme="dark"] {
   color-scheme: dark;
-  /* Neutral surfaces (no blue cast): main canvas is darkest, sidebar and
-     panels sit a step above it. One accent drives the five accent moments:
-     active nav indicator, play button, current-track highlight, progress
-     fill, liked heart. Swap the palette here only — never in components. */
-  --bg: #0f1012;
-  --surface: #141518;
-  --surface-raised: #1c1e22;
-  --surface-hover: #24262b;
-  --text-primary: #f5f6f7;
-  --text-secondary: #a6aab1;
-  --text-muted: #71757d;
-  --border-subtle: rgba(255, 255, 255, 0.07);
-  --border-strong: rgba(255, 255, 255, 0.16);
-  --accent: #2bd46b;
-  --accent-strong: #24bd5e;
-  --accent-contrast: #06180c;
+  --bg: #09090b;
+  --surface: #111113;
+  --surface-raised: #202024;
+  --surface-hover: #1c1c20;
+  --text-primary: #f5f5f7;
+  --text-secondary: #a1a1aa;
+  --text-muted: #71717a;
+  --border-subtle: #26262b;
+  --border-strong: #3f3f46;
+  --accent: #f5f5f7;
+  --accent-strong: #f5f5f7;
+  --accent-contrast: #111113;
   --success: #4cc2a5;
   --danger: #ff6b70;
   --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.55);
   --scrim: rgba(5, 6, 8, 0.66);
+  --theme-color: #09090b;
 }
 
 [data-theme="light"] {
   color-scheme: light;
-  --bg: #f4f5f6;
+  --bg: #f5f5f7;
   --surface: #ffffff;
-  --surface-raised: #ffffff;
-  --surface-hover: #e8eaec;
-  --text-primary: #1a1c20;
-  --text-secondary: #4a4e56;
-  --text-muted: #6a6e76;
-  --border-subtle: rgba(15, 18, 22, 0.1);
-  --border-strong: rgba(15, 18, 22, 0.22);
-  --accent: #0e8a4d;
-  --accent-strong: #0c7a44;
+  --surface-raised: #f5f5f7;
+  --surface-hover: #e8e8ec;
+  --text-primary: #171719;
+  --text-secondary: #6b6b70;
+  --text-muted: #929298;
+  --border-subtle: #e4e4e7;
+  --border-strong: #c9c9cf;
+  --accent: #171719;
+  --accent-strong: #171719;
   --accent-contrast: #ffffff;
   --success: #1d8f66;
   --danger: #d2454f;
-  --shadow-overlay: 0 16px 40px rgba(20, 24, 30, 0.18);
-  --scrim: rgba(240, 242, 244, 0.7);
+  --shadow-overlay: 0 16px 40px rgba(20, 24, 30, 0.14);
+  --scrim: rgba(23, 23, 25, 0.32);
+  --theme-color: #f5f5f7;
 }
 
 @theme inline {

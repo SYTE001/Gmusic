@@ -254,8 +254,13 @@ export type RankedCandidate = {
   autoAcceptable: boolean;
 };
 
+function isDurationAligned(quality: MatchQuality): boolean {
+  return quality.durationDeltaSeconds === null || quality.durationDeltaSeconds <= 5;
+}
+
 /**
  * Ranks search candidates (PRD §5, §6). Order: safe-to-attach records first,
+ * duration-aligned synced recordings ahead of mismatched-length edits (>10s drift),
  * then by lyric capability (word > line > plain), then by metadata score.
  * Records with no usable lyric content are dropped.
  */
@@ -279,6 +284,16 @@ export function rankCandidates(
     .sort((a, b) => {
       const acceptDiff = Number(b.autoAcceptable) - Number(a.autoAcceptable);
       if (acceptDiff !== 0) return acceptDiff;
+      if (a.hasSynced && b.hasSynced) {
+        const aAligned = isDurationAligned(a.quality);
+        const bAligned = isDurationAligned(b.quality);
+        if (aAligned !== bAligned) {
+          const unalignedDelta = aAligned
+            ? (b.quality.durationDeltaSeconds ?? 0)
+            : (a.quality.durationDeltaSeconds ?? 0);
+          if (unalignedDelta > 10) return aAligned ? -1 : 1;
+        }
+      }
       const capabilityDiff = CAPABILITY_RANK[b.capability] - CAPABILITY_RANK[a.capability];
       if (capabilityDiff !== 0) return capabilityDiff;
       return b.quality.score - a.quality.score;

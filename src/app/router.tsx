@@ -18,6 +18,7 @@ const PlaylistsPage = lazy(() => import("../features/playlists/PlaylistsPage").t
 const PlaylistDetailPage = lazy(() => import("../features/playlists/PlaylistDetailPage").then((m) => ({ default: m.PlaylistDetailPage })));
 const RecentPage = lazy(() => import("../features/recent/RecentPage").then((m) => ({ default: m.RecentPage })));
 const SettingsPage = lazy(() => import("../features/settings/SettingsPage").then((m) => ({ default: m.SettingsPage })));
+const BrokenPage = lazy(() => import("../features/broken/BrokenPage").then((m) => ({ default: m.BrokenPage })));
 const NowPlayingPage = lazy(() => import("../features/player/NowPlayingPage").then((m) => ({ default: m.NowPlayingPage })));
 
 /** Quiet, layout-stable placeholder shown only while a page chunk loads. */
@@ -55,6 +56,7 @@ export function AppRoutes() {
           <Route path="playlists" element={<PlaylistsPage />} />
           <Route path="playlist/:id" element={<PlaylistDetailPage />} />
           <Route path="recent" element={<RecentPage />} />
+          <Route path="broken" element={<BrokenPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Route>

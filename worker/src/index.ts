@@ -14,6 +14,7 @@
 import { requireUser } from "./auth";
 import { ApiError, Errors } from "./errors";
 import { KeySpec, contentTypeForUpload, extensionFromFileName, validateId } from "./keys";
+import { handleMusicBrainzProxy, isMusicBrainzProxyPath } from "./musicbrainz";
 import { deleteTrackObjects, objectExists, presignGet, presignPut, verifyObject } from "./r2";
 import { createUploadIntent, verifyUploadIntent } from "./uploadIntent";
 import type { Env } from "./env";
@@ -92,6 +93,14 @@ export default {
 
     if (url.pathname === "/api/health" && request.method === "GET") {
       return json({ ok: true, service: "local-music-r2" }, 200, env);
+    }
+
+    if (isMusicBrainzProxyPath(url.pathname)) {
+      try {
+        return await handleMusicBrainzProxy(request, env, corsHeaders(env));
+      } catch (error) {
+        return errorResponse(error, env);
+      }
     }
 
     if (!url.pathname.startsWith("/api/audio/")) {

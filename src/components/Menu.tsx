@@ -11,7 +11,7 @@ export type MenuItemSpec =
   | { kind: "heading"; label: string };
 
 export function Menu({ items, buttonLabel, trigger }: {
-  items: MenuItemSpec[];
+  items: MenuItemSpec[] | (() => MenuItemSpec[]);
   buttonLabel: string;
   trigger?: ReactNode;
 }) {
@@ -50,7 +50,8 @@ export function Menu({ items, buttonLabel, trigger }: {
     buttons[next].focus();
   };
 
-  const actionable = items.filter((item) => item.kind === "action");
+  const resolvedItems = open ? (typeof items === "function" ? items() : items) : [];
+  const actionable = open ? resolvedItems.filter((item) => item.kind === "action") : [];
 
   return (
     <div ref={rootRef} className="relative">
@@ -76,7 +77,7 @@ export function Menu({ items, buttonLabel, trigger }: {
           onKeyDown={onKeyDownList}
           className="surface-card absolute right-0 top-[calc(100%+4px)] z-40 min-w-48 py-1.5 shadow-[var(--shadow-overlay)] animate-fade-in"
         >
-          {items.map((item, index) => {
+          {resolvedItems.map((item, index) => {
             if (item.kind === "separator") {
               return <div key={`sep-${index}`} className="my-1.5 h-px" style={{ background: "var(--border-subtle)" }} />;
             }

@@ -9,6 +9,7 @@ import type { RankedCandidate } from "../services/lyrics/matching";
 import { describeLrcmuxError } from "../services/lyrics/lrcmuxClient";
 import { usePlaybackStore } from "./playbackStore";
 import { useSettingsStore } from "./settingsStore";
+import { perfMark, perfMeasure } from "../utils/perf";
 
 /**
  * Lyrics discovery state (feature spec §1, §8). One resolution per track;
@@ -54,6 +55,8 @@ type LyricsState = {
   clearCandidates: () => void;
   /** Force a fresh lookup even though lyrics exist (keeps manual records until replaced). */
   searchAgain: (track: Track) => Promise<void>;
+  /** Aborts any in-flight resolution and resets state when the active track changes. */
+  resetForTrackChange: (nextTrackId: string | null) => void;
 };
 
 export const useLyricsStore = create<LyricsState>((set, get) => {
@@ -159,6 +162,20 @@ export const useLyricsStore = create<LyricsState>((set, get) => {
     },
 
     clearCandidates: () => set({ candidates: [] }),
+
+    resetForTrackChange: (nextTrackId) => {
+      resolutionToken += 1;
+      activeController?.abort();
+      activeController = null;
+      set({
+        trackId: nextTrackId,
+        status: "idle",
+        phase: "idle",
+        candidates: [],
+        errorMessage: null,
+        fromCache: false,
+      });
+    },
   };
 });
 
@@ -177,18 +194,48 @@ export function bindLyricsTrackLookup(lookup: (id: string) => Track | undefined)
  * lookups, ensure lyrics are resolved. Playback is never awaited or blocked.
  */
 export function startLyricsPrefetch(): () => void {
-  const maybeResolve = () => {
-    const playback = usePlaybackStore.getState();
-    if (!playback.currentTrackId) return;
-    const track = trackLookup(playback.currentTrackId);
-    if (!track) return;
-    const { prefs } = useSettingsStore.getState();
-    if (!prefs.autoFetchLyrics) return;
-    void useLyricsStore.getState().resolveForTrack(track);
+  let deferTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearPendingTimer = () => {
+    if (deferTimer !== null) {
+      clearTimeout(deferTimer);
+      deferTimer = null;
+    }
+  };
+
+  const scheduleResolve = (expectedTrackId: string) => {
+    clearPendingTimer();
+    deferTimer = setTimeout(() => {
+      deferTimer = null;
+      perfMark("skip:lyrics-lookup:start");
+      const playback = usePlaybackStore.getState();
+      if (!playback.currentTrackId || playback.currentTrackId !== expectedTrackId) return;
+      if (playback.status === "loading") return;
+      const track = trackLookup(playback.currentTrackId);
+      if (!track) return;
+      const { prefs } = useSettingsStore.getState();
+      if (!prefs.autoFetchLyrics) return;
+      void useLyricsStore.getState().resolveForTrack(track);
+      perfMeasure("skip:lyrics-lookup-start", "skip:lyrics-lookup:start", "skip:lyrics-lookup:end");
+    }, 0);
   };
 
   const unsubscribe = usePlaybackStore.subscribe((state, previous) => {
-    if (state.currentTrackId !== previous.currentTrackId) maybeResolve();
+    if (state.currentTrackId !== previous.currentTrackId) {
+      clearPendingTimer();
+      useLyricsStore.getState().resetForTrackChange(state.currentTrackId);
+      if (state.currentTrackId && state.status === "ready") {
+        scheduleResolve(state.currentTrackId);
+      }
+      return;
+    }
+    if (state.currentTrackId && state.status === "ready" && previous.status !== "ready") {
+      scheduleResolve(state.currentTrackId);
+    }
   });
-  return unsubscribe;
+
+  return () => {
+    clearPendingTimer();
+    unsubscribe();
+  };
 }

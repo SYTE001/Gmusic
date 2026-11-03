@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
-import { SidebarContent } from "./Sidebar";
+import { SidebarContent, focusVisibleSearch } from "./Sidebar";
 import { CloudBadge, MobileTopBar, OfflineBadge } from "./TopBar";
 import { MiniPlayer } from "./MiniPlayer";
 import { QueuePanel } from "./QueuePanel";
@@ -8,6 +8,7 @@ import { usePlaybackStore } from "../stores/playbackStore";
 import { useLibraryStore } from "../stores/libraryStore";
 import { useToastStore } from "../stores/toastStore";
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, HeartIcon, HomeIcon, LibraryIcon, PlaylistIcon, SettingsIcon } from "./Icons";
+import { DynamicIslandNotification } from "./DynamicIslandNotification";
 import { APP_NAME } from "../types";
 
 const mobileNavClass = ({ isActive }: { isActive: boolean }) =>
@@ -163,12 +164,20 @@ export function AppShell() {
               </button>
             </div>
             <div className="min-h-0 flex-1">
-              <SidebarContent showSearch={false} />
+              <SidebarContent
+                showSearch={false}
+                onSearchActivate={() => {
+                  setDrawerOpen(false);
+                  // Let the drawer unmount first so the top-bar field is visible.
+                  window.setTimeout(focusVisibleSearch, 80);
+                }}
+              />
             </div>
           </div>
         </div>
       )}
 
+      <DynamicIslandNotification />
       <Toasts />
       <AriaLiveAnnouncer />
     </div>

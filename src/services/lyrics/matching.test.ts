@@ -163,6 +163,16 @@ describe("rankCandidates", () => {
     expect(ranked[0].record.id).toBe(1);
   });
 
+  it("prefers a duration-aligned synced recording over an unaligned video edit (>10s drift)", () => {
+    const ranked = rankCandidates(track, [
+      // Music video cut (25s longer) with word sync whose timestamps would be shifted
+      record({ id: 40, duration: 237, hasWordSync: true, syncedLyrics: "[00:25.00]<00:25.00>te <00:25.50>xt" }),
+      // Exact duration match (212s) with line sync
+      record({ id: 41, duration: 212, syncedLyrics: "[00:01.00]text" }),
+    ]);
+    expect(ranked[0].record.id).toBe(41);
+  });
+
   it("caps the candidate list length", () => {
     const many = Array.from({ length: 30 }, (_, i) => record({ id: i }));
     expect(rankCandidates(track, many)).toHaveLength(12);

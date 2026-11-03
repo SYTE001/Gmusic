@@ -17,6 +17,7 @@ import { fileSystemAccessSupported } from "../../services/file-access/FileAccess
 import { humanBytes } from "../../utils/misc";
 import { APP_VERSION } from "../../types";
 import { ImportIcon, InfoIcon, OfflineIcon } from "../../components/Icons";
+import { SegmentedControl } from "../../components/SegmentedControl";
 import { CloudAccountSection } from "./CloudAccountSection";
 import { CloudMigrationSection } from "./CloudMigrationSection";
 
@@ -116,17 +117,17 @@ export function SettingsPage() {
       </div>
 
       <Section title="Appearance">
-        <Row label="Theme" hint="Dark is the designed default.">
-          <select
+        <Row label="Theme" hint="Light, Dark, or follow your device's appearance.">
+          <SegmentedControl
             value={prefs.theme}
-            onChange={(event) => update({ theme: event.target.value as typeof prefs.theme })}
-            className="rounded-lg border bg-surface px-2.5 py-1.5 text-sm outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            <option value="dark">Dark</option>
-            <option value="light">Light</option>
-            <option value="system">System</option>
-          </select>
+            onChange={(value) => update({ theme: value })}
+            options={[
+              { value: "light", label: "Light" },
+              { value: "dark", label: "Dark" },
+              { value: "system", label: "System" },
+            ]}
+            label="Theme"
+          />
         </Row>
         <Row label="Artwork background tint" hint="Tint Now Playing with a soft color from the current cover.">
           <Toggle checked={prefs.artworkTint} onChange={(value) => update({ artworkTint: value })} label="Artwork tint" />
@@ -356,7 +357,7 @@ export function SettingsPage() {
 
       <Section title="About & limits">
         <ul className="list-inside list-disc space-y-1.5 px-1 text-sm text-text-secondary">
-          <li>Local Music {APP_VERSION} — an offline personal music player. Original implementation; not affiliated with any other music app.</li>
+          <li>Gmusic {APP_VERSION} — an offline personal music player. Original implementation; not affiliated with any other music app.</li>
           <li>Your audio, artwork, lyrics, and metadata never leave this device. There is no server, account, or analytics.</li>
           <li>
             Playback support depends on your browser's codecs: MP3, AAC/M4A, FLAC, OGG/Vorbis/Opus, and WAV generally work in

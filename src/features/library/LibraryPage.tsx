@@ -10,11 +10,15 @@ import { LibraryIcon, MusicNoteIcon } from "../../components/Icons";
 import { formatDurationLong } from "../../utils/misc";
 import { useTrackActions } from "./useTrackActions";
 import { Menu } from "../../components/Menu";
+import { recordComponentRender } from "../../utils/perf";
 
-type ViewMode = "songs" | "albums" | "artists";
+import { BrokenPage } from "../broken/BrokenPage";
 
-/** All Songs / Albums / Artists views of the imported library (PRD §7.3). */
+type ViewMode = "songs" | "albums" | "artists" | "broken";
+
+/** All Songs / Albums / Artists / Broken views of the imported library (PRD §7.3). */
 export function LibraryPage() {
+  recordComponentRender("LibraryPage");
   const [searchParams, setSearchParams] = useSearchParams();
   const [view, setView] = useState<ViewMode>("songs");
   const tracks = useLibraryStore((state) => state.tracks);
@@ -22,8 +26,12 @@ export function LibraryPage() {
   const query = searchParams.get("q") ?? undefined;
   const { dialogs } = useTrackActions();
 
-  const albums = useMemo(() => groupAlbums(tracks), [tracks]);
-  const artists = useMemo(() => groupArtists(tracks), [tracks]);
+  const albums = useMemo(() => (view === "albums" ? groupAlbums(tracks) : []), [tracks, view]);
+  const artists = useMemo(() => (view === "artists" ? groupArtists(tracks) : []), [tracks, view]);
+  const brokenCount = useMemo(
+    () => tracks.filter((t) => t.broken?.isBroken || t.availability === "broken").length,
+    [tracks],
+  );
 
   if (status === "error") {
     return (
@@ -64,21 +72,28 @@ export function LibraryPage() {
       </div>
 
       <div role="tablist" aria-label="Library views" className="flex w-fit rounded-lg border p-0.5" style={{ borderColor: "var(--border-subtle)" }}>
-        {(["songs", "albums", "artists"] as ViewMode[]).map((mode) => (
+        {(["songs", "albums", "artists", "broken"] as ViewMode[]).map((mode) => (
           <button
             key={mode}
             role="tab"
             aria-selected={view === mode}
             type="button"
-            className={`rounded-md px-3.5 py-1.5 text-sm capitalize transition-colors ${
+            className={`flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-sm capitalize transition-colors ${
               view === mode ? "bg-surface-raised font-medium text-text-primary" : "text-text-secondary hover:text-text-primary"
             }`}
             onClick={() => setView(mode)}
           >
-            {mode}
+            <span>{mode}</span>
+            {mode === "broken" && brokenCount > 0 && (
+              <span className="rounded-full bg-danger/15 px-1.5 py-0.5 text-xs font-medium text-danger tabular-nums">
+                {brokenCount}
+              </span>
+            )}
           </button>
         ))}
       </div>
+
+      {view === "broken" && <BrokenPage />}
 
       {view === "songs" && (
         <TrackListSection

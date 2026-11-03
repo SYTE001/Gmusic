@@ -1,6 +1,7 @@
 import { create } from "zustand";
-import type { PlaybackContext, RepeatMode, Track } from "../types";
+import type { BrokenCategory, PlaybackContext, RepeatMode, Track } from "../types";
 import { clamp } from "../utils/misc";
+import { useDynamicIslandStore } from "./dynamicIslandStore";
 import {
   appendToQueue,
   clearUpcoming,
@@ -20,7 +21,12 @@ import {
   type EngineEvents,
   type MediaFailure,
 } from "../services/audio/engine";
-import { regainHandleAccess, resolveTrackSource } from "../services/file-access/FileAccessService";
+import {
+  preloadTrackSource,
+  regainHandleAccess,
+  resolveTrackSource,
+} from "../services/file-access/FileAccessService";
+import { perfMark, perfMeasure } from "../utils/perf";
 
 /**
  * PlaybackStore — the single global playback state (PRD §7.6). One audio
@@ -67,7 +73,10 @@ type PlaybackActions = {
 
   playContext(trackIds: string[], startIndex: number, context: PlaybackContext): void;
   playTrackFromContext(trackId: string, contextTrackIds: string[], context: PlaybackContext): void;
-  startTrack(trackId: string, options?: { startPositionMs?: number; autoplay?: boolean; requestPermission?: boolean }): Promise<void>;
+  startTrack(
+    trackId: string,
+    options?: { startPositionMs?: number; autoplay?: boolean; requestPermission?: boolean; queueIndex?: number },
+  ): Promise<void>;
   togglePlay(): void;
   play(): void;
   pause(): void;
@@ -110,9 +119,49 @@ type PlaybackActions = {
 export type PlaybackStore = PlaybackState & PlaybackActions;
 
 const SEEK_PREVIOUS_THRESHOLD_MS = 3000;
+const RAPID_SKIP_COALESCE_WINDOW_MS = 35;
+const RAPID_SKIP_DEBOUNCE_MS = 14;
 
 let loadToken = 0;
 let pendingSeekMs: number | null = null;
+let lastStartTrackAt = 0;
+let preloadedForTrackId: string | null = null;
+
+function scheduleIdleSideEffect(task: () => void): void {
+  if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+    (window as Window & { requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback(
+      task,
+      { timeout: 120 },
+    );
+  } else {
+    setTimeout(task, 0);
+  }
+}
+
+function maybePreloadNextTrack(): void {
+  const state = usePlaybackStore.getState();
+  if (!state.currentTrackId || state.status !== "ready") return;
+  if (preloadedForTrackId === state.currentTrackId) return;
+  preloadedForTrackId = state.currentTrackId;
+
+  const target = nextIndex({
+    queueTrackIds: state.queueTrackIds,
+    queueIndex: state.queueIndex,
+    repeatMode: state.repeatMode === "one" ? "all" : state.repeatMode,
+  });
+  if (target === null) return;
+  const nextTrackId = state.queueTrackIds[target];
+  if (!nextTrackId || nextTrackId === state.currentTrackId) return;
+
+  scheduleIdleSideEffect(() => {
+    const latest = usePlaybackStore.getState();
+    if (latest.currentTrackId !== state.currentTrackId) return;
+    void playbackHelpers.getTrackForPlayback(nextTrackId).then((nextTrack) => {
+      if (!nextTrack || usePlaybackStore.getState().currentTrackId !== state.currentTrackId) return;
+      void playbackHelpers.preloadSource(nextTrack);
+    });
+  });
+}
 
 /**
  * Generation-based stale-event guard. `acceptedSourceGeneration` is the
@@ -140,6 +189,9 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
       // previous source would poison the fresh track's position.
       if (usePlaybackStore.getState().status === "loading") return;
       usePlaybackStore.setState({ currentTimeMs: sec * 1000 });
+      if (sec >= 3) {
+        maybePreloadNextTrack();
+      }
     },
     onDurationChange: (sec) => {
       // Apply a one-time resume seek once duration is known.
@@ -149,7 +201,12 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
         get().getEngine().seekSec(seekMs / 1000);
         usePlaybackStore.setState({ currentTimeMs: seekMs });
       }
-      usePlaybackStore.setState({ durationMs: sec !== null ? sec * 1000 : null });
+      const durationMs = sec !== null && Number.isFinite(sec) && sec > 0 ? Math.round(sec * 1000) : null;
+      usePlaybackStore.setState({ durationMs });
+      const currentTrackId = usePlaybackStore.getState().currentTrackId;
+      if (currentTrackId && durationMs !== null) {
+        void playbackHelpers.syncTrackDuration(currentTrackId, durationMs);
+      }
     },
     onPlayStateChange: (isPlaying) => {
       if (isPlaying) {
@@ -262,6 +319,8 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const current = get().engine;
     current?.dispose();
     acceptedSourceGeneration = null; // fresh engine, fresh generation space
+    lastStartTrackAt = 0;
+    preloadedForTrackId = null;
     set({ engine });
   },
 
@@ -297,15 +356,23 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
   startTrack: async (trackId, options) => {
     const token = ++loadToken;
+    const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const isRapidSkip = !options?.requestPermission && lastStartTrackAt > 0 && now - lastStartTrackAt < RAPID_SKIP_COALESCE_WINDOW_MS;
+    lastStartTrackAt = now;
+    preloadedForTrackId = null;
+
+    perfMark(`skip:start:${token}`);
+    perfMark(`skip:store-update:start:${token}`);
     // From this moment, any media event from the still-loaded previous
     // source is stale: this attempt owns the engine's next generation.
     acceptedSourceGeneration = expectNextSourceGeneration();
-    const { autoplay = true, startPositionMs, requestPermission } = options ?? {};
+    const { autoplay = true, startPositionMs, requestPermission, queueIndex } = options ?? {};
     pendingSeekMs = startPositionMs ?? null;
     // Any explicit start consumes a pending session-resume so a later Play
     // cannot resurrect a stale position for a different attempt.
     pendingResumeMs = null;
     set({
+      ...(queueIndex !== undefined ? { queueIndex } : {}),
       currentTrackId: trackId,
       status: "loading",
       error: null,
@@ -313,6 +380,14 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       currentTimeMs: startPositionMs ?? 0,
       durationMs: null,
     });
+    perfMeasure("skip:store-update", `skip:store-update:start:${token}`, `skip:store-update:end:${token}`);
+
+    // Coalesce rapid consecutive skips so tapping Next 5-10 times quickly
+    // updates the UI immediately but only resolves and loads the final track.
+    if (isRapidSkip) {
+      await new Promise((resolve) => setTimeout(resolve, RAPID_SKIP_DEBOUNCE_MS));
+      if (token !== loadToken) return;
+    }
 
     const { getTrackForPlayback } = playbackHelpers;
     const track = await getTrackForPlayback(trackId);
@@ -321,6 +396,10 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     if (!track) {
       pendingSeekMs = null; // don't leak this resume seek onto a later track
       set({ status: "error", error: { title: "Track not found", detail: "This track is no longer in your library.", action: "none" } });
+      useDynamicIslandStore.getState().showNotification({
+        title: "Playback failed",
+        description: "This track is no longer in your library.",
+      });
       return;
     }
 
@@ -339,13 +418,24 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
             action: "grant-permission",
           },
         });
+        useDynamicIslandStore.getState().showNotification({
+          title: "Access required",
+          description: "The browser did not grant file access. Tap to grant access.",
+          song: `${track.title} — ${track.artist || "Unknown Artist"}`,
+          trackId: track.id,
+        });
         void playbackHelpers.markTrackAvailability(track.id, "permission-required");
         return;
       }
     }
 
+    perfMark(`skip:file-resolution:start:${token}`);
     const resolved = await playbackHelpers.resolveSource(track);
-    if (token !== loadToken) return;
+    perfMeasure("skip:file-resolution", `skip:file-resolution:start:${token}`, `skip:file-resolution:end:${token}`);
+    if (token !== loadToken) {
+      if (resolved.ok) resolved.release();
+      return;
+    }
 
     if (!resolved.ok) {
       pendingSeekMs = null; // don't leak this resume seek onto a later track
@@ -355,39 +445,70 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
           : resolved.reason === "missing"
             ? "relink"
             : "none";
-      set({
-        status: "error",
-        isPlaying: false,
-        error: { title: `Can't play "${track.title}"`, detail: resolved.detail, action },
-      });
       if (resolved.reason === "permission-required" || resolved.reason === "missing") {
         void playbackHelpers.markTrackAvailability(track.id, resolved.reason);
       } else if (resolved.reason === "offline") {
         void playbackHelpers.markTrackAvailability(track.id, "offline");
       }
+      set({
+        status: "error",
+        isPlaying: false,
+        error: { title: `Can't play "${track.title}"`, detail: resolved.detail, action },
+      });
+      if (resolved.reason === "missing" && !track.objectKey) {
+        // Permanent local source failure
+        void playbackHelpers.markTrackBroken(track.id, {
+          category: "missing",
+          description: "The audio file could not be found or opened.",
+        });
+        useDynamicIslandStore.getState().showNotification({
+          title: "Missing audio source",
+          description: "The audio file could not be found or opened.",
+          song: `${track.title} — ${track.artist || "Unknown Artist"}`,
+          trackId: track.id,
+          category: "missing",
+        });
+      } else {
+        useDynamicIslandStore.getState().showNotification({
+          title: resolved.reason === "offline" ? "Playback offline" : "Playback failed",
+          description: resolved.detail,
+          song: `${track.title} — ${track.artist || "Unknown Artist"}`,
+          trackId: track.id,
+        });
+      }
       return;
     }
 
+    perfMark(`skip:audio-src-to-canplay:start:${token}`);
     const engine = get().getEngine();
     engine.setSource(resolved.url);
     recordActiveSourceGeneration();
 
-    // A successful resolution is the ground truth for availability: if an
-    // earlier attempt (or a stale startup check) marked the track missing or
-    // permission-required but a fallback source just played, heal the badge.
-    void playbackHelpers.markTrackAvailability(track.id, "available");
-
-    void playbackHelpers.notifyTrackStarted(trackId);
+    const commitPostStartSideEffects = () => {
+      scheduleIdleSideEffect(() => {
+        if (token !== loadToken) return;
+        perfMark(`skip:db-writes:start:${token}`);
+        if (track.broken?.isBroken || track.availability === "broken") {
+          void playbackHelpers.restoreBrokenTrack(track.id);
+        }
+        void playbackHelpers.markTrackAvailability(track.id, "available");
+        void playbackHelpers.notifyTrackStarted(trackId);
+        perfMeasure("skip:db-writes-dispatch", `skip:db-writes:start:${token}`, `skip:db-writes:end:${token}`);
+      });
+    };
 
     if (autoplay) {
       try {
         await engine.play();
+        perfMeasure("skip:audio-src-to-canplay", `skip:audio-src-to-canplay:start:${token}`, `skip:audio-src-to-canplay:end:${token}`);
         if (token !== loadToken) return;
         set({
           isPlaying: true,
           status: "ready",
           announcement: `Playing ${track.title} by ${track.artist || "unknown artist"}`,
         });
+        perfMeasure("skip:total", `skip:start:${token}`, `skip:end:${token}`);
+        commitPostStartSideEffects();
       } catch (error) {
         if (token !== loadToken) return;
         if (error instanceof AutoplayBlockedError) {
@@ -397,16 +518,25 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
             status: "ready",
             announcement: "Playback blocked by the browser. Press play to start.",
           });
+          useDynamicIslandStore.getState().showNotification({
+            title: "Autoplay blocked",
+            description: "The browser blocked playback. Press play to start.",
+            song: `${track.title} — ${track.artist || "Unknown Artist"}`,
+            trackId: track.id,
+          });
+          commitPostStartSideEffects();
         } else if (error instanceof DOMException && error.name === "AbortError") {
           // play() was interrupted by a load() or pause() — a transition, not
           // a playback failure. The element's own events keep state honest.
           set({ isPlaying: false, status: "ready" });
+          commitPostStartSideEffects();
         } else {
           get().handleEngineError({ code: 0, message: error instanceof Error ? error.message : String(error) });
         }
       }
     } else {
       set({ status: "ready" });
+      commitPostStartSideEffects();
     }
   },
 
@@ -451,6 +581,13 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       .catch((error: unknown) => {
         if (error instanceof AutoplayBlockedError) {
           set({ isPlaying: false, autoplayBlocked: true, announcement: "Playback blocked by the browser. Press play to start." });
+          const currentTrack = playbackHelpers.currentTrack();
+          useDynamicIslandStore.getState().showNotification({
+            title: "Autoplay blocked",
+            description: "The browser blocked playback. Press play to start.",
+            song: currentTrack ? `${currentTrack.title} — ${currentTrack.artist || "Unknown Artist"}` : undefined,
+            trackId: currentTrack?.id,
+          });
         } else if (error instanceof DOMException && error.name === "AbortError") {
           // play() interrupted by a load()/pause() — a transition, not a
           // failure (e.g. pressing Play then Pause in quick succession).
@@ -482,8 +619,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       set({ isPlaying: false, status: "ended" });
       return;
     }
-    set({ queueIndex: target });
-    void get().startTrack(state.queueTrackIds[target], { autoplay: true });
+    void get().startTrack(state.queueTrackIds[target], { autoplay: true, queueIndex: target });
   },
 
   previous: () => {
@@ -502,8 +638,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       get().seek(0);
       return;
     }
-    set({ queueIndex: target });
-    void get().startTrack(state.queueTrackIds[target], { autoplay: true });
+    void get().startTrack(state.queueTrackIds[target], { autoplay: true, queueIndex: target });
   },
 
   seek: (ms) => {
@@ -661,11 +796,67 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     }
     const track = playbackHelpers.currentTrack();
     loadToken += 1; // invalidate any in-flight loads
+    const errorInfo = describeFailureForTrack(failure, track);
     set({
       isPlaying: false,
       status: "error",
-      error: describeFailureForTrack(failure, track),
+      error: errorInfo,
     });
+
+    const song = track ? `${track.title} — ${track.artist || "Unknown Artist"}` : undefined;
+
+    if (failure.code === 4) {
+      if (track) {
+        void playbackHelpers.markTrackBroken(track.id, {
+          category: "unsupported",
+          description: "This audio format is not supported by your browser.",
+        });
+      }
+      useDynamicIslandStore.getState().showNotification({
+        title: "Unsupported audio format",
+        description: "This audio format is not supported by your browser.",
+        song,
+        trackId: track?.id,
+        category: "unsupported",
+      });
+    } else if (failure.code === 3) {
+      if (track) {
+        void playbackHelpers.markTrackBroken(track.id, {
+          category: "decoding",
+          description: "Audio decoding failed: the file may be corrupted.",
+        });
+      }
+      useDynamicIslandStore.getState().showNotification({
+        title: "Audio decoding failed",
+        description: "This audio file appears to be corrupted or undecodable.",
+        song,
+        trackId: track?.id,
+        category: "decoding",
+      });
+    } else if (failure.code === 2) {
+      // Network error is transient
+      useDynamicIslandStore.getState().showNotification({
+        title: "Playback failed",
+        description: "A network error interrupted loading.",
+        song,
+        trackId: track?.id,
+      });
+    } else {
+      if (track) {
+        void playbackHelpers.markTrackBroken(track.id, {
+          category: "corrupted",
+          description: "Playback failed due to unreadable or corrupted audio.",
+        });
+      }
+      useDynamicIslandStore.getState().showNotification({
+        title: "Playback failed",
+        description: "This audio file appears to be corrupted.",
+        song,
+        trackId: track?.id,
+        category: "corrupted",
+      });
+    }
+
     // A network failure on a cloud track is often just an expired signed URL.
     // One automatic refresh keeps playback alive; a second failure surfaces.
     if (failure.code === 2 && track?.objectKey) {
@@ -713,6 +904,7 @@ const playbackHelpers: {
   getTrackForPlayback: (id: string) => Promise<Track | undefined>;
   currentTrack: () => Track | undefined;
   notifyTrackStarted: (trackId: string) => Promise<void>;
+  syncTrackDuration: (trackId: string, durationMs: number) => Promise<void>;
   markTrackAvailability: (
     trackId: string,
     availability: "available" | "permission-required" | "missing" | "offline",
@@ -720,14 +912,21 @@ const playbackHelpers: {
   persistPrefs: () => void;
   persistPosition: () => void;
   resolveSource: typeof resolveTrackSource;
+  preloadSource: typeof preloadTrackSource;
+  markTrackBroken: (trackId: string, info: { category: BrokenCategory; description: string }) => Promise<void>;
+  restoreBrokenTrack: (trackId: string) => Promise<void>;
 } = {
   getTrackForPlayback: async () => undefined,
   currentTrack: () => undefined,
   notifyTrackStarted: async () => undefined,
+  syncTrackDuration: async () => undefined,
   markTrackAvailability: async () => undefined,
   persistPrefs: () => undefined,
   persistPosition: () => undefined,
   resolveSource: resolveTrackSource,
+  preloadSource: preloadTrackSource,
+  markTrackBroken: async () => undefined,
+  restoreBrokenTrack: async () => undefined,
 };
 
 export function bindPlaybackHelpers(helpers: Partial<typeof playbackHelpers>): void {

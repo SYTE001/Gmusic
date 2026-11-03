@@ -1,10 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
 import type { Track } from "../types";
 import { Artwork } from "./Artwork";
 import { ChevronDownIcon, ChevronUpIcon, CloseIcon, GripIcon, PlayIcon, TrashIcon } from "./Icons";
 import { formatClock } from "../utils/misc";
+import { recordComponentRender } from "../utils/perf";
+
+const EMPTY_TRACKS: Track[] = [];
+const EMPTY_QUEUE_IDS: string[] = [];
 
 /**
  * Queue drawer: reorder by drag with keyboard-accessible move buttons,
@@ -12,11 +16,14 @@ import { formatClock } from "../utils/misc";
  * (PRD §7.9). Playback continues while the panel is open.
  */
 export function QueuePanel({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const tracks = useLibraryStore((state) => state.tracks);
-  const queueTrackIds = usePlaybackStore((state) => state.queueTrackIds);
-  const queueIndex = usePlaybackStore((state) => state.queueIndex);
+  recordComponentRender("QueuePanel");
+  const tracks = useLibraryStore((state) => (open ? state.tracks : EMPTY_TRACKS));
+  const queueTrackIds = usePlaybackStore((state) => (open ? state.queueTrackIds : EMPTY_QUEUE_IDS));
+  const queueIndex = usePlaybackStore((state) => (open ? state.queueIndex : -1));
   const dragIndexRef = useRef<number | null>(null);
   const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+
+  const trackById = useMemo(() => new Map(tracks.map((track) => [track.id, track])), [tracks]);
 
   useEffect(() => {
     if (!open) return;
@@ -29,7 +36,6 @@ export function QueuePanel({ open, onClose }: { open: boolean; onClose: () => vo
 
   if (!open) return null;
 
-  const trackById = new Map(tracks.map((track) => [track.id, track]));
   const entries = queueTrackIds.map((id, index) => ({ id, index, track: trackById.get(id) as Track | undefined }));
   const nowPlaying = entries[queueIndex];
   const upcoming = entries.slice(queueIndex + 1);
@@ -118,7 +124,7 @@ export function QueuePanel({ open, onClose }: { open: boolean; onClose: () => vo
   );
 }
 
-function QueueRow({
+const QueueRow = memo(function QueueRow({
   track,
   isCurrent = false,
   onPlay,
@@ -143,9 +149,10 @@ function QueueRow({
   onDrop?: () => void;
   isDragOver?: boolean;
 }) {
+  recordComponentRender("QueueRow");
   return (
     <div
-      className={`group flex items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors ${
+      className={`group flex items-center gap-2.5 rounded-lg px-2 py-1.5 transition-colors [content-visibility:auto] [contain-intrinsic-size:auto_3rem] ${
         isCurrent ? "bg-surface-raised" : "hover:bg-surface-hover"
       } ${isDragOver ? "outline outline-2 outline-accent" : ""}`}
       draggable={draggable}
@@ -161,7 +168,7 @@ function QueueRow({
       <button type="button" className="flex min-w-0 flex-1 items-center gap-2.5 text-left" onClick={onPlay}>
         <Artwork trackId={track.id} alt="" className="size-9 shrink-0" rounded="rounded" />
         <span className="min-w-0 flex-1">
-          <span className={`block truncate text-sm ${isCurrent ? "text-accent" : "text-text-primary"}`}>{track.title}</span>
+          <span className={`block truncate text-sm ${isCurrent ? "font-medium text-text-primary" : "text-text-primary"}`}>{track.title}</span>
           <span className="block truncate text-xs text-text-secondary">{track.artist || "Unknown artist"}</span>
         </span>
         <span className="shrink-0 text-xs tabular-nums text-text-muted">{track.durationMs !== null ? formatClock(track.durationMs) : "—"}</span>
@@ -186,4 +193,4 @@ function QueueRow({
       </div>
     </div>
   );
-}
+});

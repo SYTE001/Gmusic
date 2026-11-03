@@ -393,3 +393,12 @@ export function InfoIcon({ size, ...props }: IconProps) {
     </svg>
   );
 }
+
+export function RefreshIcon({ size, ...props }: IconProps) {
+  return (
+    <svg {...base(size, props)}>
+      <path d="M20 12a8 8 0 0 1-13.66 5.66M4 12a8 8 0 0 1 13.66-5.66" />
+      <path d="M4 4v5h5M20 20v-5h-5" />
+    </svg>
+  );
+}

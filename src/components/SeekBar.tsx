@@ -177,8 +177,12 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
           style={{ transform: `translate3d(${safeFraction * 100}%, 0, 0)`, willChange: "transform" }}
         >
           <div
-            className={`size-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-text-primary transition-opacity ${
-              scrubMs !== null || isPlaying ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+            className={`size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent-strong shadow-sm transition-[opacity,transform] duration-150 ${
+              scrubMs !== null
+                ? "scale-110 opacity-100"
+                : isPlaying
+                  ? "opacity-100"
+                  : "opacity-0 scale-90 group-hover:scale-105 group-hover:opacity-100"
             }`}
           />
         </div>

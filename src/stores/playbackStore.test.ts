@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { usePlaybackStore, bindPlaybackHelpers } from "./playbackStore";
 import type { AudioEngine, EngineEvents, MediaFailure } from "../services/audio/engine";
-import { resolveTrackSource } from "../services/file-access/FileAccessService";
+import { resolveTrackSource, releaseActiveTrackSource } from "../services/file-access/FileAccessService";
 import { repository } from "../services/indexeddb/LibraryRepository";
+import { getObjectUrlStats, resetObjectUrlStats } from "../utils/perf";
 import type { Track } from "../types";
 
 /** Deterministic engine double — no real audio in jsdom. */
@@ -466,6 +467,82 @@ describe("playback store", () => {
     const state = usePlaybackStore.getState();
     expect(state.status).toBe("ready");
     expect(state.error).toBeNull();
+  });
+
+  it("ignores stale track resolution during rapid skips and revokes its object URL", async () => {
+    let finishStaleResolution: (() => void) | null = null;
+    let staleUrlReleased = false;
+
+    bindPlaybackHelpers({
+      resolveSource: async (track) => {
+        if (track.id === "a") {
+          await new Promise<void>((resolve) => {
+            finishStaleResolution = resolve;
+          });
+          return {
+            ok: true as const,
+            url: "blob:stale-a",
+            release: () => {
+              staleUrlReleased = true;
+            },
+          };
+        }
+        return {
+          ok: true as const,
+          url: `blob:fresh-${track.id}`,
+          release: () => undefined,
+        };
+      },
+    });
+
+    // Start track "a" (slow resolution), then skip to "b" and "c" before "a" finishes.
+    usePlaybackStore.getState().playContext(["a", "b", "c"], 0, { type: "library", label: "L" });
+    await new Promise((r) => setTimeout(r, 5));
+    usePlaybackStore.getState().next(true);
+    usePlaybackStore.getState().next(true);
+
+    await waitForStore(() => usePlaybackStore.getState().currentTrackId === "c" && usePlaybackStore.getState().isPlaying);
+    expect(engine.src).toBe("blob:fresh-c");
+
+    // Now the stale resolution for "a" completes late: it must be ignored and its URL released.
+    expect(finishStaleResolution).not.toBeNull();
+    finishStaleResolution!();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(staleUrlReleased).toBe(true);
+    expect(usePlaybackStore.getState().currentTrackId).toBe("c");
+    expect(engine.src).toBe("blob:fresh-c");
+  });
+
+  it("revokes previous object URLs without leaks across 10 rapid skips", async () => {
+    releaseActiveTrackSource();
+    resetObjectUrlStats();
+    const tenTracks: Track[] = [];
+    for (let i = 0; i < 11; i++) {
+      const t = makeTrack({ id: `rapid-${i}`, title: `Rapid ${i}` });
+      tenTracks.push(t);
+      tracks.push(t);
+      await repository.putAudioBlob(t.id, new Blob(["audio-bytes"]));
+    }
+    await repository.putTracks(tenTracks);
+
+    usePlaybackStore.getState().playContext(
+      tenTracks.map((t) => t.id),
+      0,
+      { type: "library", label: "L" },
+    );
+    await waitForStore(() => usePlaybackStore.getState().currentTrackId === "rapid-0" && usePlaybackStore.getState().isPlaying);
+
+    for (let i = 0; i < 10; i++) {
+      usePlaybackStore.getState().next(true);
+    }
+
+    await waitForStore(() => usePlaybackStore.getState().currentTrackId === "rapid-10" && usePlaybackStore.getState().isPlaying);
+    const stats = getObjectUrlStats();
+    expect(usePlaybackStore.getState().currentTrackId).toBe("rapid-10");
+    expect(usePlaybackStore.getState().status).toBe("ready");
+    expect(stats.active).toBe(1);
+    expect(stats.created - stats.revoked).toBe(1);
   });
 });
 

@@ -1,10 +1,10 @@
-import { useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { useLibraryStore } from "../stores/libraryStore";
+import { useLibraryStore, useTrackById } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
-import { toast } from "../stores/toastStore";
+import { recordComponentRender } from "../utils/perf";
 import { Artwork } from "./Artwork";
 import { SeekBar } from "./SeekBar";
+import { TransportToggle } from "./TransportToggle";
 import {
   ExpandIcon,
   HeartIcon,
@@ -19,7 +19,6 @@ import {
   ShuffleIcon,
   VolumeIcon,
   VolumeMuteIcon,
-  WarningIcon,
 } from "./Icons";
 
 /**
@@ -30,19 +29,17 @@ import {
  * isolated to the SeekBar subtree.
  */
 export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => void; queueOpen: boolean }) {
+  recordComponentRender("MiniPlayer");
   const navigate = useNavigate();
-  const locateInputRef = useRef<HTMLInputElement>(null);
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const isBuffering = usePlaybackStore((state) => state.isBuffering);
   const status = usePlaybackStore((state) => state.status);
-  const error = usePlaybackStore((state) => state.error);
-  const autoplayBlocked = usePlaybackStore((state) => state.autoplayBlocked);
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
   const volume = usePlaybackStore((state) => state.volume);
   const isMuted = usePlaybackStore((state) => state.isMuted);
-  const track = useLibraryStore((state) => state.tracks.find((item) => item.id === currentTrackId) ?? null);
+  const track = useTrackById(currentTrackId);
   const toggleLike = useLibraryStore((state) => state.toggleLike);
 
   if (!track && status === "idle") return null;
@@ -51,61 +48,6 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
 
   return (
     <div className="relative z-20 border-t bg-surface" style={{ borderColor: "var(--border-subtle)" }}>
-      {(autoplayBlocked || error) && (
-        <div
-          className="flex items-center justify-between gap-3 px-4 py-1.5 text-xs"
-          style={{ background: "color-mix(in srgb, var(--danger) 16%, transparent)", color: "color-mix(in srgb, var(--danger) 75%, white)" }}
-          role="alert"
-        >
-          <span className="flex items-center gap-1.5 truncate">
-            <WarningIcon size={14} />
-            {error ? `${error.title} — ${error.detail}` : "The browser blocked playback. Press play to start."}
-          </span>
-          {error?.action === "grant-permission" && (
-            <button
-              type="button"
-              className="shrink-0 font-medium underline underline-offset-2"
-              onClick={() => usePlaybackStore.getState().play()}
-            >
-              Grant access
-            </button>
-          )}
-          {error?.action === "relink" && (
-            <>
-              {/* Direct recovery: pick the moved/renamed file right here — no
-                  detour through the Library — and re-attempt playback. */}
-              <input
-                ref={locateInputRef}
-                type="file"
-                accept="audio/*,.mp3,.m4a,.aac,.wav,.ogg,.flac,.opus"
-                className="hidden"
-                aria-hidden
-                tabIndex={-1}
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  event.target.value = "";
-                  if (!file || !currentTrackId) return;
-                  void useLibraryStore
-                    .getState()
-                    .relinkTrack(currentTrackId, file)
-                    .then(() => {
-                      usePlaybackStore.getState().play(); // status is "error", so play() re-resolves the source
-                    })
-                    .catch(() => toast("error", "The file could not be linked. Try again from the song's ⋯ menu."));
-                }}
-              />
-              <button
-                type="button"
-                className="shrink-0 font-medium underline underline-offset-2"
-                onClick={() => locateInputRef.current?.click()}
-              >
-                Locate file…
-              </button>
-            </>
-          )}
-        </div>
-      )}
-
       <div className="mx-auto flex h-[72px] max-w-[1600px] items-center gap-1 px-3 md:h-[84px] md:gap-4 md:px-5">
         {/* Left zone: artwork + title/artist + like */}
         <div className="flex min-w-0 flex-1 items-center gap-1.5 md:w-[30%] md:flex-none md:gap-2">
@@ -146,16 +88,15 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
         {/* Center zone: transport + seek */}
         <div className="flex flex-none flex-col items-center justify-center gap-0.5 md:flex-1">
           <div className="flex items-center gap-0.5 md:gap-2">
-            <button
-              type="button"
-              className="icon-btn hidden sm:inline-flex"
+            <TransportToggle
+              className="hidden sm:inline-flex"
+              active={shuffleEnabled}
+              label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
               title="Shuffle (S)"
-              aria-label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
-              aria-pressed={shuffleEnabled}
               onClick={() => usePlaybackStore.getState().toggleShuffle()}
             >
-              <ShuffleIcon size={17} className={shuffleEnabled ? "text-accent" : ""} />
-            </button>
+              <ShuffleIcon size={17} />
+            </TransportToggle>
             <button
               type="button"
               className="icon-btn"
@@ -168,7 +109,7 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
             </button>
             <button
               type="button"
-              className="grid size-11 place-items-center rounded-full bg-accent text-accent-contrast transition-transform hover:scale-105 active:scale-95 disabled:opacity-40 md:size-12"
+              className="grid size-12 place-items-center rounded-full bg-accent text-accent-contrast transition-transform hover:scale-105 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
               title="Play/Pause (Space)"
               aria-label={isPlaying ? "Pause" : "Play"}
               onClick={() => usePlaybackStore.getState().togglePlay()}
@@ -186,19 +127,21 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
             >
               <NextIcon size={19} />
             </button>
-            <button
-              type="button"
-              className="icon-btn hidden sm:inline-flex"
+            <TransportToggle
+              className="hidden sm:inline-flex"
+              active={repeatMode !== "off"}
+              label={
+                repeatMode === "one"
+                  ? "Repeat one — click for off"
+                  : repeatMode === "all"
+                    ? "Repeat all — click for repeat one"
+                    : "Enable repeat all"
+              }
               title="Repeat (R)"
-              aria-label={repeatMode === "one" ? "Repeat one — click for off" : repeatMode === "all" ? "Repeat all — click for repeat one" : "Enable repeat all"}
               onClick={() => usePlaybackStore.getState().cycleRepeat()}
             >
-              {repeatMode === "one" ? (
-                <RepeatOneIcon size={17} className="text-accent" />
-              ) : (
-                <RepeatIcon size={17} className={repeatMode === "off" ? "" : "text-accent"} />
-              )}
-            </button>
+              {repeatMode === "one" ? <RepeatOneIcon size={17} /> : <RepeatIcon size={17} />}
+            </TransportToggle>
           </div>
           <div className="hidden w-full max-w-xl md:block">
             <SeekBar compact />
