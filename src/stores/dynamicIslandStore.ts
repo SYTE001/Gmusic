@@ -6,6 +6,7 @@ export type NotificationPayload = {
   song?: string;
   trackId?: string;
   category?: string;
+  errorCode?: string;
 };
 
 export type NotificationItem = NotificationPayload & {
@@ -21,6 +22,8 @@ type DynamicIslandStore = {
   queue: NotificationItem[];
   showNotification: (payload: NotificationPayload) => void;
   dismissNotification: () => void;
+  pauseAutoDismiss: () => void;
+  resumeAutoDismiss: () => void;
   /** For testing or resetting state */
   reset: () => void;
 };
@@ -29,6 +32,9 @@ let nextId = 0;
 let expandTimeout: ReturnType<typeof setTimeout> | null = null;
 let autoDismissTimeout: ReturnType<typeof setTimeout> | null = null;
 let collapseTimeout: ReturnType<typeof setTimeout> | null = null;
+let autoDismissStartedAt: number | null = null;
+let autoDismissRemainingMs: number = 3000;
+let isPaused: boolean = false;
 
 function clearAllTimers() {
   if (expandTimeout) {
@@ -43,12 +49,28 @@ function clearAllTimers() {
     clearTimeout(collapseTimeout);
     collapseTimeout = null;
   }
+  autoDismissStartedAt = null;
+  isPaused = false;
+  autoDismissRemainingMs = AUTO_DISMISS_DELAY_MS;
 }
 
 const MAX_QUEUE_SIZE = 3;
 const AUTO_DISMISS_DELAY_MS = 3000;
 const EXPAND_DELAY_MS = 60;
 const COLLAPSE_DURATION_MS = 240;
+
+function scheduleAutoDismiss(onDismiss: () => void, delayMs: number) {
+  if (autoDismissTimeout) {
+    clearTimeout(autoDismissTimeout);
+    autoDismissTimeout = null;
+  }
+  autoDismissRemainingMs = delayMs;
+  autoDismissStartedAt = Date.now();
+  isPaused = false;
+  autoDismissTimeout = setTimeout(() => {
+    onDismiss();
+  }, delayMs);
+}
 
 export const useDynamicIslandStore = create<DynamicIslandStore>((set, get) => ({
   current: null,
@@ -79,9 +101,7 @@ export const useDynamicIslandStore = create<DynamicIslandStore>((set, get) => ({
 
       expandTimeout = setTimeout(() => {
         set({ stage: "expanded" });
-        autoDismissTimeout = setTimeout(() => {
-          get().dismissNotification();
-        }, AUTO_DISMISS_DELAY_MS);
+        scheduleAutoDismiss(() => get().dismissNotification(), AUTO_DISMISS_DELAY_MS);
       }, EXPAND_DELAY_MS);
       return;
     }
@@ -105,14 +125,30 @@ export const useDynamicIslandStore = create<DynamicIslandStore>((set, get) => ({
         set({ current: next, queue: rest, stage: "initial" });
         expandTimeout = setTimeout(() => {
           set({ stage: "expanded" });
-          autoDismissTimeout = setTimeout(() => {
-            get().dismissNotification();
-          }, AUTO_DISMISS_DELAY_MS);
+          scheduleAutoDismiss(() => get().dismissNotification(), AUTO_DISMISS_DELAY_MS);
         }, EXPAND_DELAY_MS);
       } else {
         set({ current: null, stage: "idle" });
       }
     }, COLLAPSE_DURATION_MS);
+  },
+
+  pauseAutoDismiss: () => {
+    const state = get();
+    if (state.stage !== "expanded" || isPaused || !autoDismissStartedAt) return;
+    if (autoDismissTimeout) {
+      clearTimeout(autoDismissTimeout);
+      autoDismissTimeout = null;
+    }
+    const elapsed = Date.now() - autoDismissStartedAt;
+    autoDismissRemainingMs = Math.max(500, autoDismissRemainingMs - elapsed);
+    isPaused = true;
+  },
+
+  resumeAutoDismiss: () => {
+    const state = get();
+    if (state.stage !== "expanded" || !isPaused) return;
+    scheduleAutoDismiss(() => get().dismissNotification(), autoDismissRemainingMs);
   },
 
   reset: () => {

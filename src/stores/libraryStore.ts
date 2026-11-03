@@ -58,7 +58,7 @@ type LibraryState = {
   /** Removes the local audio copy for a track whose cloud copy is confirmed. */
   removeLocalAudioCopy: (trackId: string) => Promise<void>;
   /** Marks a track as broken due to persistent playback/decoding failure. */
-  markTrackBroken: (trackId: string, info: { category: BrokenCategory; description: string }) => Promise<void>;
+  markTrackBroken: (trackId: string, info: { category: BrokenCategory; description: string; summary?: string; originalMessage?: string; errorCode?: string }) => Promise<void>;
   /** Restores a broken track back to normal available status. */
   restoreBrokenTrack: (trackId: string) => Promise<void>;
   /** Downloads and stores a local copy of a cloud track (explicit action). */
@@ -482,6 +482,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       isBroken: true,
       category: info.category,
       description: info.description,
+      summary: info.summary,
+      originalMessage: info.originalMessage,
+      errorCode: info.errorCode,
       failedAt: Date.now(),
       retryCount: currentRetries + 1,
     };

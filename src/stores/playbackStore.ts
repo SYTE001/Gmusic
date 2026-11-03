@@ -1,3 +1,4 @@
+import { summarizePlaybackError } from "../services/errors/summarizePlaybackError";
 import { create } from "zustand";
 import type { BrokenCategory, PlaybackContext, RepeatMode, Track } from "../types";
 import { clamp } from "../utils/misc";
@@ -457,16 +458,21 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       });
       if (resolved.reason === "missing" && !track.objectKey) {
         // Permanent local source failure
+        const missingSummary = summarizePlaybackError("Audio file not found: " + (resolved.detail || "The audio file could not be found or opened."));
         void playbackHelpers.markTrackBroken(track.id, {
           category: "missing",
-          description: "The audio file could not be found or opened.",
+          description: missingSummary.summary,
+          summary: missingSummary.summary,
+          originalMessage: resolved.detail || "The audio file could not be found or opened.",
+          errorCode: "NotFoundError",
         });
         useDynamicIslandStore.getState().showNotification({
-          title: "Missing audio source",
-          description: "The audio file could not be found or opened.",
+          title: missingSummary.title,
+          description: missingSummary.summary,
           song: `${track.title} — ${track.artist || "Unknown Artist"}`,
           trackId: track.id,
           category: "missing",
+          errorCode: "NotFoundError",
         });
       } else {
         useDynamicIslandStore.getState().showNotification({
@@ -805,55 +811,35 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
     const song = track ? `${track.title} — ${track.artist || "Unknown Artist"}` : undefined;
 
-    if (failure.code === 4) {
-      if (track) {
-        void playbackHelpers.markTrackBroken(track.id, {
-          category: "unsupported",
-          description: "This audio format is not supported by your browser.",
-        });
-      }
-      useDynamicIslandStore.getState().showNotification({
-        title: "Unsupported audio format",
-        description: "This audio format is not supported by your browser.",
-        song,
-        trackId: track?.id,
-        category: "unsupported",
-      });
-    } else if (failure.code === 3) {
-      if (track) {
-        void playbackHelpers.markTrackBroken(track.id, {
-          category: "decoding",
-          description: "Audio decoding failed: the file may be corrupted.",
-        });
-      }
-      useDynamicIslandStore.getState().showNotification({
-        title: "Audio decoding failed",
-        description: "This audio file appears to be corrupted or undecodable.",
-        song,
-        trackId: track?.id,
-        category: "decoding",
-      });
-    } else if (failure.code === 2) {
+    const errorSummary = summarizePlaybackError(failure);
+
+    if (failure.code === 2) {
       // Network error is transient
       useDynamicIslandStore.getState().showNotification({
-        title: "Playback failed",
-        description: "A network error interrupted loading.",
+        title: errorSummary.title,
+        description: errorSummary.summary,
         song,
         trackId: track?.id,
+        category: errorSummary.category,
+        errorCode: errorSummary.errorCode,
       });
     } else {
       if (track) {
         void playbackHelpers.markTrackBroken(track.id, {
-          category: "corrupted",
-          description: "Playback failed due to unreadable or corrupted audio.",
+          category: (errorSummary.category === "playback" || errorSummary.category === "network" ? "corrupted" : errorSummary.category),
+          description: errorSummary.summary,
+          summary: errorSummary.summary,
+          originalMessage: errorSummary.originalMessage,
+          errorCode: errorSummary.errorCode,
         });
       }
       useDynamicIslandStore.getState().showNotification({
-        title: "Playback failed",
-        description: "This audio file appears to be corrupted.",
+        title: errorSummary.title,
+        description: errorSummary.summary,
         song,
         trackId: track?.id,
-        category: "corrupted",
+        category: errorSummary.category,
+        errorCode: errorSummary.errorCode,
       });
     }
 
@@ -913,7 +899,7 @@ const playbackHelpers: {
   persistPosition: () => void;
   resolveSource: typeof resolveTrackSource;
   preloadSource: typeof preloadTrackSource;
-  markTrackBroken: (trackId: string, info: { category: BrokenCategory; description: string }) => Promise<void>;
+  markTrackBroken: (trackId: string, info: { category: BrokenCategory; description: string; summary?: string; originalMessage?: string; errorCode?: string }) => Promise<void>;
   restoreBrokenTrack: (trackId: string) => Promise<void>;
 } = {
   getTrackForPlayback: async () => undefined,

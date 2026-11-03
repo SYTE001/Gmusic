@@ -51,7 +51,7 @@ describe("Playback error classification, Broken track detection & Dynamic Island
 
   it("classifies unsupported audio format (MediaError code 4) as permanent broken track and shows notification", () => {
     const track = createMockTrack("unsupported-1");
-    let brokenMarked: { category: string; description: string } | null = null;
+    let brokenMarked: { category: string; description: string; originalMessage?: string; errorCode?: string } | null = null;
 
     bindPlaybackHelpers({
       currentTrack: () => track,
@@ -64,19 +64,23 @@ describe("Playback error classification, Broken track detection & Dynamic Island
 
     expect(brokenMarked).toEqual({
       category: "unsupported",
-      description: "This audio format is not supported by your browser.",
+      description: "This audio format is not supported.",
+      summary: "This audio format is not supported.",
+      originalMessage: "MEDIA_ERR_SRC_NOT_SUPPORTED (4): Format not supported",
+      errorCode: "MEDIA_ERR_SRC_NOT_SUPPORTED (4)",
     });
 
     const notif = useDynamicIslandStore.getState().current;
     expect(notif).not.toBeNull();
-    expect(notif?.title).toBe("Unsupported audio format");
+    expect(notif?.title).toBe("Unsupported audio");
+    expect(notif?.description).toBe("This audio format is not supported.");
     expect(notif?.category).toBe("unsupported");
     expect(notif?.song).toBe("Track unsupported-1 — Test Artist");
   });
 
   it("classifies audio decoding failure (MediaError code 3) as permanent broken track", () => {
     const track = createMockTrack("decode-fail-1");
-    let brokenMarked: { category: string; description: string } | null = null;
+    let brokenMarked: { category: string; description: string; originalMessage?: string; errorCode?: string } | null = null;
 
     bindPlaybackHelpers({
       currentTrack: () => track,
@@ -89,18 +93,22 @@ describe("Playback error classification, Broken track detection & Dynamic Island
 
     expect(brokenMarked).toEqual({
       category: "decoding",
-      description: "Audio decoding failed: the file may be corrupted.",
+      description: "The audio file could not be decoded.",
+      summary: "The audio file could not be decoded.",
+      originalMessage: "MEDIA_ERR_DECODE (3): Decode error",
+      errorCode: "MEDIA_ERR_DECODE (3)",
     });
 
     const notif = useDynamicIslandStore.getState().current;
     expect(notif).not.toBeNull();
-    expect(notif?.title).toBe("Audio decoding failed");
+    expect(notif?.title).toBe("Playback failed");
+    expect(notif?.description).toBe("The audio file could not be decoded.");
     expect(notif?.category).toBe("decoding");
   });
 
   it("classifies corrupted audio (code 0 / general permanent error) as broken", () => {
     const track = createMockTrack("corrupt-1");
-    let brokenMarked: { category: string; description: string } | null = null;
+    let brokenMarked: { category: string; description: string; originalMessage?: string; errorCode?: string } | null = null;
 
     bindPlaybackHelpers({
       currentTrack: () => track,
@@ -113,17 +121,21 @@ describe("Playback error classification, Broken track detection & Dynamic Island
 
     expect(brokenMarked).toEqual({
       category: "corrupted",
-      description: "Playback failed due to unreadable or corrupted audio.",
+      description: "This audio file appears to be damaged.",
+      summary: "This audio file appears to be damaged.",
+      originalMessage: "MEDIA_ERR (0): File data corrupted",
+      errorCode: "MEDIA_ERR (0)",
     });
 
     const notif = useDynamicIslandStore.getState().current;
-    expect(notif?.title).toBe("Playback failed");
+    expect(notif?.title).toBe("Damaged audio");
+    expect(notif?.description).toBe("This audio file appears to be damaged.");
     expect(notif?.category).toBe("corrupted");
   });
 
   it("classifies missing local audio source as broken missing category", async () => {
     const track = createMockTrack("missing-src-1", { accessMode: "stored-copy" });
-    let brokenMarked: { category: string; description: string } | null = null;
+    let brokenMarked: { category: string; description: string; originalMessage?: string; errorCode?: string } | null = null;
 
     bindPlaybackHelpers({
       getTrackForPlayback: async () => track,
@@ -143,10 +155,14 @@ describe("Playback error classification, Broken track detection & Dynamic Island
     expect(brokenMarked).toEqual({
       category: "missing",
       description: "The audio file could not be found or opened.",
+      summary: "The audio file could not be found or opened.",
+      originalMessage: "The audio file is not available in this session.",
+      errorCode: "NotFoundError",
     });
 
     const notif = useDynamicIslandStore.getState().current;
-    expect(notif?.title).toBe("Missing audio source");
+    expect(notif?.title).toBe("Audio not found");
+    expect(notif?.description).toBe("The audio file could not be found or opened.");
     expect(notif?.category).toBe("missing");
   });
 
@@ -165,7 +181,7 @@ describe("Playback error classification, Broken track detection & Dynamic Island
 
     expect(brokenMarked).toBe(false);
     const notif = useDynamicIslandStore.getState().current;
-    expect(notif?.title).toBe("Playback failed");
+    expect(notif?.title).toBe("Network error");
     expect(notif?.description).toBe("A network error interrupted loading.");
   });
 

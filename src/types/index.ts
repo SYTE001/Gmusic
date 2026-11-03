@@ -25,6 +25,9 @@ export type BrokenInfo = {
   description: string;
   failedAt: number;
   retryCount?: number;
+  summary?: string;
+  originalMessage?: string;
+  errorCode?: string;
 };
 
 /**
