@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { toast } from "../../stores/toastStore";
@@ -16,6 +16,10 @@ import { formatDurationLong } from "../../utils/misc";
 import type { Track } from "../../types";
 
 export function BrokenPage() {
+  const [searchParams] = useSearchParams();
+  const targetTrackId = searchParams.get("trackId");
+  const [highlightedId, setHighlightedId] = useState<string | null>(targetTrackId);
+
   const tracks = useLibraryStore((state) => state.tracks);
   const restoreBrokenTrack = useLibraryStore((state) => state.restoreBrokenTrack);
   const removeTracks = useLibraryStore((state) => state.removeTracks);
@@ -28,6 +32,19 @@ export function BrokenPage() {
   );
 
   const totalDurationMs = brokenTracks.reduce((sum, t) => sum + (t.durationMs ?? 0), 0);
+
+  useEffect(() => {
+    if (!targetTrackId) return;
+    setHighlightedId(targetTrackId);
+    const element = document.getElementById(`broken-track-${targetTrackId}`);
+    if (element) {
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    const timer = setTimeout(() => {
+      setHighlightedId(null);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [targetTrackId]);
 
   const handleRetry = (track: Track) => {
     toast("info", `Retrying playback for “${track.title}”…`);
@@ -115,67 +132,96 @@ export function BrokenPage() {
 
       {/* Broken tracks list */}
       <div className="divide-y rounded-xl border bg-surface" style={{ borderColor: "var(--border-subtle)" }}>
-        {brokenTracks.map((track) => (
-          <div
-            key={track.id}
-            role="listitem"
-            className="flex flex-col gap-3 p-3.5 transition-colors sm:flex-row sm:items-center sm:justify-between sm:gap-4 md:px-4"
-          >
-            {/* Track info & artwork */}
-            <div className="flex min-w-0 items-center gap-3">
-              <Artwork trackId={track.id} alt="" className="size-12 shrink-0" rounded="rounded-md" />
-              <div className="min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="truncate text-sm font-medium text-text-primary">
-                    {track.title}
-                  </span>
-                  <span className="shrink-0 rounded-md bg-danger/15 px-2 py-0.5 text-[11px] font-medium text-danger">
-                    {categoryLabel(track.broken?.category)}
-                  </span>
+        {brokenTracks.map((track) => {
+          const isHighlighted = highlightedId === track.id;
+          const displaySummary = track.broken?.summary || track.broken?.description || "Playback failed";
+
+          return (
+            <div
+              key={track.id}
+              id={`broken-track-${track.id}`}
+              data-track-id={track.id}
+              role="listitem"
+              className={`flex flex-col gap-3 p-3.5 transition-all duration-300 sm:flex-row sm:items-start sm:justify-between sm:gap-4 md:px-4 ${
+                isHighlighted ? "ring-2 ring-danger/80 bg-danger/5 dark:bg-danger/10 rounded-lg" : ""
+              }`}
+            >
+              {/* Track info & artwork & error details */}
+              <div className="flex min-w-0 flex-1 items-start gap-3">
+                <Artwork trackId={track.id} alt="" className="size-12 shrink-0 mt-0.5" rounded="rounded-md" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="truncate text-sm font-semibold text-text-primary">
+                      {track.title}
+                    </span>
+                    <span className="shrink-0 rounded-md bg-danger/15 px-2 py-0.5 text-[11px] font-medium text-danger">
+                      {categoryLabel(track.broken?.category)}
+                    </span>
+                    {track.broken?.errorCode && (
+                      <span className="shrink-0 rounded bg-surface-raised px-1.5 py-0.5 text-[10px] font-mono text-text-muted">
+                        {track.broken.errorCode}
+                      </span>
+                    )}
+                  </div>
+
+                  <p className="truncate text-xs text-text-secondary mt-0.5">
+                    {track.artist || "Unknown Artist"}
+                    {track.album ? ` · ${track.album}` : ""}
+                  </p>
+
+                  {/* Error Summary */}
+                  <p className="mt-1 text-xs font-medium text-danger/90 leading-snug">
+                    {displaySummary}
+                  </p>
+
+                  {/* Verbatim original error message for technical inspection */}
+                  {track.broken?.originalMessage && track.broken.originalMessage !== displaySummary && (
+                    <div className="mt-1.5 rounded bg-surface-raised/80 px-2.5 py-1.5 text-[11px] font-mono text-text-secondary select-text overflow-x-auto max-w-full">
+                      {track.broken.originalMessage}
+                    </div>
+                  )}
+
+                  {/* Failure time and attempts */}
+                  <p className="mt-1 text-[11px] text-text-muted">
+                    {track.broken?.failedAt ? `Failed ${new Date(track.broken.failedAt).toLocaleDateString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}` : ""}
+                    {track.broken?.retryCount && track.broken.retryCount > 1 ? ` · ${track.broken.retryCount} attempts` : ""}
+                  </p>
                 </div>
-                <p className="truncate text-xs text-text-secondary">
-                  {track.artist || "Unknown Artist"}
-                  {track.album ? ` · ${track.album}` : ""}
-                </p>
-                <p className="mt-0.5 truncate text-[11px] text-danger/90">
-                  {track.broken?.description || "Playback failed"}
-                  {track.broken?.retryCount ? ` (${track.broken.retryCount} attempt${track.broken.retryCount === 1 ? "" : "s"})` : ""}
-                </p>
+              </div>
+
+              {/* Actions: Retry, Restore, Remove */}
+              <div className="flex shrink-0 items-center gap-2 self-end sm:self-start pt-1">
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs font-medium text-text-primary transition-colors hover:bg-surface-hover"
+                  title="Attempt playback again"
+                  onClick={() => handleRetry(track)}
+                >
+                  <PlayIcon size={13} />
+                  Retry
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs font-medium text-text-primary transition-colors hover:bg-surface-hover"
+                  title="Restore track back to normal library"
+                  onClick={() => void handleRestore(track)}
+                >
+                  <RefreshIcon size={13} />
+                  Restore
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-danger transition-colors hover:bg-danger/10"
+                  title="Remove from library (does not delete file from disk)"
+                  onClick={() => setTrackToDelete(track)}
+                >
+                  <TrashIcon size={14} />
+                  Remove
+                </button>
               </div>
             </div>
-
-            {/* Actions: Retry, Restore, Remove */}
-            <div className="flex shrink-0 items-center gap-2 self-end sm:self-center">
-              <button
-                type="button"
-                className="inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs font-medium text-text-primary transition-colors hover:bg-surface-hover"
-                title="Attempt playback again"
-                onClick={() => handleRetry(track)}
-              >
-                <PlayIcon size={13} />
-                Retry
-              </button>
-              <button
-                type="button"
-                className="inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-1.5 text-xs font-medium text-text-primary transition-colors hover:bg-surface-hover"
-                title="Restore track back to normal library"
-                onClick={() => void handleRestore(track)}
-              >
-                <RefreshIcon size={13} />
-                Restore
-              </button>
-              <button
-                type="button"
-                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium text-danger transition-colors hover:bg-danger/10"
-                title="Remove from library (does not delete file from disk)"
-                onClick={() => setTrackToDelete(track)}
-              >
-                <TrashIcon size={14} />
-                Remove
-              </button>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
 
       <ConfirmDialog

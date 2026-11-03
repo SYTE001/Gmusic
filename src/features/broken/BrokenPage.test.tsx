@@ -6,7 +6,11 @@ import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import type { Track } from "../../types";
 
-function createBrokenTrack(id: string, category: "corrupted" | "unsupported" | "decoding" | "missing" = "corrupted"): Track {
+function createBrokenTrack(
+  id: string,
+  category: "corrupted" | "unsupported" | "decoding" | "missing" = "corrupted",
+  overrides?: Partial<Track>,
+): Track {
   return {
     id,
     title: `Broken Song ${id}`,
@@ -30,9 +34,13 @@ function createBrokenTrack(id: string, category: "corrupted" | "unsupported" | "
       isBroken: true,
       category,
       description: "Audio file cannot be decoded",
-      failedAt: Date.now(),
+      summary: "This audio file could not be decoded.",
+      originalMessage: "MEDIA_ERR_DECODE (3): Audio decoder pipeline encountered unrecoverable bitstream error",
+      errorCode: "MEDIA_ERR_DECODE (3)",
+      failedAt: 1700000000000,
       retryCount: 2,
     },
+    ...overrides,
   };
 }
 
@@ -57,7 +65,7 @@ describe("BrokenPage UI component", () => {
     expect(screen.getByRole("link", { name: "Go to Library" })).toBeTruthy();
   });
 
-  it("lists affected broken tracks with preserved metadata and error badge", () => {
+  it("lists affected broken tracks with preserved metadata, summary, original message, and error code", () => {
     const track = createBrokenTrack("b1", "decoding");
     useLibraryStore.setState({ tracks: [track] });
 
@@ -70,7 +78,31 @@ describe("BrokenPage UI component", () => {
     expect(screen.getByText("Broken Song b1")).toBeTruthy();
     expect(screen.getByText(/Tester Artist/)).toBeTruthy();
     expect(screen.getByText("Decoding failed")).toBeTruthy();
-    expect(screen.getByText(/Audio file cannot be decoded/)).toBeTruthy();
+    expect(screen.getByText("This audio file could not be decoded.")).toBeTruthy();
+    expect(
+      screen.getByText("MEDIA_ERR_DECODE (3): Audio decoder pipeline encountered unrecoverable bitstream error"),
+    ).toBeTruthy();
+    expect(screen.getByText("MEDIA_ERR_DECODE (3)")).toBeTruthy();
+  });
+
+  it("highlights target track when navigated with ?trackId query parameter", () => {
+    // Mock scrollIntoView
+    window.HTMLElement.prototype.scrollIntoView = vi.fn();
+
+    const track1 = createBrokenTrack("t1");
+    const track2 = createBrokenTrack("t2-target");
+    useLibraryStore.setState({ tracks: [track1, track2] });
+
+    render(
+      <MemoryRouter initialEntries={["/broken?trackId=t2-target"]}>
+        <BrokenPage />
+      </MemoryRouter>,
+    );
+
+    const targetEl = document.getElementById("broken-track-t2-target");
+    expect(targetEl).toBeTruthy();
+    expect(targetEl?.className).toContain("ring-");
+    expect(window.HTMLElement.prototype.scrollIntoView).toHaveBeenCalled();
   });
 
   it("triggers retry on clicking Retry button", () => {
