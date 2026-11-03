@@ -17,7 +17,8 @@ export type BrokenCategory =
   | "unsupported"
   | "unreadable"
   | "missing"
-  | "decoding";
+  | "decoding"
+  | "permission";
 
 export type BrokenInfo = {
   isBroken: boolean;

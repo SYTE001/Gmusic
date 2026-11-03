@@ -75,6 +75,8 @@ export function BrokenPage() {
         return "Missing source";
       case "decoding":
         return "Decoding failed";
+      case "permission":
+        return "Access denied";
       default:
         return "Playback failed";
     }

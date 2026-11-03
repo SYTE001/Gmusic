@@ -826,7 +826,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     } else {
       if (track) {
         void playbackHelpers.markTrackBroken(track.id, {
-          category: (errorSummary.category === "playback" || errorSummary.category === "network" ? "corrupted" : errorSummary.category),
+          category: (errorSummary.category === "playback" || errorSummary.category === "network" ? "corrupted" : errorSummary.category) as BrokenCategory,
           description: errorSummary.summary,
           summary: errorSummary.summary,
           originalMessage: errorSummary.originalMessage,
