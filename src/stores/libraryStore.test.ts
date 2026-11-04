@@ -138,4 +138,27 @@ describe("library store (IndexedDB-backed)", () => {
     await useLibraryStore.getState().init();
     expect(useLibraryStore.getState().tracks).toHaveLength(0);
   });
+
+  it("preserves state.tracks array reference on markTrackPlayed and updates trackStats", async () => {
+    const track = makeTrack({ id: "track-1", playCount: 2 });
+    await repository.putTracks([track]);
+    await useLibraryStore.getState().init();
+
+    const initialTracks = useLibraryStore.getState().tracks;
+    expect(useLibraryStore.getState().trackStats["track-1"]).toEqual({
+      lastPlayedAt: null,
+      playCount: 2,
+    });
+
+    await useLibraryStore.getState().markTrackPlayed("track-1");
+
+    // Array reference must be identical to avoid render cascades across whole library
+    expect(useLibraryStore.getState().tracks).toBe(initialTracks);
+    expect(useLibraryStore.getState().trackStats["track-1"].playCount).toBe(3);
+    expect(typeof useLibraryStore.getState().trackStats["track-1"].lastPlayedAt).toBe("number");
+
+    // Subsequent play increments accurately
+    await useLibraryStore.getState().markTrackPlayed("track-1");
+    expect(useLibraryStore.getState().trackStats["track-1"].playCount).toBe(4);
+  });
 });

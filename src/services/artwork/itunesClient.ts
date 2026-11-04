@@ -1,4 +1,5 @@
 import { normalizeForSearch } from "../../utils/misc";
+import { extractVersionQualifiers, isYearOnly } from "../metadata/normalization";
 
 export type ItunesTrackResult = {
   trackId: number;
@@ -50,6 +51,13 @@ export function computeStringSimilarity(a: string, b: string): number {
   return Math.max(0, 1 - distance / Math.max(left.length, right.length));
 }
 
+export interface ItunesArtworkDetails {
+  artworkUrl: string;
+  collectionName?: string;
+  artistName?: string;
+  score: number;
+}
+
 /**
  * Validates and ranks search results from the iTunes Search API against
  * the track title and artist. Rejects mismatched songs or remixes when an
@@ -60,6 +68,7 @@ export function validateAndRankItunesResults(
   results: ItunesTrackResult[],
 ): RankedItunesCandidate[] {
   const candidates: RankedItunesCandidate[] = [];
+  const queryFlags = extractVersionQualifiers(track.title);
 
   for (const item of results) {
     if (!item.trackName || !item.artworkUrl100) continue;
@@ -76,8 +85,25 @@ export function validateAndRankItunesResults(
     }
 
     // Reject if artist is provided but clearly a different artist
-    if (hasTrackArtist && artistSim < 0.4) {
+    if (hasTrackArtist && artistSim < 0.45) {
       continue;
+    }
+
+    // Version qualifier penalty: prefer studio versions when query is not live/remix
+    const candidateMeta = `${item.trackName} ${item.collectionName ?? ""}`;
+    const candidateFlags = extractVersionQualifiers(candidateMeta);
+    let versionPenalty = 0;
+    if (candidateFlags.has("live") && !queryFlags.has("live")) {
+      versionPenalty -= 20;
+    }
+    if (candidateFlags.has("remix") && !queryFlags.has("remix")) {
+      versionPenalty -= 20;
+    }
+    if (candidateFlags.has("acoustic") && !queryFlags.has("acoustic")) {
+      versionPenalty -= 15;
+    }
+    if (candidateFlags.has("instrumental") && !queryFlags.has("instrumental")) {
+      versionPenalty -= 25;
     }
 
     // Optional duration check if both are present
@@ -91,17 +117,22 @@ export function validateAndRankItunesResults(
       durationBonus = Math.max(0, 1 - durationDeltaSec / 25) * 10;
     }
 
-    // Optional album bonus
+    // Optional album bonus (ignore pure release years)
     let albumBonus = 0;
-    if (track.album && item.collectionName) {
-      const albumSim = computeStringSimilarity(track.album, item.collectionName);
+    const hasMeaningfulAlbum = Boolean(track.album && !isYearOnly(track.album));
+    if (hasMeaningfulAlbum && item.collectionName) {
+      const albumSim = computeStringSimilarity(track.album!, item.collectionName);
       if (albumSim > 0.75) albumBonus = 10;
     }
 
     // Calculate overall match score (0..100)
     const baseScore = hasTrackArtist
-      ? titleSim * 50 + artistSim * 30 + durationBonus + albumBonus
-      : titleSim * 70 + durationBonus + albumBonus;
+      ? titleSim * 50 + artistSim * 30 + durationBonus + albumBonus + versionPenalty
+      : titleSim * 70 + durationBonus + albumBonus + versionPenalty;
+
+    if (baseScore < 40) {
+      continue;
+    }
 
     // Prefer 600x600 high-res artwork over 100x100 thumbnail
     const highResArtworkUrl = item.artworkUrl100.replace(/\/\d+x\d+bb\./, "/600x600bb.");
@@ -110,7 +141,7 @@ export function validateAndRankItunesResults(
       result: item,
       titleSimilarity: titleSim,
       artistSimilarity: artistSim,
-      score: Math.round(baseScore * 10) / 10,
+      score: Math.max(0, Math.round(baseScore * 10) / 10),
       artworkUrl: highResArtworkUrl,
     });
   }
@@ -120,14 +151,12 @@ export function validateAndRankItunesResults(
 }
 
 /**
- * Searches the Apple iTunes Search API for matching album artwork.
- * Strictly adheres to non-paid Apple Search API specs:
- * https://itunes.apple.com/search
+ * Searches the Apple iTunes Search API for matching album artwork with verified metadata.
  */
-export async function searchItunesArtwork(
+export async function searchItunesArtworkDetails(
   track: { title: string; artist?: string; album?: string; durationMs?: number | null },
   signal?: AbortSignal,
-): Promise<string | null> {
+): Promise<ItunesArtworkDetails | null> {
   const cleanTitle = track.title?.trim();
   if (!cleanTitle) return null;
 
@@ -169,7 +198,13 @@ export async function searchItunesArtwork(
       return null;
     }
 
-    return candidates[0].artworkUrl;
+    const best = candidates[0];
+    return {
+      artworkUrl: best.artworkUrl,
+      collectionName: best.result.collectionName,
+      artistName: best.result.artistName,
+      score: best.score,
+    };
   } catch {
     // Network errors, aborts, JSON errors fail gracefully with null
     return null;
@@ -179,4 +214,17 @@ export async function searchItunesArtwork(
       signal.removeEventListener("abort", onCallerAbort);
     }
   }
+}
+
+/**
+ * Searches the Apple iTunes Search API for matching album artwork.
+ * Strictly adheres to non-paid Apple Search API specs:
+ * https://itunes.apple.com/search
+ */
+export async function searchItunesArtwork(
+  track: { title: string; artist?: string; album?: string; durationMs?: number | null },
+  signal?: AbortSignal,
+): Promise<string | null> {
+  const details = await searchItunesArtworkDetails(track, signal);
+  return details?.artworkUrl ?? null;
 }

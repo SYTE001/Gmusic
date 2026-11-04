@@ -6,7 +6,6 @@ import { recordComponentRender } from "../../utils/perf";
 import { Artwork } from "../../components/Artwork";
 import { SeekBar } from "../../components/SeekBar";
 import { TransportToggle } from "../../components/TransportToggle";
-import LyricsAmbientBackground from "../lyrics/LyricsAmbientBackground";
 import { LyricsView } from "../lyrics/LyricsView";
 import {
   CloseIcon,
@@ -22,9 +21,8 @@ import {
 } from "../../components/Icons";
 
 /**
- * Immersive Now Playing (PRD §7.8): artwork-led, Apple Music-style layout
- * with the liquid ambient background, centered/stacked controls under the artwork,
- * and side-by-side synchronized lyrics view.
+ * Immersive Now Playing (PRD §7.8): artwork-led, centered/stacked controls under the artwork,
+ * and side-by-side synchronized lyrics view on a neutral theme background.
  */
 export function NowPlayingPage() {
   recordComponentRender("NowPlayingPage");
@@ -61,18 +59,11 @@ export function NowPlayingPage() {
   }
 
   return (
-    <>
-      {/* Liquid ambient background: artwork first, theme-matched fallback
-          second; crossfades between songs, sources, and themes. */}
-      <LyricsAmbientBackground trackId={track.id} />
-
-      {/* 3. Top UI Container (transparent background, z-10 above the background layer) */}
-      <div
-        className="fixed inset-0 z-10 flex flex-col overflow-hidden animate-fade-in select-none bg-transparent"
-        role="region"
-        aria-label="Now playing"
-      >
-
+    <div
+      className="fixed inset-0 z-10 flex flex-col overflow-hidden animate-fade-in select-none bg-app-bg"
+      role="region"
+      aria-label="Now playing"
+    >
       {/* Top bar: close button on left, song title centered, lyrics toggle button on right */}
       <div className="relative z-10 flex items-center px-4 py-3 md:px-6 shrink-0">
         <button
@@ -221,6 +212,5 @@ export function NowPlayingPage() {
         )}
       </div>
     </div>
-    </>
   );
 }

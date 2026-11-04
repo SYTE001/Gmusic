@@ -19,6 +19,7 @@ export type EngineEvents = {
   onSeeked: () => void;
   onEnded: () => void;
   onError: (failure: MediaFailure) => void;
+  onDispose?: () => void;
 };
 
 export interface AudioEngine {
@@ -164,5 +165,6 @@ export class HtmlAudioEngine implements AudioEngine {
     this.audio.pause();
     this.audio.removeAttribute("src");
     this.audio.load();
+    this.events.onDispose?.();
   }
 }

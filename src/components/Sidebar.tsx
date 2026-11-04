@@ -5,7 +5,7 @@ import { SearchField } from "./TopBar";
 import { Menu, type MenuItemSpec } from "./Menu";
 import { Modal } from "./Modal";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { CreatePlaylistModal } from "../features/playlists/PlaylistsPage";
+import { CreatePlaylistModal } from "../features/playlists/CreatePlaylistModal";
 import { useArtworkUrl } from "./Artwork";
 import {
   ClockIcon,

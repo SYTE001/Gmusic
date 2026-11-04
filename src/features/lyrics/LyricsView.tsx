@@ -12,12 +12,13 @@ import {
   readLyricFileText,
 } from "../../services/lyrics/lyricsService";
 import type { TrackLyrics } from "../../types";
-import { formatClock } from "../../utils/misc";
 import { detectLyricsCapability } from "../../services/lyrics/capability";
 import { toAmllLines } from "../../services/lyrics/amllAdapter";
 import { ImportIcon, LyricsIcon, OfflineIcon, WarningIcon } from "../../components/Icons";
 import { MatchPickerDialog } from "./MatchPickerDialog";
 import { LyricLineItem } from "./LyricLineItem";
+import { LyricQuickEditor } from "./LyricQuickEditor";
+import { LyricsOffsetControls } from "./LyricsOffsetControls";
 
 // The AMLL renderer (and its stylesheet) is its own chunk, fetched only when
 // a timed lyrics document is actually shown.
@@ -613,40 +614,7 @@ export function LyricsView() {
           </span>
 
           {lyrics && timedLines && (
-            <>
-              {lyrics.offsetMs !== 0 && (
-                <span className="rounded-full border px-2 py-0.5 text-text-muted" style={{ borderColor: "var(--border-subtle)" }}>
-                  offset {(lyrics.offsetMs / 1000).toFixed(1)}s
-                </span>
-              )}
-              <button
-                type="button"
-                className="rounded-lg border px-2 py-0.5 text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
-                style={{ borderColor: "var(--border-subtle)" }}
-                aria-label="Shift lyrics half a second earlier"
-                onClick={() => void adjustOffset(-500)}
-              >
-                −0.5s
-              </button>
-              <button
-                type="button"
-                className="rounded-lg border px-2 py-0.5 text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary"
-                style={{ borderColor: "var(--border-subtle)" }}
-                aria-label="Shift lyrics half a second later"
-                onClick={() => void adjustOffset(500)}
-              >
-                +0.5s
-              </button>
-              {lyrics.offsetMs !== 0 && (
-                <button
-                  type="button"
-                  className="rounded-lg px-1.5 py-0.5 text-accent hover:underline"
-                  onClick={() => void adjustOffset(-lyrics.offsetMs)}
-                >
-                  Reset
-                </button>
-              )}
-            </>
+            <LyricsOffsetControls lyrics={lyrics} onAdjustOffset={adjustOffset} />
           )}
 
           <input
@@ -723,57 +691,6 @@ export function LyricsView() {
         }}
         onDismiss={() => setPickerOpen(false)}
       />
-    </div>
-  );
-}
-
-/** Minimal lyric text/timestamp editor. */
-function LyricQuickEditor({ lyrics, onSaved }: { lyrics: TrackLyrics; onSaved: (updated: TrackLyrics) => void }) {
-  const [value, setValue] = useState(() =>
-    lyrics.lines
-      .map((line) => (line.timeMs !== null ? `[${formatClock(line.timeMs)}] ${line.text}` : line.text))
-      .join("\n"),
-  );
-  const [saving, setSaving] = useState(false);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      const parsed = parseLyricFile(lyrics.trackId, lyrics.sourceName, value);
-      const updated = { ...parsed.lyrics, offsetMs: lyrics.offsetMs, origin: lyrics.origin, schemaVersion: DB_SCHEMA_VERSION };
-      await repository.putLyrics(updated);
-      onSaved(updated);
-    } catch {
-      // Leave the editor open with the user's text intact on failure.
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="mt-4 rounded-xl border p-3" style={{ borderColor: "var(--border-subtle)", background: "var(--surface)" }}>
-      <label className="mb-1.5 block text-xs text-text-secondary" htmlFor="lyric-editor">
-        Quick editor — one line per lyric; use [m:ss] timestamps for sync
-      </label>
-      <textarea
-        id="lyric-editor"
-        value={value}
-        onChange={(event) => setValue(event.target.value)}
-        rows={8}
-        spellCheck={false}
-        className="w-full resize-y rounded-lg border bg-transparent p-2.5 font-mono text-xs outline-none focus:border-accent"
-        style={{ borderColor: "var(--border-subtle)" }}
-      />
-      <div className="mt-2 flex justify-end gap-2">
-        <button
-          type="button"
-          className="rounded-lg bg-accent-strong px-3 py-1.5 text-xs font-medium text-accent-contrast disabled:opacity-50"
-          onClick={() => void save()}
-          disabled={saving}
-        >
-          Save lyrics
-        </button>
-      </div>
     </div>
   );
 }

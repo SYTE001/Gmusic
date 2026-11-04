@@ -4,6 +4,7 @@ import {
   getAlbumArtworkCacheKey,
   getArtworkCacheKey,
   getCachedArtworkEntry,
+  invalidateArtworkCacheForTrack,
   NEGATIVE_CACHE_TTL_MS,
   POSITIVE_CACHE_TTL_MS,
   resolveArtworkForAlbumBatch,
@@ -11,7 +12,8 @@ import {
 } from "./artworkService";
 import { __configureMusicBrainzForTests } from "./musicbrainzClient";
 import { repository } from "../indexeddb/LibraryRepository";
-import { searchItunesArtwork } from "./itunesClient";
+import { searchItunesArtwork, searchItunesArtworkDetails } from "./itunesClient";
+import { notifyArtworkLoaded, subscribeArtwork } from "./artworkCache";
 
 vi.mock("../indexeddb/LibraryRepository", () => ({
   repository: {
@@ -19,9 +21,24 @@ vi.mock("../indexeddb/LibraryRepository", () => ({
   },
 }));
 
-vi.mock("./itunesClient", () => ({
-  searchItunesArtwork: vi.fn(),
-}));
+vi.mock("./itunesClient", () => {
+  const searchItunesArtworkMock = vi.fn();
+  const searchItunesArtworkDetailsMock = vi.fn(async (track: { title: string; artist?: string; album?: string; durationMs?: number | null }) => {
+    const url = await searchItunesArtworkMock(track);
+    if (!url) return null;
+    return {
+      artworkUrl: url,
+      collectionName: track.album || "Mocked Album",
+      artistName: track.artist || "Mocked Artist",
+      score: 75,
+    };
+  });
+
+  return {
+    searchItunesArtwork: searchItunesArtworkMock,
+    searchItunesArtworkDetails: searchItunesArtworkDetailsMock,
+  };
+});
 
 const RG_MBID = "11111111-2222-3333-4444-555555555555";
 const REL_MBID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -236,19 +253,196 @@ describe("artworkService", () => {
         album: "Indie EP",
       });
 
-      expect(res).toEqual({
-        url: "https://is1-ssl.mzstatic.com/itunes-fallback.jpg",
-        source: "itunes",
-        releaseGroupMbid: null,
-        releaseMbid: null,
-        confidence: 70,
-      });
+      expect(res).toEqual(
+        expect.objectContaining({
+          url: "https://is1-ssl.mzstatic.com/itunes-fallback.jpg",
+          source: "itunes",
+          releaseGroupMbid: null,
+          releaseMbid: null,
+        }),
+      );
       expect(searchItunesArtwork).toHaveBeenCalledWith({
         title: "Rare Track",
         artist: "Indie Artist",
         album: "Indie EP",
         durationMs: undefined,
       });
+    });
+
+    it("passes normalized metadata to online providers when raw track has YouTube channel as artist and Artist - Title in title", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ "release-groups": [], releases: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      vi.mocked(searchItunesArtwork).mockResolvedValue("https://is1-ssl.mzstatic.com/sexyback.jpg");
+
+      const res = await resolveArtworkForTrack({
+        id: "t-noisy",
+        title: "Justin Timberlake - SexyBack (Audio)",
+        artist: "7clouds",
+      });
+
+      expect(res.url).toBe("https://is1-ssl.mzstatic.com/sexyback.jpg");
+      expect(searchItunesArtwork).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "SexyBack",
+          artist: "Justin Timberlake",
+        }),
+      );
+    });
+
+    it("Scenario 6: MusicBrainz receives normalized metadata instead of raw YouTube noise", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/release-group?")) {
+          // Verify URL query contains escaped normalized artist "Sade"
+          expect(url).toContain("artist%3A%22Sade%22");
+          expect(url).not.toContain("7clouds");
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ "release-groups": [], releases: [] }),
+          } as Response;
+        }
+        return { ok: false, status: 404 } as Response;
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      vi.mocked(searchItunesArtwork).mockResolvedValue(null);
+
+      await resolveArtworkForTrack({
+        id: "t-sade-mb",
+        title: "Sade - Smooth Operator (Lyrics)",
+        artist: "7clouds",
+      });
+
+      expect(fetchMock).toHaveBeenCalled();
+    });
+
+    it("Scenario 7: iTunes receives normalized metadata and records verified album", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ "release-groups": [], releases: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      vi.mocked(searchItunesArtworkDetails).mockResolvedValue({
+        artworkUrl: "https://is1-ssl.mzstatic.com/diamond-life.jpg",
+        collectionName: "Diamond Life",
+        artistName: "Sade",
+        score: 95,
+      });
+
+      const res = await resolveArtworkForTrack({
+        id: "t-sade-itunes",
+        title: "Sade - Smooth Operator (Lyrics)",
+        artist: "7clouds",
+      });
+
+      expect(res.url).toBe("https://is1-ssl.mzstatic.com/diamond-life.jpg");
+      expect(res.album).toBe("Diamond Life");
+      expect(searchItunesArtworkDetails).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: "Smooth Operator",
+          artist: "Sade",
+        }),
+      );
+
+      // Verify cached entry has verified album
+      const cached = getCachedArtworkEntry({
+        title: "Smooth Operator",
+        artist: "Sade",
+      });
+      expect(cached?.album).toBe("Diamond Life");
+      expect(cached?.url).toBe("https://is1-ssl.mzstatic.com/diamond-life.jpg");
+    });
+
+    it("Scenario 8: Alternate query is used when primary search fails", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ "release-groups": [], releases: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      // Primary search fails, but alternate query (e.g. without featured artist) succeeds
+      vi.mocked(searchItunesArtworkDetails).mockImplementation(async (query) => {
+        if (query.artist === "Daft Punk feat. Pharrell Williams") {
+          return null; // Primary fails
+        }
+        if (query.artist === "Daft Punk") {
+          return {
+            artworkUrl: "https://is1-ssl.mzstatic.com/get-lucky.jpg",
+            collectionName: "Random Access Memories",
+            artistName: "Daft Punk",
+            score: 90,
+          };
+        }
+        return null;
+      });
+
+      const res = await resolveArtworkForTrack({
+        id: "t-alt",
+        title: "Get Lucky",
+        artist: "Daft Punk feat. Pharrell Williams",
+      });
+
+      expect(res.url).toBe("https://is1-ssl.mzstatic.com/get-lucky.jpg");
+      expect(res.source).toBe("itunes");
+    });
+
+    it("Scenario 10: Negative cache does not prevent retry after metadata identity changes", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({ "release-groups": [], releases: [] }),
+      });
+      vi.stubGlobal("fetch", fetchMock);
+
+      // 1. Initial track lookup fails and gets negatively cached
+      vi.mocked(searchItunesArtworkDetails).mockResolvedValue(null);
+      const initial = await resolveArtworkForTrack({
+        id: "t-neg",
+        title: "Corrupted Title 123",
+        artist: "Unknown Band",
+      });
+      expect(initial.source).toBe("none");
+
+      // Verify negative cache is stored for the old key
+      const oldKey = getArtworkCacheKey({ title: "Corrupted Title 123", artist: "Unknown Band" });
+      const oldEntry = getCachedArtworkEntry({ title: "Corrupted Title 123", artist: "Unknown Band" });
+      expect(oldEntry?.key).toBe(oldKey);
+      expect(oldEntry?.negative).toBe(true);
+
+      // 2. User edits/corrects metadata to the real song
+      vi.mocked(searchItunesArtworkDetails).mockResolvedValue({
+        artworkUrl: "https://is1-ssl.mzstatic.com/smooth-operator.jpg",
+        collectionName: "Diamond Life",
+        artistName: "Sade",
+        score: 95,
+      });
+
+      const corrected = await resolveArtworkForTrack({
+        id: "t-neg",
+        title: "Smooth Operator",
+        artist: "Sade",
+      });
+
+      // Corrected track gets resolved because canonical identity key is different!
+      expect(corrected.source).toBe("itunes");
+      expect(corrected.url).toBe("https://is1-ssl.mzstatic.com/smooth-operator.jpg");
+
+      // 3. Invalidation clears cache properly
+      invalidateArtworkCacheForTrack({ title: "Smooth Operator", artist: "Sade" });
+      const afterInvalidation = getCachedArtworkEntry({ title: "Smooth Operator", artist: "Sade" });
+      expect(afterInvalidation).toBeUndefined();
     });
 
     it("respects 30-day positive cache TTL and 24-hour negative cache TTL", () => {
@@ -360,6 +554,28 @@ describe("artworkService", () => {
       const res = await resolveArtworkForTrack({ id: "t1", title: "Song", artist: "Artist" });
       expect(res).toEqual({ url: undefined, source: "none" });
       expect(searchItunesArtwork).not.toHaveBeenCalled();
+    });
+
+    it("isolates track-specific artwork subscriptions and cleans them up on unsubscribe", () => {
+      const track1Events: Array<string | undefined> = [];
+      const track2Events: Array<string | undefined> = [];
+
+      const unsub1 = subscribeArtwork("track-1", (url) => track1Events.push(url));
+      const unsub2 = subscribeArtwork("track-2", (url) => track2Events.push(url));
+
+      notifyArtworkLoaded("track-1", "https://img.test/1.jpg");
+      expect(track1Events).toEqual(["https://img.test/1.jpg"]);
+      expect(track2Events).toEqual([]);
+
+      notifyArtworkLoaded("track-2", "https://img.test/2.jpg");
+      expect(track1Events).toEqual(["https://img.test/1.jpg"]);
+      expect(track2Events).toEqual(["https://img.test/2.jpg"]);
+
+      unsub1();
+      notifyArtworkLoaded("track-1", "https://img.test/1-updated.jpg");
+      expect(track1Events).toEqual(["https://img.test/1.jpg"]); // no new event
+
+      unsub2();
     });
   });
 });

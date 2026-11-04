@@ -1,10 +1,14 @@
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { PlaybackContext, Track } from "../types";
 import { TrackRow } from "./TrackRow";
+import { TrackActionsProvider } from "../features/library/useTrackActions";
 import { normalizeForSearch } from "../utils/misc";
 import { recordComponentRender } from "../utils/perf";
+import { Select, type SelectOption } from "./Select";
 
 export type SortKey = "title" | "artist" | "album" | "addedAt" | "duration" | "recentlyPlayed";
+
+const CHUNK_SIZE = 100;
 
 const SORT_LABELS: Record<SortKey, string> = {
   title: "Title",
@@ -14,6 +18,13 @@ const SORT_LABELS: Record<SortKey, string> = {
   duration: "Duration",
   recentlyPlayed: "Recently played",
 };
+
+const SORT_OPTIONS: SelectOption<SortKey>[] = (
+  Object.entries(SORT_LABELS) as [SortKey, string][]
+).map(([value, label]) => ({
+  value,
+  label,
+}));
 
 const trackSortCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
 
@@ -107,6 +118,12 @@ export function TrackListSection({
   const [sortKey, setSortKey] = useState<SortKey>(defaultSort);
   const [localQuery, setLocalQuery] = useState("");
   const query = externalQuery !== undefined ? externalQuery : localQuery;
+  const [displayLimit, setDisplayLimit] = useState(maxRowsWithoutVirtualization);
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setDisplayLimit(maxRowsWithoutVirtualization);
+  }, [query, sortKey, maxRowsWithoutVirtualization]);
 
   const prevFilterInputsRef = useRef<{ tracks: Track[]; query: string; sortKey: SortKey; result: Track[] } | null>(null);
   const filtered = useMemo(() => {
@@ -147,6 +164,24 @@ export function TrackListSection({
     return next;
   }, [filtered]);
 
+  useEffect(() => {
+    if (displayLimit >= filtered.length) return;
+    const target = sentinelRef.current;
+    if (!target || typeof IntersectionObserver === "undefined") return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setDisplayLimit((prev) => Math.min(prev + CHUNK_SIZE, filtered.length));
+        }
+      },
+      { rootMargin: "300px" },
+    );
+
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [displayLimit, filtered.length]);
+
   if (tracks.length === 0) {
     return <>{emptyState}</>;
   }
@@ -165,21 +200,16 @@ export function TrackListSection({
             style={{ borderColor: "var(--border-subtle)" }}
           />
         )}
-        <label className="flex items-center gap-2 text-xs text-text-secondary">
-          Sort by
-          <select
+        <div className="flex items-center gap-2 text-xs text-text-secondary">
+          <span>Sort by</span>
+          <Select<SortKey>
+            size="sm"
             value={sortKey}
-            onChange={(event) => setSortKey(event.target.value as SortKey)}
-            className="rounded-lg border bg-surface px-2 py-1.5 text-xs text-text-primary outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            {Object.entries(SORT_LABELS).map(([value, label]) => (
-              <option key={value} value={value}>
-                {label}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={setSortKey}
+            options={SORT_OPTIONS}
+            ariaLabel="Sort songs by"
+          />
+        </div>
         {headerRight}
         <span className="ml-auto text-xs text-text-muted tabular-nums">
           {filtered.length} song{filtered.length === 1 ? "" : "s"}
@@ -191,20 +221,34 @@ export function TrackListSection({
           No songs match “{query}”.
         </p>
       ) : (
-        <div role="list" aria-label="Songs" className="space-y-0.5">
-          {filtered.slice(0, maxRowsWithoutVirtualization).map((track, index) => (
-            <TrackRow
-              key={track.id}
-              track={track}
-              index={index + 1}
-              contextTrackIds={contextTrackIds}
-              context={context}
-              showAlbum={showAlbum}
-              showAdded={showAdded}
-              playlistId={playlistId}
-            />
-          ))}
-        </div>
+        <TrackActionsProvider>
+          <div role="list" aria-label="Songs" className="space-y-0.5">
+            {filtered.slice(0, displayLimit).map((track, index) => (
+              <TrackRow
+                key={track.id}
+                track={track}
+                index={index + 1}
+                contextTrackIds={contextTrackIds}
+                context={context}
+                showAlbum={showAlbum}
+                showAdded={showAdded}
+                playlistId={playlistId}
+              />
+            ))}
+            {displayLimit < filtered.length && (
+              <div ref={sentinelRef} className="py-4 text-center">
+                <button
+                  type="button"
+                  onClick={() => setDisplayLimit((prev) => Math.min(prev + CHUNK_SIZE, filtered.length))}
+                  className="rounded-lg border px-4 py-2 text-xs font-medium text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-colors"
+                  style={{ borderColor: "var(--border-subtle)" }}
+                >
+                  Show more ({filtered.length - displayLimit} remaining)
+                </button>
+              </div>
+            )}
+          </div>
+        </TrackActionsProvider>
       )}
     </div>
   );

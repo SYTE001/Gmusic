@@ -1,20 +1,55 @@
-import { useRef, useState } from "react";
+import { createContext, useContext, useRef, useState, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { toast } from "../../stores/toastStore";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { AddToPlaylistDialog } from "../playlists/AddToPlaylistDialog";
 import type { MenuItemSpec } from "../../components/Menu";
-import { CloudIcon, CloudCheckIcon, HeartIcon, LinkIcon, PlayIcon, PlusIcon, QueueIcon, TrashIcon } from "../../components/Icons";
+import {
+  CloudIcon,
+  CloudCheckIcon,
+  CopyIcon,
+  HeartIcon,
+  LinkIcon,
+  LyricsIcon,
+  MusicNoteIcon,
+  PlayIcon,
+  PlusIcon,
+  QueueIcon,
+  SearchIcon,
+  TrashIcon,
+} from "../../components/Icons";
 import type { Track } from "../../types";
 import { useCloudStore } from "../../stores/cloudStore";
 import { CloudStorageError } from "../../services/cloud/r2StorageService";
+
+export interface TrackActionsContextValue {
+  buildMenuItems: (track: Track, options?: { playlistId?: string }) => MenuItemSpec[];
+}
+
+export const TrackActionsContext = createContext<TrackActionsContextValue | null>(null);
+
+export function useTrackActionsContext(): TrackActionsContextValue | null {
+  return useContext(TrackActionsContext);
+}
+
+export function TrackActionsProvider({ children }: { children: ReactNode }) {
+  const { buildMenuItems, dialogs } = useTrackActions();
+  return (
+    <TrackActionsContext.Provider value={{ buildMenuItems }}>
+      {children}
+      {dialogs}
+    </TrackActionsContext.Provider>
+  );
+}
 
 /**
  * Shared track action menu: play next, queue, like, playlist, relink, and
  * remove-from-library (with explicit confirmation — never deletes the file).
  */
 export function useTrackActions() {
+  const navigate = useNavigate();
   const [pendingRemoval, setPendingRemoval] = useState<Track | null>(null);
   const [addToPlaylistFor, setAddToPlaylistFor] = useState<string[] | null>(null);
   const [relinkFor, setRelinkFor] = useState<Track | null>(null);
@@ -89,6 +124,7 @@ export function useTrackActions() {
         icon: <HeartIcon size={16} filled={track.isLiked} />,
         onSelect: () => {
           void useLibraryStore.getState().toggleLike(track.id);
+          toast("success", track.isLiked ? "Removed from Liked Songs." : "Added to Liked Songs.");
         },
       },
       {
@@ -100,18 +136,72 @@ export function useTrackActions() {
     );
     if (options?.playlistId) {
       const playlistId = options.playlistId;
-      items.push(
-        { kind: "separator" },
-        {
-          kind: "action",
-          label: "Remove from this playlist",
-          icon: <TrashIcon size={16} />,
-          onSelect: () => {
-            void useLibraryStore.getState().removeFromPlaylist(playlistId, track.id);
-          },
+      items.push({
+        kind: "action",
+        label: "Remove from this playlist",
+        icon: <TrashIcon size={16} />,
+        onSelect: () => {
+          void useLibraryStore.getState().removeFromPlaylist(playlistId, track.id);
+          toast("success", "Removed from playlist.");
         },
-      );
+      });
     }
+
+    // Direct navigation and utility shortcuts
+    items.push(
+      { kind: "separator" },
+      {
+        kind: "action",
+        label: "View lyrics",
+        icon: <LyricsIcon size={16} />,
+        onSelect: () => {
+          const currentId = usePlaybackStore.getState().currentTrackId;
+          if (currentId !== track.id) {
+            usePlaybackStore.getState().startTrack(track.id, { autoplay: true });
+          }
+          navigate("/now-playing?lyrics=1");
+        },
+      },
+    );
+
+    if (track.artist) {
+      items.push({
+        kind: "action",
+        label: `Go to artist (${track.artist})`,
+        icon: <SearchIcon size={16} />,
+        onSelect: () => {
+          navigate(`/library?q=${encodeURIComponent(track.artist)}`);
+        },
+      });
+    }
+
+    if (track.album) {
+      items.push({
+        kind: "action",
+        label: `Go to album (${track.album})`,
+        icon: <MusicNoteIcon size={16} />,
+        onSelect: () => {
+          navigate(`/library?q=${encodeURIComponent(track.album)}`);
+        },
+      });
+    }
+
+    items.push({
+      kind: "action",
+      label: "Copy song info",
+      icon: <CopyIcon size={16} />,
+      onSelect: () => {
+        const text = track.artist ? `${track.artist} - ${track.title}` : track.title;
+        if (navigator.clipboard?.writeText) {
+          navigator.clipboard.writeText(text).then(
+            () => toast("success", `Copied "${text}"`),
+            () => toast("error", "Could not copy to clipboard."),
+          );
+        } else {
+          toast("info", text);
+        }
+      },
+    });
     const cloud = useCloudStore.getState();
     if (cloud.status === "authenticated" || track.objectKey) {
       if (track.cloudStatus === "ready" && track.objectKey) {

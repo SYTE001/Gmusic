@@ -8,6 +8,7 @@ import { Menu } from "../../components/Menu";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { Modal } from "../../components/Modal";
 import { TrackRow } from "../../components/TrackRow";
+import { TrackActionsProvider } from "../library/useTrackActions";
 import { StickyPageHeader } from "../../components/StickyPageHeader";
 import { AddSongsToPlaylistDialog } from "./AddToPlaylistDialog";
 import {
@@ -102,9 +103,9 @@ export function PlaylistDetailPage() {
             </button>
             <button
               type="button"
-              className="icon-btn size-11 rounded-full border"
+              className="inline-flex size-10 items-center justify-center rounded-[14px] border bg-surface/40 text-text-secondary transition-all hover:border-[var(--border-strong)] hover:bg-surface-hover hover:text-text-primary active:scale-95 disabled:opacity-40"
+              style={{ borderColor: "color-mix(in srgb, var(--border-strong) 45%, transparent)" }}
               title="Shuffle play playlist"
-              style={{ borderColor: "var(--border-strong)" }}
               aria-label="Shuffle play playlist"
               onClick={() => playAll(true)}
               disabled={available.length === 0}
@@ -113,9 +114,9 @@ export function PlaylistDetailPage() {
             </button>
             <button
               type="button"
-              className="icon-btn size-11 rounded-full border"
+              className="inline-flex size-10 items-center justify-center rounded-[14px] border bg-surface/40 text-text-secondary transition-all hover:border-[var(--border-strong)] hover:bg-surface-hover hover:text-text-primary active:scale-95"
+              style={{ borderColor: "color-mix(in srgb, var(--border-strong) 45%, transparent)" }}
               title="Add songs to this playlist"
-              style={{ borderColor: "var(--border-strong)" }}
               aria-label="Add songs to this playlist"
               onClick={() => setAddToPlaylistOpen(true)}
             >
@@ -174,59 +175,61 @@ export function PlaylistDetailPage() {
           }
         />
       ) : (
-        <div role="list" aria-label={`Songs in ${playlist.name}`} className="space-y-0.5">
-          {resolved.map((track, index) =>
-            track ? (
-              <PlaylistTrackRow
-                key={`${track.id}-${index}`}
-                track={track}
-                playlistId={playlist.id}
-                contextTrackIds={available.map((item) => item.id)}
-                canMoveUp={index > 0}
-                canMoveDown={index < resolved.length - 1}
-                onMoveUp={() => void reorderPlaylist(playlist.id, index, index - 1)}
-                onMoveDown={() => void reorderPlaylist(playlist.id, index, index + 1)}
-                onDragStart={() => setDragFrom(index)}
-                onDragOverItem={(event) => {
-                  event.preventDefault();
-                  setDragOver(index);
-                }}
-                onDropItem={() => {
-                  if (dragFrom !== null && dragFrom !== index) void reorderPlaylist(playlist.id, dragFrom, index);
-                  setDragFrom(null);
-                  setDragOver(null);
-                }}
-                onDragEnd={() => {
-                  setDragFrom(null);
-                  setDragOver(null);
-                }}
-                isDragOver={dragOver === index && dragFrom !== null && dragFrom !== index}
-              />
-            ) : (
-              <div
-                role="listitem"
-                key={`missing-${index}`}
-                className="flex h-14 items-center gap-3 rounded-lg px-3 text-sm text-text-muted"
-                style={{ background: "color-mix(in srgb, var(--danger) 6%, transparent)" }}
-              >
-                <span className="grid size-10 shrink-0 place-items-center rounded-md bg-surface-raised" aria-hidden>
-                  <PlaylistIcon size={16} />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate">A track in this playlist is no longer in your library</span>
-                  <span className="block text-xs">It was removed from the library. Remove it here to clean up the playlist.</span>
-                </span>
-                <button
-                  type="button"
-                  className="text-xs text-danger underline underline-offset-2"
-                  onClick={() => void useLibraryStore.getState().removeFromPlaylist(playlist.id, playlist.trackIds[index])}
+        <TrackActionsProvider>
+          <div role="list" aria-label={`Songs in ${playlist.name}`} className="space-y-0.5">
+            {resolved.map((track, index) =>
+              track ? (
+                <PlaylistTrackRow
+                  key={`${track.id}-${index}`}
+                  track={track}
+                  playlistId={playlist.id}
+                  contextTrackIds={available.map((item) => item.id)}
+                  canMoveUp={index > 0}
+                  canMoveDown={index < resolved.length - 1}
+                  onMoveUp={() => void reorderPlaylist(playlist.id, index, index - 1)}
+                  onMoveDown={() => void reorderPlaylist(playlist.id, index, index + 1)}
+                  onDragStart={() => setDragFrom(index)}
+                  onDragOverItem={(event) => {
+                    event.preventDefault();
+                    setDragOver(index);
+                  }}
+                  onDropItem={() => {
+                    if (dragFrom !== null && dragFrom !== index) void reorderPlaylist(playlist.id, dragFrom, index);
+                    setDragFrom(null);
+                    setDragOver(null);
+                  }}
+                  onDragEnd={() => {
+                    setDragFrom(null);
+                    setDragOver(null);
+                  }}
+                  isDragOver={dragOver === index && dragFrom !== null && dragFrom !== index}
+                />
+              ) : (
+                <div
+                  role="listitem"
+                  key={`missing-${index}`}
+                  className="flex h-14 items-center gap-3 rounded-lg px-3 text-sm text-text-muted"
+                  style={{ background: "color-mix(in srgb, var(--danger) 6%, transparent)" }}
                 >
-                  Remove
-                </button>
-              </div>
-            ),
-          )}
-        </div>
+                  <span className="grid size-10 shrink-0 place-items-center rounded-md bg-surface-raised" aria-hidden>
+                    <PlaylistIcon size={16} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">A track in this playlist is no longer in your library</span>
+                    <span className="block text-xs">It was removed from the library. Remove it here to clean up the playlist.</span>
+                  </span>
+                  <button
+                    type="button"
+                    className="text-xs text-danger underline underline-offset-2"
+                    onClick={() => void useLibraryStore.getState().removeFromPlaylist(playlist.id, playlist.trackIds[index])}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ),
+            )}
+          </div>
+        </TrackActionsProvider>
       )}
 
       {/* Rename modal */}
@@ -341,17 +344,27 @@ function PlaylistTrackRow({
           showAdded={false}
         />
       </div>
-      <div className="flex items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-        {canMoveUp && (
-          <button type="button" className="icon-btn size-7" aria-label={`Move ${track.title} up`} onClick={onMoveUp}>
-            <ChevronUpIcon size={14} />
-          </button>
-        )}
-        {canMoveDown && (
-          <button type="button" className="icon-btn size-7" aria-label={`Move ${track.title} down`} onClick={onMoveDown}>
-            <ChevronDownIcon size={14} />
-          </button>
-        )}
+      <div className="flex w-14 shrink-0 items-center justify-end opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+        <button
+          type="button"
+          className={`icon-btn size-7 ${canMoveUp ? "" : "invisible pointer-events-none"}`}
+          aria-label={`Move ${track.title} up`}
+          onClick={onMoveUp}
+          tabIndex={canMoveUp ? 0 : -1}
+          disabled={!canMoveUp}
+        >
+          <ChevronUpIcon size={14} />
+        </button>
+        <button
+          type="button"
+          className={`icon-btn size-7 ${canMoveDown ? "" : "invisible pointer-events-none"}`}
+          aria-label={`Move ${track.title} down`}
+          onClick={onMoveDown}
+          tabIndex={canMoveDown ? 0 : -1}
+          disabled={!canMoveDown}
+        >
+          <ChevronDownIcon size={14} />
+        </button>
       </div>
     </div>
   );

@@ -110,13 +110,14 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
 
       {showResults && (
         <div
-          className="surface-card absolute inset-x-0 top-[calc(100%+6px)] z-40 overflow-hidden py-1.5 shadow-[var(--shadow-overlay)] animate-fade-in"
+          className="surface-card absolute inset-x-0 top-[calc(100%+6px)] z-40 overflow-hidden p-1.5 shadow-[var(--shadow-overlay)] animate-fade-in"
           role="listbox"
           aria-label="Search results"
+          style={{ background: "var(--surface)", borderColor: "var(--border-subtle)" }}
         >
-          {!hasAnyResults && <p className="px-4 py-3 text-sm text-text-muted">No matches in your library for “{query}”.</p>}
+          {!hasAnyResults && <p className="px-3 py-2 text-sm text-text-muted">No matches in your library for “{query}”.</p>}
           {results.playlists.length > 0 && (
-            <div className="px-4 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Playlists</div>
+            <div className="px-3 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Playlists</div>
           )}
           {results.playlists.map((playlist) => (
             <button
@@ -124,7 +125,7 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
               type="button"
               role="option"
               aria-selected={false}
-              className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm text-text-primary hover:bg-surface-hover"
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-text-primary transition-colors hover:bg-surface-hover"
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => {
                 navigate(`/playlist/${playlist.id}`);
@@ -137,7 +138,7 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
             </button>
           ))}
           {results.tracks.length > 0 && (
-            <div className="px-4 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Songs</div>
+            <div className="px-3 pb-1 pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-text-muted">Songs</div>
           )}
           {results.tracks.map((track) => (
             <button
@@ -145,7 +146,7 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
               type="button"
               role="option"
               aria-selected={false}
-              className="flex w-full items-center gap-3 px-4 py-2 text-left hover:bg-surface-hover"
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors hover:bg-surface-hover"
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => {
                 playTrack(track);
@@ -162,7 +163,7 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
           {results.tracks.length > 0 && (
             <button
               type="button"
-              className="flex w-full items-center gap-2 border-t px-4 py-2.5 text-left text-xs text-accent hover:bg-surface-hover"
+              className="mt-1 flex w-full items-center gap-2 rounded-lg border-t px-3 py-2 text-left text-xs text-accent transition-colors hover:bg-surface-hover"
               style={{ borderColor: "var(--border-subtle)" }}
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => {

@@ -22,7 +22,31 @@ export async function parseFlacTags(file: File): Promise<ParsedTags> {
     const blockLength = (blockHeader[1] << 16) | (blockHeader[2] << 8) | blockHeader[3];
     const dataStart = offset + 4;
 
-    if (blockType === 4 && blockLength < 4 * 1024 * 1024) {
+    if (blockType === 0 && blockLength >= 34) {
+      const data = new Uint8Array(await file.slice(dataStart, dataStart + 34).arrayBuffer());
+      if (data.length >= 34) {
+        const b10 = data[10];
+        const b11 = data[11];
+        const b12 = data[12];
+        const b13 = data[13];
+        const b14 = data[14];
+        const b15 = data[15];
+        const b16 = data[16];
+        const b17 = data[17];
+
+        const sampleRate = (b10 << 12) | (b11 << 4) | (b12 >> 4);
+        const high4 = b13 & 0x0f;
+        const low32 = ((b14 << 24) >>> 0) + (b15 << 16) + (b16 << 8) + b17;
+        const totalSamples = high4 * 0x100000000 + low32;
+
+        if (sampleRate > 0 && totalSamples > 0) {
+          const durationMs = Math.round((totalSamples / sampleRate) * 1000);
+          if (Number.isFinite(durationMs) && durationMs > 0) {
+            tags.durationMs = durationMs;
+          }
+        }
+      }
+    } else if (blockType === 4 && blockLength < 4 * 1024 * 1024) {
       const data = new Uint8Array(await file.slice(dataStart, dataStart + blockLength).arrayBuffer());
       const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
       let pos = 0;

@@ -33,3 +33,6 @@ worker/.dev.vars
 .idea
 .vscode
 *.tsbuildinfo
+
+# Local agent artifacts
+graphify-out/

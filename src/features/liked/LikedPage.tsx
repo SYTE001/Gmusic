@@ -54,9 +54,9 @@ export function LikedPage() {
               </button>
               <button
                 type="button"
-                className="icon-btn size-11 rounded-full border"
+                className="inline-flex size-10 items-center justify-center rounded-[14px] border bg-surface/40 text-text-secondary transition-all hover:border-[var(--border-strong)] hover:bg-surface-hover hover:text-text-primary active:scale-95"
+                style={{ borderColor: "color-mix(in srgb, var(--border-strong) 45%, transparent)" }}
                 title="Shuffle play liked songs"
-                style={{ borderColor: "var(--border-strong)" }}
                 aria-label="Shuffle play liked songs"
                 onClick={() => playAll(true)}
               >

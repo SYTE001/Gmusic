@@ -59,13 +59,13 @@ export function normalizeForSearch(input: string): string {
 
 /** "01 - Song Name.mp3" -> { title: "Song Name", artist: "" } style fallbacks. */
 export function deriveTitleFromFileName(fileName: string): { title: string; trackNumber: number | null } {
-  const withoutExt = fileName.replace(/\.[^./\\]+$/, "");
+  const withoutExt = fileName.replace(/\.[^./\\]+$/, "").trim();
   const numbered = withoutExt.match(/^\s*(\d{1,3})\s*[-._)]\s*(.+)$/);
   if (numbered) {
     const n = Number.parseInt(numbered[1], 10);
     return { title: numbered[2].trim(), trackNumber: Number.isFinite(n) ? n : null };
   }
-  return { title: withoutExt.trim() || fileName, trackNumber: null };
+  return { title: withoutExt, trackNumber: null };
 }
 
 /** "Artist - Title" split used when tags are missing. */

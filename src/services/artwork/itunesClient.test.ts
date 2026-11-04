@@ -88,6 +88,20 @@ describe("itunesClient", () => {
       expect(ranked.length).toBe(0);
     });
 
+    it("Scenario 9: rejects mismatched artwork from unrelated song or low similarity", () => {
+      const results: ItunesTrackResult[] = [
+        {
+          trackId: 777,
+          trackName: "Smooth Operator",
+          artistName: "Completely Unrelated Band",
+          artworkUrl100: "https://is1-ssl.mzstatic.com/image/thumb/7/100x100bb.jpg",
+        },
+      ];
+
+      const ranked = validateAndRankItunesResults({ title: "Smooth Operator", artist: "Sade" }, results);
+      expect(ranked.length).toBe(0);
+    });
+
     it("accepts title matches when local track has no artist", () => {
       const bareTrack = { title: "Bohemian Rhapsody" };
       const results: ItunesTrackResult[] = [

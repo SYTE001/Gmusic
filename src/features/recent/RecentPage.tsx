@@ -4,18 +4,27 @@ import { EmptyState } from "../../components/EmptyState";
 import { ClockIcon } from "../../components/Icons";
 import { formatDate, formatDurationLong } from "../../utils/misc";
 import { TrackRow } from "../../components/TrackRow";
-import { useTrackActions } from "../library/useTrackActions";
+import { TrackActionsProvider } from "../library/useTrackActions";
+import type { Track } from "../../types";
 
 /** Recently Played (PRD §7.6 lastPlayedAt tracking), ordered by real history. */
 export function RecentPage() {
   const tracks = useLibraryStore((state) => state.tracks);
+  const trackStats = useLibraryStore((state) => state.trackStats);
   const [limit, setLimit] = useState(50);
-  const { dialogs } = useTrackActions();
 
-  const recent = useMemo(
-    () => tracks.filter((track) => track.lastPlayedAt !== null).sort((a, b) => (b.lastPlayedAt ?? 0) - (a.lastPlayedAt ?? 0)),
-    [tracks],
-  );
+  const recent = useMemo(() => {
+    const list: Track[] = [];
+    for (const track of tracks) {
+      const stats = trackStats[track.id];
+      const lastPlayedAt = stats ? stats.lastPlayedAt : track.lastPlayedAt;
+      const playCount = stats ? stats.playCount : track.playCount;
+      if (lastPlayedAt !== null) {
+        list.push(stats ? { ...track, lastPlayedAt, playCount } : track);
+      }
+    }
+    return list.sort((a, b) => (b.lastPlayedAt ?? 0) - (a.lastPlayedAt ?? 0));
+  }, [tracks, trackStats]);
   const visible = recent.slice(0, limit);
   const contextTrackIds = useMemo(() => recent.map((track) => track.id), [recent]);
 
@@ -37,7 +46,7 @@ export function RecentPage() {
           description="Songs you play will show up here with when you last played them. This history stays on this device."
         />
       ) : (
-        <>
+        <TrackActionsProvider>
           <div role="list" aria-label="Recently played songs" className="space-y-0.5">
             {visible.map((track, index) => (
               <div key={track.id} role="presentation" className="flex items-center gap-3">
@@ -67,9 +76,8 @@ export function RecentPage() {
               Show more ({recent.length - visible.length} remaining)
             </button>
           )}
-        </>
+        </TrackActionsProvider>
       )}
-      {dialogs}
     </div>
   );
 }

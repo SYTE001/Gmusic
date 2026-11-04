@@ -18,8 +18,37 @@ import { humanBytes } from "../../utils/misc";
 import { APP_VERSION } from "../../types";
 import { ImportIcon, InfoIcon, OfflineIcon } from "../../components/Icons";
 import { SegmentedControl } from "../../components/SegmentedControl";
+import { Select, type SelectOption } from "../../components/Select";
 import { CloudAccountSection } from "./CloudAccountSection";
 import { CloudMigrationSection } from "./CloudMigrationSection";
+
+const REDUCED_MOTION_OPTIONS: SelectOption[] = [
+  { value: "system", label: "Follow system" },
+  { value: "on", label: "Always reduce" },
+  { value: "off", label: "Never reduce" },
+];
+
+const REPEAT_MODE_OPTIONS: SelectOption[] = [
+  { value: "off", label: "Off" },
+  { value: "all", label: "Repeat all" },
+  { value: "one", label: "Repeat one" },
+];
+
+const LYRIC_STYLE_OPTIONS: SelectOption[] = [
+  { value: "line", label: "Line" },
+  { value: "word", label: "Word by word" },
+];
+
+const LYRIC_FONT_SIZE_OPTIONS: SelectOption[] = [
+  { value: "sm", label: "Small" },
+  { value: "md", label: "Medium" },
+  { value: "lg", label: "Large" },
+];
+
+const LYRIC_ALIGNMENT_OPTIONS: SelectOption[] = [
+  { value: "center", label: "Centered" },
+  { value: "left", label: "Left" },
+];
 
 type RestoreState =
   | { phase: "idle" }
@@ -133,16 +162,14 @@ export function SettingsPage() {
           <Toggle checked={prefs.artworkTint} onChange={(value) => update({ artworkTint: value })} label="Artwork tint" />
         </Row>
         <Row label="Reduced motion" hint="Follows your system setting by default.">
-          <select
+          <Select
+            size="sm"
+            align="right"
             value={prefs.reducedMotion}
-            onChange={(event) => update({ reducedMotion: event.target.value as typeof prefs.reducedMotion })}
-            className="rounded-lg border bg-surface px-2.5 py-1.5 text-sm outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            <option value="system">Follow system</option>
-            <option value="on">Always reduce</option>
-            <option value="off">Never reduce</option>
-          </select>
+            onChange={(val) => update({ reducedMotion: val as typeof prefs.reducedMotion })}
+            options={REDUCED_MOTION_OPTIONS}
+            ariaLabel="Reduced motion"
+          />
         </Row>
       </Section>
 
@@ -151,16 +178,14 @@ export function SettingsPage() {
           <Toggle checked={prefs.shuffle} onChange={(value) => update({ shuffle: value })} label="Shuffle" />
         </Row>
         <Row label="Repeat">
-          <select
+          <Select
+            size="sm"
+            align="right"
             value={prefs.repeatMode}
-            onChange={(event) => update({ repeatMode: event.target.value as typeof prefs.repeatMode })}
-            className="rounded-lg border bg-surface px-2.5 py-1.5 text-sm outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            <option value="off">Off</option>
-            <option value="all">Repeat all</option>
-            <option value="one">Repeat one</option>
-          </select>
+            onChange={(val) => update({ repeatMode: val as typeof prefs.repeatMode })}
+            options={REPEAT_MODE_OPTIONS}
+            ariaLabel="Repeat mode"
+          />
         </Row>
         <Row label="Volume" hint={`${Math.round(prefs.volume * 100)}% — also adjustable in the player.`}>
           <input
@@ -181,38 +206,34 @@ export function SettingsPage() {
           label="Lyric style"
           hint="Word by word highlights each word when the song has word timing, otherwise falls back to line by line."
         >
-          <select
+          <Select
+            size="sm"
+            align="right"
             value={prefs.lyricsStyle}
-            onChange={(event) => update({ lyricsStyle: event.target.value as typeof prefs.lyricsStyle })}
-            className="rounded-lg border bg-surface px-2.5 py-1.5 text-sm outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            <option value="line">Line</option>
-            <option value="word">Word by word</option>
-          </select>
+            onChange={(val) => update({ lyricsStyle: val as typeof prefs.lyricsStyle })}
+            options={LYRIC_STYLE_OPTIONS}
+            ariaLabel="Lyric style"
+          />
         </Row>
         <Row label="Font size">
-          <select
+          <Select
+            size="sm"
+            align="right"
             value={prefs.lyricFontSize}
-            onChange={(event) => update({ lyricFontSize: event.target.value as typeof prefs.lyricFontSize })}
-            className="rounded-lg border bg-surface px-2.5 py-1.5 text-sm outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            <option value="sm">Small</option>
-            <option value="md">Medium</option>
-            <option value="lg">Large</option>
-          </select>
+            onChange={(val) => update({ lyricFontSize: val as typeof prefs.lyricFontSize })}
+            options={LYRIC_FONT_SIZE_OPTIONS}
+            ariaLabel="Font size"
+          />
         </Row>
         <Row label="Alignment">
-          <select
+          <Select
+            size="sm"
+            align="right"
             value={prefs.lyricAlignment}
-            onChange={(event) => update({ lyricAlignment: event.target.value as typeof prefs.lyricAlignment })}
-            className="rounded-lg border bg-surface px-2.5 py-1.5 text-sm outline-none focus:border-accent"
-            style={{ borderColor: "var(--border-subtle)" }}
-          >
-            <option value="center">Centered</option>
-            <option value="left">Left</option>
-          </select>
+            onChange={(val) => update({ lyricAlignment: val as typeof prefs.lyricAlignment })}
+            options={LYRIC_ALIGNMENT_OPTIONS}
+            ariaLabel="Lyric alignment"
+          />
         </Row>
         <Row label="Line spacing">
           <input
@@ -486,13 +507,21 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (val
       aria-checked={checked}
       aria-label={label}
       title={label}
-      className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors ${checked ? "bg-accent-strong" : "bg-surface-hover"}`}
+      className={`flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 border transition-colors ${
+        checked
+          ? "border-[var(--accent-strong)] bg-accent-strong"
+          : "border-[var(--border-subtle)] bg-surface-hover"
+      }`}
       onClick={() => onChange(!checked)}
     >
       {/* In-flow flex knob: pinned 2px from the edges in both states, so the
           position can never drift with the host's static-position layout. */}
       <span
-        className={`size-5 rounded-full bg-text-primary shadow-sm transition-transform ${checked ? "translate-x-5" : "translate-x-0"}`}
+        className={`size-5 rounded-full shadow-sm transition-transform ${
+          checked
+            ? "translate-x-5 bg-accent-contrast"
+            : "translate-x-0 bg-text-secondary"
+        }`}
       />
     </button>
   );

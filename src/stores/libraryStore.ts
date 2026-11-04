@@ -9,7 +9,7 @@ import {
   revalidateAccess,
   relinkTrackWithFile,
 } from "../services/file-access/FileAccessService";
-import { loadArtworkUrl, setCachedArtworkForTrack } from "../components/Artwork";
+import { loadArtworkUrl, setCachedArtworkForTrack } from "../services/artwork/artworkCache";
 import { resolveArtworkForAlbumBatch } from "../services/artwork/artworkService";
 import { importAudioItems, type ImportItem, type ImportProgress } from "../services/library/importService";
 import {
@@ -17,20 +17,29 @@ import {
   loadPlaybackSession,
   savePlaybackSession,
 } from "../services/library/playbackSession";
-import { createId, debounce } from "../utils/misc";
+import { createId, debounce, deriveArtistTitleFromFileName } from "../utils/misc";
+import { isCorruptedOrSuspiciousMetadata } from "../services/metadata/types";
 import { bindPlaybackHelpers, usePlaybackStore } from "./playbackStore";
 import { useSettingsStore } from "./settingsStore";
 import { toast } from "./toastStore";
 import { bindLyricsTrackLookup, useLyricsStore } from "./lyricsStore";
-import { useCloudStore, removeTrackFromCloud } from "./cloudStore";
-import { invalidatePlayUrl } from "../services/cloud/r2StorageService";
+import { currentAuthState } from "../services/cloud/cloudAuthService";
+import { removeTrackFromCloud } from "../services/cloud/cloudDeletionService";
+import { getPlayUrl, invalidatePlayUrl } from "../services/cloud/r2StorageService";
+import { releaseActiveTrackSource } from "../services/file-access/FileAccessService";
 import { perfMark, perfMeasure } from "../utils/perf";
 
 export type LibraryStatus = "loading" | "ready" | "error";
 
+export type TrackPlaybackStats = {
+  lastPlayedAt: number | null;
+  playCount: number;
+};
+
 type LibraryState = {
   tracks: Track[];
   playlists: Playlist[];
+  trackStats: Record<string, TrackPlaybackStats>;
   status: LibraryStatus;
   loadError: string | null;
   importProgress: ImportProgress | null;
@@ -103,20 +112,43 @@ export function flushPlaybackSessionNow(): void {
   persistSessionNow();
 }
 
+let cloudSyncCallback: (() => Promise<void>) | null = null;
+export function registerCloudSyncCallback(cb: () => Promise<void>): () => void {
+  cloudSyncCallback = cb;
+  return () => {
+    if (cloudSyncCallback === cb) cloudSyncCallback = null;
+  };
+}
+
 /**
  * Pushes library changes to the cloud after local writes have already
  * succeeded. Cloud failures never roll the local change back; they surface
  * as a toast and the next sync reconciles. Idempotent by construction.
  */
-const scheduleCloudPush = debounce(() => {
-  const cloud = useCloudStore.getState();
-  if (cloud.status !== "authenticated") return;
-  void cloud.syncNow().catch(() => undefined);
+const scheduleCloudPush = debounce(async () => {
+  if (!cloudSyncCallback) return;
+  const auth = await currentAuthState();
+  if (auth.status === "authenticated") {
+    void cloudSyncCallback().catch(() => undefined);
+  }
 }, 1500);
+
+let statsWriteQueue: Promise<void> = Promise.resolve();
+
+function enqueueStatsWrite(trackId: string, lastPlayedAt: number, playCount: number): void {
+  statsWriteQueue = statsWriteQueue
+    .then(async () => {
+      await repository.updateTrack(trackId, { lastPlayedAt, playCount });
+    })
+    .catch((error) => {
+      console.warn("Failed to persist track playback statistics", error);
+    });
+}
 
 export const useLibraryStore = create<LibraryState>((set, get) => ({
   tracks: [],
   playlists: [],
+  trackStats: {},
   status: "loading",
   loadError: null,
   importProgress: null,
@@ -181,18 +213,65 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     try {
       const [tracks, playlists] = await Promise.all([repository.listTracks(), repository.listPlaylists()]);
 
-      // Re-check file availability after a reload.
-      const availabilityUpdates = await revalidateAccess(tracks);
-      const effectiveTracks =
-        availabilityUpdates.size > 0
-          ? tracks.map((track) => (availabilityUpdates.has(track.id) ? { ...track, availability: availabilityUpdates.get(track.id)! } : track))
-          : tracks;
-      const changed = [...availabilityUpdates.entries()].map(([id, availability]) => ({ id, availability }));
-      if (changed.length > 0) {
-        await Promise.all(changed.map(({ id, availability }) => repository.updateTrack(id, { availability })));
+      // Healing migration: safely clean any corrupted cached metadata (mojibake from prior buggy parser)
+      const corruptedUpdates: Array<{ id: string; patch: Partial<Track> }> = [];
+      const sanitizedTracks = tracks.map((track) => {
+        const titleCorrupted = isCorruptedOrSuspiciousMetadata(track.title);
+        const artistCorrupted = isCorruptedOrSuspiciousMetadata(track.artist);
+        const albumCorrupted = isCorruptedOrSuspiciousMetadata(track.album);
+
+        if (!titleCorrupted && !artistCorrupted && !albumCorrupted) {
+          return track;
+        }
+
+        const fallback = deriveArtistTitleFromFileName(track.fileName);
+        const newTitle = titleCorrupted ? (fallback.title || "Unknown Track") : track.title;
+        const newArtist = artistCorrupted ? (fallback.artist || "Unknown Artist") : track.artist;
+        const newAlbum = albumCorrupted ? "" : track.album;
+        const metadataFromFilename = titleCorrupted ? true : track.metadataFromFilename;
+
+        corruptedUpdates.push({
+          id: track.id,
+          patch: {
+            title: newTitle,
+            artist: newArtist,
+            album: newAlbum,
+            metadataFromFilename,
+          },
+        });
+
+        return {
+          ...track,
+          title: newTitle,
+          artist: newArtist,
+          album: newAlbum,
+          metadataFromFilename,
+        };
+      });
+
+      if (corruptedUpdates.length > 0) {
+        await repository.updateTracksBatch(corruptedUpdates);
       }
 
-      set({ tracks: effectiveTracks, playlists, status: "ready" });
+      // Re-check file availability after a reload.
+      const availabilityUpdates = await revalidateAccess(sanitizedTracks);
+      const effectiveTracks =
+        availabilityUpdates.size > 0
+          ? sanitizedTracks.map((track) => (availabilityUpdates.has(track.id) ? { ...track, availability: availabilityUpdates.get(track.id)! } : track))
+          : sanitizedTracks;
+      const changed = [...availabilityUpdates.entries()].map(([id, availability]) => ({ id, availability }));
+      if (changed.length > 0) {
+        await repository.updateTracksBatch(changed.map(({ id, availability }) => ({ id, patch: { availability } })));
+      }
+
+      const initialStats: Record<string, TrackPlaybackStats> = {};
+      for (const track of effectiveTracks) {
+        if (track.lastPlayedAt !== null || track.playCount > 0) {
+          initialStats[track.id] = { lastPlayedAt: track.lastPlayedAt, playCount: track.playCount };
+        }
+      }
+
+      set({ tracks: effectiveTracks, trackStats: initialStats, playlists, status: "ready" });
 
       // Restore last session (paused; playback needs a user gesture).
       const session = await loadPlaybackSession();
@@ -259,22 +338,30 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     // here is reported but never blocks the user's local action, and local
     // data is already safe.
     const cloudBacked = tracks.filter((track) => track.objectKey);
-    if (cloudBacked.length > 0 && useCloudStore.getState().status === "authenticated") {
-      void Promise.allSettled(cloudBacked.map((track) => removeTrackFromCloud(track))).then((results) => {
-        const failed = results.filter((result) => result.status === "rejected").length;
-        if (failed > 0) {
-          toast(
-            "error",
-            `${failed} cloud cop${failed === 1 ? "y" : "ies"} could not be removed yet — it will be finished automatically on the next sync.`,
-          );
-        }
-        for (const track of cloudBacked) invalidatePlayUrl(track.objectKey as string);
+    if (cloudBacked.length > 0) {
+      void currentAuthState().then((auth) => {
+        if (auth.status !== "authenticated") return;
+        void Promise.allSettled(cloudBacked.map((track) => removeTrackFromCloud(track))).then((results) => {
+          const failed = results.filter((result) => result.status === "rejected").length;
+          if (failed > 0) {
+            toast(
+              "error",
+              `${failed} cloud cop${failed === 1 ? "y" : "ies"} could not be removed yet — it will be finished automatically on the next sync.`,
+            );
+          }
+          for (const track of cloudBacked) invalidatePlayUrl(track.objectKey as string);
+        });
       });
     }
 
     await repository.deleteTracks(ids);
+    const nextStats = { ...get().trackStats };
+    for (const id of ids) {
+      delete nextStats[id];
+    }
     set({
       tracks: get().tracks.filter((track) => !idSet.has(track.id)),
+      trackStats: nextStats,
       playlists: get().playlists.map((playlist) => ({
         ...playlist,
         trackIds: playlist.trackIds.filter((id) => !idSet.has(id)),
@@ -395,26 +482,30 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const track = get().tracks.find((item) => item.id === trackId);
     if (!track) return;
     const now = Date.now();
+    const currentStats = get().trackStats[trackId];
+    const currentPlayCount = currentStats ? currentStats.playCount : track.playCount;
+    const newPlayCount = currentPlayCount + 1;
+    const newStats: TrackPlaybackStats = { lastPlayedAt: now, playCount: newPlayCount };
+
+    // Update trackStats in Zustand: keeps state.tracks reference unchanged, avoiding full-library render cascades
     set({
-      tracks: get().tracks.map((item) =>
-        item.id === trackId ? { ...item, lastPlayedAt: now, playCount: item.playCount + 1 } : item,
-      ),
+      trackStats: { ...get().trackStats, [trackId]: newStats },
     });
     perfMeasure("skip:mark-played-state", "skip:mark-played:start", "skip:mark-played:state-end");
-    try {
-      await repository.updateTrack(trackId, { lastPlayedAt: now, playCount: track.playCount + 1 });
-    } catch {
-      // Non-fatal: play history is a convenience, not critical data.
-    }
+
+    // Queue IndexedDB write sequentially to preserve play count accuracy and prevent stale writes
+    enqueueStatsWrite(trackId, now, newPlayCount);
     perfMeasure("skip:db-writes", "skip:mark-played:start", "skip:mark-played:end");
   },
 
   clearLibrary: async () => {
     await repository.clearLibrary();
     await clearPlaybackSession();
-    set({ tracks: [], playlists: [], lastImportOutcome: null });
+    set({ tracks: [], playlists: [], trackStats: {}, lastImportOutcome: null });
     const playback = usePlaybackStore.getState();
     playback.getEngine().pause();
+    playback.getEngine().setSource(null);
+    releaseActiveTrackSource();
     usePlaybackStore.setState({
       currentTrackId: null,
       isPlaying: false,
@@ -458,7 +549,6 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   keepLocalCopyFromCloud: async (trackId) => {
     const track = get().tracks.find((item) => item.id === trackId);
     if (!track || !track.objectKey) return;
-    const { getPlayUrl } = await import("../services/cloud/r2StorageService");
     try {
       const url = await getPlayUrl(track.objectKey, { forceFresh: true });
       const response = await fetch(url);

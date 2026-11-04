@@ -58,6 +58,7 @@ const NOISE_PATTERNS = [
   /official\s+audio/i,
   /audio\s+only/i,
   /full\s+audio/i,
+  /\baudio\b/i,
   /lyric\s+video/i,
   /lyrics\s+video/i,
   /\blyrics?\b/i,
@@ -79,6 +80,56 @@ const QUOTES_REGEX = /^["'“”‘’`]+|["'“”‘’`]+$/g;
 
 /** In-memory cache for fast lookup */
 const normalizedMetadataCache = new Map<string, NormalizedIdentity>();
+
+/**
+ * Detects whether a string is solely a release year (e.g. "1984", "(1984)", "[2001]")
+ * so release years are never mistaken for album names.
+ */
+export function isYearOnly(value: string | undefined | null): boolean {
+  if (!value) return false;
+  const trimmed = value.trim().replace(/^[[({]/, "").replace(/[\])}]$/, "").trim();
+  return /^(?:18|19|20)\d{2}$/.test(trimmed);
+}
+
+const KNOWN_PROMOTER_CHANNELS = new Set([
+  "7clouds",
+  "syrebralvibes",
+  "trap nation",
+  "bass nation",
+  "chill nation",
+  "cloudkid",
+  "sensual musique",
+  "mrsuicidesheep",
+  "proximity",
+  "t-series",
+  "vevo",
+  "lyrical lemonade",
+  "unique vibes",
+  "cassiopeia",
+  "dan music",
+  "wavemusic",
+  "taj tracks",
+  "superblyrics",
+  "gold coast music",
+  "shadow music",
+  "chilledcow",
+  "monstercat",
+  "koala kontrol",
+  "the vibe guide",
+  "latin urban",
+  "regravar",
+]);
+
+export function isSuspectChannelOrNoise(artist: string | undefined | null): boolean {
+  if (!artist) return true;
+  const norm = normalizeForSearch(artist);
+  if (!norm) return true;
+  if (KNOWN_PROMOTER_CHANNELS.has(norm)) return true;
+  if (/^(?:lyrics?|official\s+audio|audio|topic|channel|vevo|records)$/i.test(norm)) {
+    return true;
+  }
+  return false;
+}
 
 export function extractVersionQualifiers(title: string): Set<string> {
   const qualifiers = new Set<string>();
@@ -180,8 +231,8 @@ export function cleanNoiseFromText(input: string): {
     });
   }
 
-  // Trailing or isolated "lyrics"
-  text = text.replace(/\s+\blyrics?\b$/i, (m) => {
+  // Trailing or isolated "lyrics" or "audio"
+  text = text.replace(/\s+\b(?:lyrics?|audio)\b$/i, (m) => {
     removedNoise.push(m);
     return "";
   });
@@ -247,7 +298,7 @@ export function extractArtistAndTitle(
     }
 
     // 2. Check if embedded tags match
-    if (context?.tags?.artist) {
+    if (context?.tags?.artist && !isSuspectChannelOrNoise(context.tags.artist)) {
       const tagArtist = normalizeForSearch(context.tags.artist);
       if (norm0 === tagArtist) {
         return { artist: part0Clean, title: part1Clean, confidence: 0.9, isFlipped: false };
@@ -319,10 +370,29 @@ export function normalizeTrackMetadata(
   let detectedTitle = rawTitle;
   let isFlipped = false;
 
-  // If tags are empty or title looks like a complete "Artist - Title" string:
-  if (!detectedArtist || DELIMITER_REGEX.test(detectedTitle)) {
-    const candidateSource = DELIMITER_REGEX.test(detectedTitle) ? detectedTitle : rawFileName;
-    const extracted = extractArtistAndTitle(candidateSource, {
+  const isSuspect = isSuspectChannelOrNoise(detectedArtist);
+
+  // If artist tag is missing or suspect, attempt extraction from title or filename
+  if (!detectedArtist || isSuspect) {
+    const candidateSource = DELIMITER_REGEX.test(detectedTitle)
+      ? detectedTitle
+      : DELIMITER_REGEX.test(rawFileName)
+        ? rawFileName
+        : "";
+    if (candidateSource) {
+      const extracted = extractArtistAndTitle(candidateSource, {
+        knownArtists,
+        tags: { title: rawTitle, artist: isSuspect ? undefined : rawArtist },
+      });
+      if (extracted.artist) {
+        detectedArtist = extracted.artist;
+        detectedTitle = extracted.title;
+        isFlipped = extracted.isFlipped;
+      }
+    }
+  } else if (DELIMITER_REGEX.test(detectedTitle)) {
+    // Artist tag is present and valid, but title itself contains "Artist - Title" delimiter
+    const extracted = extractArtistAndTitle(detectedTitle, {
       knownArtists,
       tags: { title: rawTitle, artist: rawArtist },
     });
@@ -337,7 +407,22 @@ export function normalizeTrackMetadata(
   const cleanTitleRes = cleanNoiseFromText(detectedTitle);
   const cleanArtistRes = cleanNoiseFromText(detectedArtist);
   const canonicalTitle = cleanTitleRes.cleaned || rawTitle;
-  const canonicalArtist = cleanArtistRes.cleaned || rawArtist;
+  let canonicalArtist = cleanArtistRes.cleaned || rawArtist;
+
+  // If canonical artist is suspect or equal to "topic", fallback to candidate extraction
+  if (isSuspectChannelOrNoise(canonicalArtist) || canonicalArtist.toLowerCase() === "topic") {
+    if (DELIMITER_REGEX.test(rawTitle)) {
+      const extracted = extractArtistAndTitle(rawTitle, { knownArtists });
+      if (extracted.artist && !isSuspectChannelOrNoise(extracted.artist)) {
+        canonicalArtist = cleanNoiseFromText(extracted.artist).cleaned;
+      }
+    } else if (DELIMITER_REGEX.test(rawFileName)) {
+      const extracted = extractArtistAndTitle(rawFileName, { knownArtists });
+      if (extracted.artist && !isSuspectChannelOrNoise(extracted.artist)) {
+        canonicalArtist = cleanNoiseFromText(extracted.artist).cleaned;
+      }
+    }
+  }
 
   // Cleaned title without any version qualifiers (for broad search query)
   const baseTitleWithoutBrackets = canonicalTitle
@@ -403,10 +488,13 @@ export function normalizeTrackMetadata(
     });
   }
 
+  const cleanedAlbum = rawAlbum ? cleanNoiseFromText(rawAlbum).cleaned : undefined;
+  const canonicalAlbum = cleanedAlbum && !isYearOnly(cleanedAlbum) ? cleanedAlbum : undefined;
+
   const result: NormalizedIdentity = {
-    title: canonicalTitle,
-    artist: canonicalArtist,
-    album: rawAlbum ? cleanNoiseFromText(rawAlbum).cleaned : undefined,
+    title: canonicalTitle.normalize("NFC"),
+    artist: canonicalArtist.normalize("NFC"),
+    album: canonicalAlbum ? canonicalAlbum.normalize("NFC") : undefined,
     durationMs: track.durationMs,
     original: {
       title: rawTitle,
@@ -415,7 +503,7 @@ export function normalizeTrackMetadata(
       fileName: rawFileName,
     },
     versionType: cleanTitleRes.preservedVersion,
-    cleanedTitle: baseTitleWithoutBrackets || canonicalTitle,
+    cleanedTitle: (baseTitleWithoutBrackets || canonicalTitle).normalize("NFC"),
     alternateQueries,
   };
 

@@ -1,9 +1,9 @@
 import { create } from "zustand";
-// libraryStore imports cloudStore statically; cloudStore needs the library
-// only inside actions, never at module-eval time, so the cycle is safe.
-import { useLibraryStore } from "./libraryStore";
+import { registerCloudSyncCallback, useLibraryStore } from "./libraryStore";
+import { removeTrackFromCloud, retryPendingCloudDeletions } from "../services/cloud/cloudDeletionService";
+export { removeTrackFromCloud, retryPendingCloudDeletions };
 import type { Playlist, Track, TrackLyrics } from "../types";
-import { repository, type PendingCloudDeletion } from "../services/indexeddb/LibraryRepository";
+import { repository } from "../services/indexeddb/LibraryRepository";
 import { toast } from "./toastStore";
 import {
   CloudAuthError,
@@ -18,14 +18,13 @@ import {
   type CloudAuthState,
 } from "../services/cloud/cloudAuthService";
 import {
-  deleteCloudTrackMetadata,
   fetchCloudLibrary,
   snapshotToLocalEntities,
   upsertCloudLyrics,
   upsertCloudPlaylists,
   upsertCloudTracks,
 } from "../services/cloud/cloudLibraryService";
-import { deleteCloudObject, resetCloudStorageState } from "../services/cloud/r2StorageService";
+import { resetCloudStorageState } from "../services/cloud/r2StorageService";
 import {
   cancelMigration as cancelMigrationRun,
   initialMigrationProgress,
@@ -364,77 +363,8 @@ export const useCloudStore = create<CloudState>((set, get) => ({
   resetAuthError: () => set({ authError: null }),
 }));
 
-/**
- * Deletes the cloud copy of a track: R2 objects first, then metadata. Both
- * halves are idempotent, so the order is chosen for failure safety:
- *
- *  - objects first: if metadata removal then fails, a track row remains that
- *    visibly points at a missing object (retryable, surfaced in the UI);
- *  - had it been metadata first, a dead R2 object with no row pointing at it
- *    would be unreachable garbage that nobody can find again.
- *
- * Either way, a failure records the work left in IndexedDB so the next sync
- * finishes it — no deletion is ever abandoned partway.
- */
-export async function removeTrackFromCloud(track: Track): Promise<void> {
-  const objectKey = track.objectKey ?? null;
-  try {
-    if (objectKey) {
-      // The Worker deletes every object under the track prefix (artwork too),
-      // and reports back exactly which keys it removed.
-      await deleteCloudObject(objectKey);
-    }
-    await deleteCloudTrackMetadata(track.id);
-  } catch (error) {
-    // Record the half-finished deletion so syncNow can finish it later, then
-    // surface the failure to the caller. Local data is untouched either way.
-    const pending: PendingCloudDeletion = {
-      trackId: track.id,
-      objectKey,
-      firstAttemptedAt: Date.now(),
-      lastError: error instanceof Error ? error.message : "The deletion could not be completed.",
-    };
-    await repository.putPendingCloudDeletion(pending).catch(() => undefined);
-    throw error;
+registerCloudSyncCallback(async () => {
+  if (useCloudStore.getState().status === "authenticated") {
+    await useCloudStore.getState().syncNow();
   }
-}
-
-/**
- * Finishes every half-completed cloud deletion recorded in IndexedDB. Each
- * entry is removed only once its objects AND metadata are both gone, so the
- * catalog can never agree to leave something behind.
- */
-export async function retryPendingCloudDeletions(): Promise<{ cleared: number; remaining: number }> {
-  const pending = await repository.listPendingCloudDeletions();
-  if (pending.length === 0) return { cleared: 0, remaining: 0 };
-
-  let cleared = 0;
-  for (const entry of pending) {
-    let failed: string | null = null;
-    if (entry.objectKey) {
-      failed = await deleteCloudObject(entry.objectKey).then(
-        () => null,
-        (error: unknown) => (error instanceof Error ? error.message : "The object could not be removed."),
-      );
-    }
-    if (failed === null) {
-      failed = await deleteCloudTrackMetadata(entry.trackId).then(
-        () => null,
-        (error: unknown) => (error instanceof Error ? error.message : "The metadata could not be removed."),
-      );
-    }
-    if (failed !== null) {
-      await repository.putPendingCloudDeletion({
-        trackId: entry.trackId,
-        objectKey: entry.objectKey,
-        firstAttemptedAt: entry.firstAttemptedAt,
-        lastError: failed,
-      });
-      continue;
-    }
-    await repository.removePendingCloudDeletion(entry.trackId);
-    cleared += 1;
-  }
-  const remaining = (await repository.listPendingCloudDeletions()).length;
-  return { cleared, remaining };
-}
+});

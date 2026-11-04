@@ -46,16 +46,31 @@ if (typeof LayoutReasonStrategyMap !== "undefined") {
 function createNoopAnimation(id: string): Animation {
   let currentTime = 0;
   let playbackRate = 1;
-  return {
+  let startTime: number | null = 0;
+  const anim = {
     id,
     play: () => {},
     pause: () => {},
     cancel: () => {},
     finish: () => {},
     reverse: () => {},
+    commitStyles: () => {},
+    persist: () => {},
     addEventListener: () => {},
     removeEventListener: () => {},
     dispatchEvent: () => false,
+    onfinish: null,
+    oncancel: null,
+    onremove: null,
+    pending: false,
+    replaceState: "active" as const,
+    timeline: null,
+    get startTime() {
+      return startTime;
+    },
+    set startTime(val: number | null) {
+      startTime = val;
+    },
     get playState() {
       return "idle" as AnimationPlayState;
     },
@@ -71,10 +86,17 @@ function createNoopAnimation(id: string): Animation {
     set playbackRate(val: number) {
       playbackRate = val;
     },
+    get finished() {
+      return Promise.resolve(anim as unknown as Animation);
+    },
+    get ready() {
+      return Promise.resolve(anim as unknown as Animation);
+    },
     effect: {
       getComputedTiming: () => ({ delay: 0, duration: 0 }),
     } as unknown as AnimationEffect,
   } as unknown as Animation;
+  return anim;
 }
 
 // Eliminate redundant per-word float and per-character emphasize/matrix3d Web Animations

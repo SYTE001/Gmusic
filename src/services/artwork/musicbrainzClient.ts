@@ -1,5 +1,5 @@
 import { workerConfigured, workerUrl } from "../cloud/cloudAuthService";
-import { cleanNoiseFromText, extractPrimaryArtist, normalizeTrackMetadata } from "../metadata/normalization";
+import { cleanNoiseFromText, extractPrimaryArtist, isYearOnly, normalizeTrackMetadata } from "../metadata/normalization";
 import { normalizeForSearch } from "../../utils/misc";
 
 /**
@@ -173,9 +173,11 @@ const PLACEHOLDER_VALUES = new Set([
 
 function isPlaceholderMetadata(value: string | undefined | null): boolean {
   if (!value) return true;
+  if (isYearOnly(value)) return true;
   const cleaned = normalizeForSearch(cleanNoiseFromText(value).cleaned);
   if (!cleaned || PLACEHOLDER_VALUES.has(cleaned)) return true;
   if (/^track\s*\d+$/i.test(cleaned) || /^audio\s*track\s*\d*$/i.test(cleaned)) return true;
+  if (isYearOnly(cleaned)) return true;
   return false;
 }
 

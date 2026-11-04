@@ -54,7 +54,10 @@ describe("Menu component", () => {
     const action = screen.getByRole("menuitem", { name: "Play next" });
     fireEvent.click(action);
 
-    expect(items[1].kind === "action" && (items[1].onSelect as any)).toHaveBeenCalledTimes(1);
+    const nextItem = items[1];
+    if (nextItem.kind === "action") {
+      expect(vi.mocked(nextItem.onSelect)).toHaveBeenCalledTimes(1);
+    }
     expect(screen.queryByRole("menu")).toBeNull();
   });
 

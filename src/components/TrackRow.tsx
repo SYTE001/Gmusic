@@ -41,8 +41,8 @@ function RowBadge({ icon, label }: { icon: ReactNode; label: string }) {
  */
 type TrackRowProps = {
   track: Track;
-  contextTrackIds: string[];
-  context: PlaybackContext;
+  contextTrackIds?: string[];
+  context?: PlaybackContext;
   showAlbum?: boolean;
   showAdded?: boolean;
   index?: number;
@@ -60,8 +60,8 @@ function areTrackRowPropsEqual(prev: TrackRowProps, next: TrackRowProps): boolea
     prev.leading !== next.leading ||
     prev.trailing !== next.trailing ||
     prev.contextTrackIds !== next.contextTrackIds ||
-    prev.context.type !== next.context.type ||
-    prev.context.label !== next.context.label
+    prev.context?.type !== next.context?.type ||
+    prev.context?.label !== next.context?.label
   ) {
     return false;
   }
@@ -110,7 +110,11 @@ export const TrackRow = memo(function TrackRow({
   const cloudReady = track.cloudStatus === "ready" && Boolean(track.objectKey);
 
   const play = () => {
-    usePlaybackStore.getState().playTrackFromContext(track.id, contextTrackIds, context);
+    usePlaybackStore.getState().playTrackFromContext(
+      track.id,
+      contextTrackIds ?? [track.id],
+      context ?? { type: "library", label: "All songs" },
+    );
   };
 
   return (

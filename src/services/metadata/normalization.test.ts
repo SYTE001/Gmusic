@@ -14,6 +14,8 @@ describe("cleanNoiseFromText", () => {
     expect(cleanNoiseFromText("Ocean Eyes [Official Music Video]").cleaned).toBe("Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes (Dance Performance Video)").cleaned).toBe("Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes (Official Audio)").cleaned).toBe("Ocean Eyes");
+    expect(cleanNoiseFromText("Ocean Eyes (Audio)").cleaned).toBe("Ocean Eyes");
+    expect(cleanNoiseFromText("Ocean Eyes [Audio]").cleaned).toBe("Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes (Visualizer)").cleaned).toBe("Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes [Visualizer]").cleaned).toBe("Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes [MV]").cleaned).toBe("Ocean Eyes");
@@ -46,6 +48,7 @@ describe("cleanNoiseFromText", () => {
     expect(cleanNoiseFromText("Billie Eilish Ocean Eyes Official Video").cleaned).toBe("Billie Eilish Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes Official Music Video").cleaned).toBe("Ocean Eyes");
     expect(cleanNoiseFromText("Ocean Eyes Lyric Video").cleaned).toBe("Ocean Eyes");
+    expect(cleanNoiseFromText("Ocean Eyes Audio").cleaned).toBe("Ocean Eyes");
   });
 
   it("strips Topic suffix from YouTube artist topics", () => {
@@ -217,5 +220,84 @@ describe("normalizeTrackMetadata", () => {
       (q) => q.trackName === "Ocean Eyes" && q.artistName === "Billie Eilish",
     );
     expect(hasCleaned).toBe(true);
+  });
+
+  it("Scenario 1: normalizes 'Sade - Smooth Operator (Lyrics)' with raw artist '7clouds'", () => {
+    const normalized = normalizeTrackMetadata(
+      makeTrack({
+        title: "Sade - Smooth Operator (Lyrics)",
+        artist: "7clouds",
+        album: "",
+        fileName: "Sade - Smooth Operator (Lyrics).mp3",
+      }),
+    );
+    expect(normalized.artist).toBe("Sade");
+    expect(normalized.title).toBe("Smooth Operator");
+  });
+
+  it("Scenario 2: normalizes 'Billie Eilish - Ocean Eyes' cleanly", () => {
+    const normalized = normalizeTrackMetadata(
+      makeTrack({
+        title: "Ocean Eyes",
+        artist: "Billie Eilish",
+      }),
+    );
+    expect(normalized.artist).toBe("Billie Eilish");
+    expect(normalized.title).toBe("Ocean Eyes");
+  });
+
+  it("Scenario 3: does not consider YouTube Topic suffix as artist name", () => {
+    const normalizedTopicSuffix = normalizeTrackMetadata(
+      makeTrack({
+        title: "Smooth Operator",
+        artist: "Sade - Topic",
+      }),
+    );
+    expect(normalizedTopicSuffix.artist).toBe("Sade");
+
+    const normalizedTopicOnly = normalizeTrackMetadata(
+      makeTrack({
+        title: "Sade - Smooth Operator",
+        artist: "Topic",
+      }),
+    );
+    expect(normalizedTopicOnly.artist).toBe("Sade");
+    expect(normalizedTopicOnly.title).toBe("Smooth Operator");
+  });
+
+  it("Scenario 4: cleans titles with Official Video, Official Music Video, and Lyrics suffixes", () => {
+    expect(cleanNoiseFromText("Smooth Operator (Lyrics)").cleaned).toBe("Smooth Operator");
+    expect(cleanNoiseFromText("Smooth Operator (Official Music Video)").cleaned).toBe("Smooth Operator");
+    expect(cleanNoiseFromText("Smooth Operator [Official Video]").cleaned).toBe("Smooth Operator");
+    expect(cleanNoiseFromText("Smooth Operator Lyric Video").cleaned).toBe("Smooth Operator");
+  });
+
+  it("Scenario 5: does not mistake release years for album names", () => {
+    const normalizedWithYear = normalizeTrackMetadata(
+      makeTrack({
+        title: "Smooth Operator",
+        artist: "Sade",
+        album: "1984",
+      }),
+    );
+    expect(normalizedWithYear.album).toBeUndefined();
+
+    const normalizedWithBracketYear = normalizeTrackMetadata(
+      makeTrack({
+        title: "Smooth Operator",
+        artist: "Sade",
+        album: "(1984)",
+      }),
+    );
+    expect(normalizedWithBracketYear.album).toBeUndefined();
+
+    const normalizedRealAlbum = normalizeTrackMetadata(
+      makeTrack({
+        title: "Smooth Operator",
+        artist: "Sade",
+        album: "Diamond Life",
+      }),
+    );
+    expect(normalizedRealAlbum.album).toBe("Diamond Life");
   });
 });

@@ -545,5 +545,35 @@ describe("importAudioItems intelligent re-import & duplicate reconciliation", ()
       });
       expect(match3?.matchLevel).toBe(3);
     });
+
+    it("rejects corrupted mojibake title from tags and safely falls back to filename title", async () => {
+      const { parseAudioTags } = await import("../metadata");
+      vi.mocked(parseAudioTags).mockResolvedValueOnce({
+        title: "ÿþThot Shit",
+        artist: "Megan Thee Stallion",
+      });
+
+      const outcome = await run([audioFile("Megan Thee Stallion - Thot Shit.mp3", "audio-content")]);
+      expect(outcome.added).toBe(1);
+      const track = outcome.newTracks![0];
+      // Title must be healed from filename, and artist preserved from tag
+      expect(track.title).toBe("Thot Shit");
+      expect(track.artist).toBe("Megan Thee Stallion");
+      expect(track.metadataFromFilename).toBe(true);
+    });
+
+    it("falls back to Unknown Track only when both tags and filename have no valid title", async () => {
+      const { parseAudioTags } = await import("../metadata");
+      vi.mocked(parseAudioTags).mockResolvedValueOnce({
+        title: "   ",
+        artist: "",
+      });
+
+      const outcome = await run([audioFile(".mp3", "audio-content-2")]);
+      expect(outcome.added).toBe(1);
+      const track = outcome.newTracks![0];
+      expect(track.title).toBe("Unknown Track");
+      expect(track.artist).toBe("Unknown Artist");
+    });
   });
 });

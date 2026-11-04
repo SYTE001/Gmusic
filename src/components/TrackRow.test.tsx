@@ -189,4 +189,26 @@ describe("TrackRow component", () => {
     const title = screen.getByText("Midnight City");
     expect(title.className).toContain("text-accent");
   });
+
+  it("handles re-render when context is omitted or undefined without crashing", () => {
+    const track = createTrack();
+    const { rerender } = render(
+      <TrackRow
+        track={track}
+        index={1}
+      />
+    );
+
+    expect(screen.getByText("Midnight City")).toBeDefined();
+
+    // Rerender with new index to trigger memo comparator with undefined context
+    rerender(
+      <TrackRow
+        track={track}
+        index={2}
+      />
+    );
+
+    expect(screen.getByText("2")).toBeDefined();
+  });
 });

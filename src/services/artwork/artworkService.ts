@@ -1,7 +1,7 @@
 import { repository } from "../indexeddb/LibraryRepository";
-import { cleanNoiseFromText, extractPrimaryArtist, normalizeTrackMetadata } from "../metadata/normalization";
+import { cleanNoiseFromText, extractPrimaryArtist, isYearOnly, normalizeTrackMetadata } from "../metadata/normalization";
 import { normalizeForSearch } from "../../utils/misc";
-import { searchItunesArtwork } from "./itunesClient";
+import { searchItunesArtworkDetails } from "./itunesClient";
 import {
   fetchReleaseCoverArt,
   fetchReleaseGroupCoverArt,
@@ -24,6 +24,9 @@ export interface ArtworkResolution {
   releaseGroupMbid?: string | null;
   releaseMbid?: string | null;
   confidence?: number;
+  album?: string;
+  artist?: string;
+  title?: string;
 }
 
 export interface UnifiedArtworkCacheEntry {
@@ -76,8 +79,9 @@ const PLACEHOLDER_ALBUMS = new Set([
 
 function hasMeaningfulAlbum(album: string | undefined | null): boolean {
   if (!album) return false;
+  if (isYearOnly(album)) return false;
   const cleaned = normalizeForSearch(cleanNoiseFromText(album).cleaned);
-  return Boolean(cleaned && !PLACEHOLDER_ALBUMS.has(cleaned));
+  return Boolean(cleaned && !PLACEHOLDER_ALBUMS.has(cleaned) && !isYearOnly(cleaned));
 }
 
 /**
@@ -233,6 +237,46 @@ export function getCachedArtworkEntry(track: {
   return undefined;
 }
 
+function pruneOldestArtworkLocalStorage(): void {
+  try {
+    const artworkKeys: Array<{ key: string; timestamp: number }> = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && (k.startsWith(UNIFIED_CACHE_PREFIX) || k.startsWith(LEGACY_CACHE_PREFIX))) {
+        try {
+          const raw = localStorage.getItem(k);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            artworkKeys.push({ key: k, timestamp: parsed.timestamp ?? 0 });
+          }
+        } catch {
+          artworkKeys.push({ key: k, timestamp: 0 });
+        }
+      }
+    }
+    artworkKeys.sort((a, b) => a.timestamp - b.timestamp);
+    const toRemove = Math.max(10, Math.floor(artworkKeys.length * 0.25));
+    for (let i = 0; i < toRemove && i < artworkKeys.length; i++) {
+      localStorage.removeItem(artworkKeys[i].key);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function safeSetItem(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    pruneOldestArtworkLocalStorage();
+    try {
+      localStorage.setItem(key, value);
+    } catch {
+      // Storage fully full; silently drop
+    }
+  }
+}
+
 function writeToUnifiedCache(
   keys: string[],
   entry: Omit<UnifiedArtworkCacheEntry, "key" | "timestamp">,
@@ -249,15 +293,11 @@ function writeToUnifiedCache(
     setMemoryCacheEntry(key, fullEntry);
     transientBackoffUntil.delete(key);
 
-    try {
-      localStorage.setItem(`${UNIFIED_CACHE_PREFIX}${key}`, JSON.stringify(fullEntry));
-      localStorage.setItem(
-        `${LEGACY_CACHE_PREFIX}${key}`,
-        JSON.stringify({ url: fullEntry.url, timestamp }),
-      );
-    } catch {
-      // Ignore quota exceeded errors
-    }
+    safeSetItem(`${UNIFIED_CACHE_PREFIX}${key}`, JSON.stringify(fullEntry));
+    safeSetItem(
+      `${LEGACY_CACHE_PREFIX}${key}`,
+      JSON.stringify({ url: fullEntry.url, timestamp }),
+    );
   }
 }
 
@@ -269,8 +309,23 @@ export function invalidateArtworkCacheForTrack(track: {
   artist: string;
   album?: string;
 }): void {
-  const keys = [getAlbumArtworkCacheKey(track), getArtworkCacheKey(track)].filter(Boolean);
+  const norm = normalizeTrackMetadata({
+    title: track.title,
+    artist: track.artist,
+    album: track.album ?? "",
+    durationMs: null,
+    fileName: "",
+  });
+
+  const keys = new Set<string>([
+    getAlbumArtworkCacheKey(track),
+    getArtworkCacheKey(track),
+    getAlbumArtworkCacheKey({ title: norm.title, artist: norm.artist, album: norm.album }),
+    getArtworkCacheKey({ title: norm.title, artist: norm.artist }),
+  ]);
+
   for (const key of keys) {
+    if (!key) continue;
     memoryCache.delete(key);
     transientBackoffUntil.delete(key);
     try {
@@ -376,6 +431,7 @@ async function tryResolveFromReleaseGroupCandidate(
 async function discoverOnlineArtwork(
   track: ArtworkTrackInput,
   size: ArtworkThumbnailSize = "500",
+  alternateQueries?: Array<{ trackName: string; artistName: string }>,
 ): Promise<ProviderDiscoveryOutcome> {
   const query: MusicBrainzTrackQuery = {
     artist: track.artist,
@@ -406,6 +462,7 @@ async function discoverOnlineArtwork(
           releaseGroupMbid: primaryAttempt.releaseGroupMbid,
           releaseMbid: primaryAttempt.releaseMbid,
           confidence: primaryAttempt.confidence,
+          album: mbDiscovery.bestCandidate.releaseGroup.title,
         },
         transientFailure: false,
       };
@@ -425,6 +482,7 @@ async function discoverOnlineArtwork(
             releaseGroupMbid: secondaryAttempt.releaseGroupMbid,
             releaseMbid: secondaryAttempt.releaseMbid,
             confidence: secondaryAttempt.confidence,
+            album: secondary.releaseGroup.title,
           },
           transientFailure: false,
         };
@@ -451,6 +509,7 @@ async function discoverOnlineArtwork(
             releaseGroupMbid: candidateRel.releaseGroupMbid,
             releaseMbid: candidateRel.mbid,
             confidence: candidateRel.confidence,
+            album: candidateRel.release.title,
           },
           transientFailure: false,
         };
@@ -463,24 +522,52 @@ async function discoverOnlineArtwork(
 
   // Step 6: Existing iTunes Search API fallback
   try {
-    const itunesUrl = await searchItunesArtwork({
+    const itunesMatch = await searchItunesArtworkDetails({
       title: track.title,
       artist: track.artist,
       album: track.album,
       durationMs: track.durationMs,
     });
-    if (itunesUrl) {
-      const validated = sanitizeArtworkUrl(itunesUrl) ?? itunesUrl;
+    if (itunesMatch) {
+      const validated = sanitizeArtworkUrl(itunesMatch.artworkUrl) ?? itunesMatch.artworkUrl;
       return {
         resolution: {
           url: validated,
           source: "itunes",
           releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
           releaseMbid: null,
-          confidence: 70,
+          confidence: itunesMatch.score,
+          album: itunesMatch.collectionName,
+          artist: itunesMatch.artistName,
         },
         transientFailure: false,
       };
+    }
+
+    if (!itunesMatch && alternateQueries && alternateQueries.length > 0) {
+      for (const alt of alternateQueries.slice(0, 3)) {
+        const altMatch = await searchItunesArtworkDetails({
+          title: alt.trackName,
+          artist: alt.artistName,
+          album: track.album,
+          durationMs: track.durationMs,
+        });
+        if (altMatch) {
+          const validated = sanitizeArtworkUrl(altMatch.artworkUrl) ?? altMatch.artworkUrl;
+          return {
+            resolution: {
+              url: validated,
+              source: "itunes",
+              releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
+              releaseMbid: null,
+              confidence: Math.min(altMatch.score, 75),
+              album: altMatch.collectionName,
+              artist: altMatch.artistName,
+            },
+            transientFailure: false,
+          };
+        }
+      }
     }
   } catch {
     sawTransientError = true;
@@ -570,17 +657,42 @@ export async function resolveArtworkForTrack(
     fileName: "",
   });
 
+  const normalizedTrack: ArtworkTrackInput = {
+    ...track,
+    title: norm.title || track.title,
+    artist: norm.artist || track.artist,
+    album: norm.album || track.album,
+  };
+
   const promise = (async (): Promise<ArtworkResolution> => {
     try {
-      const { resolution, transientFailure } = await discoverOnlineArtwork(track, options?.size ?? "500");
-      const keysToCache = hasMeaningfulAlbum(track.album)
-        ? [albumKey, trackKey]
-        : [trackKey];
+      const { resolution, transientFailure } = await discoverOnlineArtwork(
+        normalizedTrack,
+        options?.size ?? "500",
+        norm.alternateQueries,
+      );
+      const verifiedAlbum = resolution.album || norm.album || track.album || "";
+      const verifiedArtist = resolution.artist || extractPrimaryArtist(norm.artist || track.artist);
+
+      const allKeysToCache = new Set<string>();
+      if (trackKey) allKeysToCache.add(trackKey);
+      if (albumKey) allKeysToCache.add(albumKey);
+      if (hasMeaningfulAlbum(verifiedAlbum)) {
+        allKeysToCache.add(
+          getAlbumArtworkCacheKey({
+            title: norm.title,
+            artist: verifiedArtist,
+            album: verifiedAlbum,
+          }),
+        );
+      }
+
+      const keysList = Array.from(allKeysToCache);
 
       if (resolution.url) {
-        writeToUnifiedCache(keysToCache, {
-          artist: extractPrimaryArtist(norm.artist || track.artist),
-          album: norm.album || track.album || "",
+        writeToUnifiedCache(keysList, {
+          artist: verifiedArtist,
+          album: verifiedAlbum,
           releaseGroupMbid: resolution.releaseGroupMbid ?? null,
           releaseMbid: resolution.releaseMbid ?? null,
           url: resolution.url,
@@ -591,14 +703,14 @@ export async function resolveArtworkForTrack(
       } else if (transientFailure) {
         // Transient network/rate-limit failure: apply short in-memory backoff, do NOT write 24h negative cache
         const retryAt = Date.now() + TRANSIENT_BACKOFF_MS;
-        for (const k of keysToCache) {
+        for (const k of keysList) {
           if (k) transientBackoffUntil.set(k, retryAt);
         }
       } else {
         // Confirmed negative lookup: cache for 24 hours
-        writeToUnifiedCache(keysToCache, {
-          artist: extractPrimaryArtist(norm.artist || track.artist),
-          album: norm.album || track.album || "",
+        writeToUnifiedCache(keysList, {
+          artist: verifiedArtist,
+          album: verifiedAlbum,
           releaseGroupMbid: resolution.releaseGroupMbid ?? null,
           releaseMbid: null,
           url: null,
@@ -686,10 +798,12 @@ export async function resolveArtworkForAlbumBatch(
           durationMs: representative.durationMs ?? null,
           fileName: "",
         });
+        const verifiedAlbum = resolution.album || norm.album || representative.album || "";
+        const verifiedArtist = resolution.artist || extractPrimaryArtist(norm.artist || representative.artist);
         const siblingTrackKeys = groupTracks.map((t) => getArtworkCacheKey(t)).filter(Boolean);
         writeToUnifiedCache(siblingTrackKeys, {
-          artist: extractPrimaryArtist(norm.artist || representative.artist),
-          album: norm.album || representative.album || "",
+          artist: verifiedArtist,
+          album: verifiedAlbum,
           releaseGroupMbid: resolution.releaseGroupMbid ?? null,
           releaseMbid: resolution.releaseMbid ?? null,
           url: resolution.url,

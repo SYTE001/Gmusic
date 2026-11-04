@@ -1,6 +1,6 @@
 import { fileExtension } from "../../utils/misc";
 import type { ParsedTags } from "./types";
-import { parseID3v2 } from "./id3";
+import { parseID3v1, parseID3v2 } from "./id3";
 import { parseMp4Tags } from "./mp4";
 import { parseFlacTags } from "./flac";
 import { parseOggTags } from "./ogg";
@@ -25,12 +25,33 @@ export async function parseAudioTags(file: File): Promise<ParsedTags> {
     }
 
     const head = new Uint8Array(await file.slice(0, 10).arrayBuffer());
+    let tags: ParsedTags = {};
     if (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33) {
       // ID3v2: syncsafe tag size lets us read exactly the tag.
       const tagSize = ((head[6] & 0x7f) << 21) | ((head[7] & 0x7f) << 14) | ((head[8] & 0x7f) << 7) | (head[9] & 0x7f);
       const readLength = Math.min(tagSize + 10, ID3_MAX_BYTES, file.size);
       const buffer = await file.slice(0, readLength).arrayBuffer();
-      return parseID3v2(buffer);
+      tags = parseID3v2(buffer);
+    }
+
+    // ID3v1 fallback when ID3v2 is missing or incomplete (no title or artist)
+    if (
+      file.size >= 128 &&
+      (!tags.title || !tags.artist) &&
+      (extension === "mp3" || file.type === "audio/mpeg" || (head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33))
+    ) {
+      const tailBuffer = await file.slice(file.size - 128).arrayBuffer();
+      const v1Tags = parseID3v1(tailBuffer);
+      if (!tags.title && v1Tags.title) tags.title = v1Tags.title;
+      if (!tags.artist && v1Tags.artist) tags.artist = v1Tags.artist;
+      if (!tags.album && v1Tags.album) tags.album = v1Tags.album;
+      if (tags.trackNumber === undefined && v1Tags.trackNumber !== undefined) {
+        tags.trackNumber = v1Tags.trackNumber;
+      }
+    }
+
+    if (tags.title || tags.artist || tags.album || tags.artwork) {
+      return tags;
     }
 
     const isMp4 =

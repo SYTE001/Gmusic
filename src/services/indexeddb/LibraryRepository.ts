@@ -62,6 +62,19 @@ export class LibraryRepository {
     });
   }
 
+  async updateTracksBatch(updates: Array<{ id: string; patch: Partial<Track> }>): Promise<void> {
+    if (updates.length === 0) return;
+    await withTransaction([STORES.tracks], "readwrite", async (tx) => {
+      const store = tx.objectStore(STORES.tracks);
+      for (const { id, patch } of updates) {
+        const existing = await requestToPromise(store.get(id) as IDBRequest<Track | undefined>);
+        if (existing) {
+          store.put({ ...existing, ...patch, id });
+        }
+      }
+    });
+  }
+
   /** Removes track metadata plus every associated record. Never touches source files. */
   async deleteTracks(ids: string[]): Promise<void> {
     await withTransaction(

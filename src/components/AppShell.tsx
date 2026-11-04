@@ -9,6 +9,7 @@ import { useLibraryStore } from "../stores/libraryStore";
 import { useToastStore } from "../stores/toastStore";
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, HeartIcon, HomeIcon, LibraryIcon, PlaylistIcon, SettingsIcon } from "./Icons";
 import { DynamicIslandNotification } from "./DynamicIslandNotification";
+import { TrackActionsProvider } from "../features/library/useTrackActions";
 import { APP_NAME } from "../types";
 
 const mobileNavClass = ({ isActive }: { isActive: boolean }) =>
@@ -114,7 +115,9 @@ export function AppShell() {
           <MobileTopBar onOpenSidebar={() => setDrawerOpen(true)} />
           <main id="main-content" className="min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
             <div className="mx-auto w-full max-w-[1400px] px-4 pb-8 pt-5 md:px-8 md:pt-7 lg:pb-10">
-              <Outlet />
+              <TrackActionsProvider>
+                <Outlet />
+              </TrackActionsProvider>
             </div>
           </main>
         </div>

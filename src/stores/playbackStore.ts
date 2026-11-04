@@ -23,8 +23,10 @@ import {
   type MediaFailure,
 } from "../services/audio/engine";
 import {
+  clearPreloadedTrackSource,
   preloadTrackSource,
   regainHandleAccess,
+  releaseActiveTrackSource,
   resolveTrackSource,
 } from "../services/file-access/FileAccessService";
 import { perfMark, perfMeasure } from "../utils/perf";
@@ -225,6 +227,7 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
     onSeeked: () => get().syncFromEngine(),
     onEnded: () => get().handleEngineEnded(),
     onError: (failure) => get().handleEngineError(failure),
+    onDispose: () => releaseActiveTrackSource(),
   };
 }
 
@@ -319,6 +322,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
   setEngineForTests: (engine) => {
     const current = get().engine;
     current?.dispose();
+    releaseActiveTrackSource();
     acceptedSourceGeneration = null; // fresh engine, fresh generation space
     lastStartTrackAt = 0;
     preloadedForTrackId = null;
@@ -440,6 +444,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
     if (!resolved.ok) {
       pendingSeekMs = null; // don't leak this resume seek onto a later track
+      clearPreloadedTrackSource();
       const action =
         resolved.reason === "permission-required"
           ? "grant-permission"

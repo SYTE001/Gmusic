@@ -7,6 +7,7 @@ import { LibraryEmptyState, ImportMusicButtons } from "../library/ImportMusic";
 import { HeartIcon, MusicNoteIcon } from "../../components/Icons";
 import { greetingForNow } from "../../utils/misc";
 import { Link } from "react-router-dom";
+import type { Track } from "../../types";
 
 /**
  * Home (PRD §7.2): greeting, Liked Songs tile, Recently Played, Your
@@ -17,18 +18,23 @@ import { Link } from "react-router-dom";
 export function HomePage() {
   const navigate = useNavigate();
   const tracks = useLibraryStore((state) => state.tracks);
+  const trackStats = useLibraryStore((state) => state.trackStats);
   const playlists = useLibraryStore((state) => state.playlists);
   const playContext = usePlaybackStore((state) => state.playContext);
 
   const liked = useMemo(() => tracks.filter((track) => track.isLiked), [tracks]);
-  const recent = useMemo(
-    () =>
-      tracks
-        .filter((track) => track.lastPlayedAt !== null)
-        .sort((a, b) => (b.lastPlayedAt ?? 0) - (a.lastPlayedAt ?? 0))
-        .slice(0, 8),
-    [tracks],
-  );
+  const recent = useMemo(() => {
+    const list: Track[] = [];
+    for (const track of tracks) {
+      const stats = trackStats[track.id];
+      const lastPlayedAt = stats ? stats.lastPlayedAt : track.lastPlayedAt;
+      const playCount = stats ? stats.playCount : track.playCount;
+      if (lastPlayedAt !== null) {
+        list.push(stats ? { ...track, lastPlayedAt, playCount } : track);
+      }
+    }
+    return list.sort((a, b) => (b.lastPlayedAt ?? 0) - (a.lastPlayedAt ?? 0)).slice(0, 8);
+  }, [tracks, trackStats]);
   const recentlyAdded = useMemo(() => [...tracks].sort((a, b) => b.addedAt - a.addedAt).slice(0, 8), [tracks]);
 
   if (tracks.length === 0) {

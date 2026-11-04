@@ -1,7 +1,7 @@
 import type { ImportOutcome, Track } from "../../types";
 import { createId, deriveArtistTitleFromFileName, looksLikeAudioFile, normalizeForSearch } from "../../utils/misc";
 import { parseAudioTags, probeAudioFile } from "../metadata";
-import type { ParsedTags } from "../metadata/types";
+import { isCorruptedOrSuspiciousMetadata, type ParsedTags } from "../metadata/types";
 import { normalizeTrackMetadata } from "../metadata/normalization";
 import { repository } from "../indexeddb/LibraryRepository";
 import { rememberSessionFile } from "../file-access/FileAccessService";
@@ -237,35 +237,47 @@ export function evaluateMetadataImprovement(
   let improvedArtwork: Blob | undefined;
   let improvedDurationMs: number | null | undefined;
 
+  // Check if existing track has corrupted metadata that must be healed
+  const existingTitleCorrupted = isCorruptedOrSuspiciousMetadata(existing.title);
+  const existingArtistCorrupted = isCorruptedOrSuspiciousMetadata(existing.artist);
+  const existingAlbumCorrupted = isCorruptedOrSuspiciousMetadata(existing.album);
+
   // Title:
-  // If imported tags provide a non-empty title that differs from existing, or existing had filename title
-  if (tags.title && tags.title.trim().length > 0) {
-    const trimmedTitle = tags.title.trim();
-    if (existing.metadataFromFilename || existing.title !== trimmedTitle) {
-      improvedTitle = trimmedTitle;
+  // If imported tags provide a valid title that differs from existing, or existing had filename title or corruption
+  const validTagTitle = tags.title && !isCorruptedOrSuspiciousMetadata(tags.title) ? tags.title.trim() : undefined;
+  if (validTagTitle) {
+    if (existing.metadataFromFilename || existingTitleCorrupted || existing.title !== validTagTitle) {
+      improvedTitle = validTagTitle;
     }
+  } else if (existingTitleCorrupted && _fallback.title && !isCorruptedOrSuspiciousMetadata(_fallback.title)) {
+    improvedTitle = _fallback.title.trim();
   }
 
   // Artist:
-  if (tags.artist && tags.artist.trim().length > 0) {
-    const trimmedArtist = tags.artist.trim();
+  const validTagArtist = tags.artist && !isCorruptedOrSuspiciousMetadata(tags.artist) ? tags.artist.trim() : undefined;
+  if (validTagArtist) {
     if (
       existing.metadataFromFilename ||
+      existingArtistCorrupted ||
       existing.artist === "Unknown Artist" ||
       !existing.artist ||
-      existing.artist !== trimmedArtist
+      existing.artist !== validTagArtist
     ) {
-      improvedArtist = trimmedArtist;
+      improvedArtist = validTagArtist;
     }
+  } else if (existingArtistCorrupted && _fallback.artist && !isCorruptedOrSuspiciousMetadata(_fallback.artist)) {
+    improvedArtist = _fallback.artist.trim();
   }
 
   // Album:
   // Never overwrite an existing non-empty album with empty
-  if (tags.album && tags.album.trim().length > 0) {
-    const trimmedAlbum = tags.album.trim();
-    if (!existing.album || existing.album !== trimmedAlbum) {
-      improvedAlbum = trimmedAlbum;
+  const validTagAlbum = tags.album && !isCorruptedOrSuspiciousMetadata(tags.album) ? tags.album.trim() : undefined;
+  if (validTagAlbum) {
+    if (existingAlbumCorrupted || !existing.album || existing.album !== validTagAlbum) {
+      improvedAlbum = validTagAlbum;
     }
+  } else if (existingAlbumCorrupted) {
+    improvedAlbum = "";
   }
 
   // Track Number:
@@ -404,27 +416,49 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
       const tailHash = extractTailHash(fingerprint);
       const tags = await parseAudioTags(file);
       const fallback = deriveArtistTitleFromFileName(file.name);
+
+      const validTagTitle = tags.title && !isCorruptedOrSuspiciousMetadata(tags.title) ? tags.title.trim() : undefined;
+      const validTagArtist = tags.artist && !isCorruptedOrSuspiciousMetadata(tags.artist) ? tags.artist.trim() : undefined;
+      const validTagAlbum = tags.album && !isCorruptedOrSuspiciousMetadata(tags.album) ? tags.album.trim() : undefined;
+
+      const validFallbackTitle = fallback.title && !isCorruptedOrSuspiciousMetadata(fallback.title) ? fallback.title.trim() : undefined;
+      const validFallbackArtist = fallback.artist && !isCorruptedOrSuspiciousMetadata(fallback.artist) ? fallback.artist.trim() : undefined;
+
+      // Reliable title & artist fallback hierarchy:
+      // 1. Valid embedded metadata
+      // 2. Valid filename-derived title/artist
+      // 3. "Unknown Track" / "Unknown Artist" only as final fallback
+      const initialTitle = validTagTitle ?? validFallbackTitle ?? "Unknown Track";
+      const initialArtist = validTagArtist ?? validFallbackArtist ?? "Unknown Artist";
+      const initialAlbum = validTagAlbum ?? "";
+      const effectiveDurationMs = probe.durationMs ?? tags.durationMs ?? null;
+
       const normalized = normalizeTrackMetadata(
         {
-          title: tags.title ?? fallback.title,
-          artist: tags.artist ?? fallback.artist,
-          album: tags.album ?? "",
-          durationMs: probe.durationMs,
+          title: initialTitle,
+          artist: initialArtist,
+          album: initialAlbum,
+          durationMs: effectiveDurationMs,
           fileName: file.name,
         },
         { libraryTracks },
       );
 
-      const normalizedTitle = normalizeForSearch(normalized.title || tags.title || fallback.title);
-      const normalizedArtist = normalizeForSearch(normalized.artist || tags.artist || fallback.artist);
-      const rawTitle = normalized.title || tags.title || fallback.title;
-      const rawArtist = normalized.artist || tags.artist || fallback.artist;
+      const rawTitle = (normalized.title && !isCorruptedOrSuspiciousMetadata(normalized.title))
+        ? normalized.title
+        : initialTitle;
+      const rawArtist = (normalized.artist && !isCorruptedOrSuspiciousMetadata(normalized.artist))
+        ? normalized.artist
+        : initialArtist;
+
+      const normalizedTitle = normalizeForSearch(rawTitle);
+      const normalizedArtist = normalizeForSearch(rawArtist);
 
       const matchedCandidate = findMatchingExistingTrack({
         file,
         fingerprint,
         tailHash,
-        durationMs: probe.durationMs,
+        durationMs: effectiveDurationMs,
         normalizedTitle,
         normalizedArtist,
         rawTitle,
@@ -436,7 +470,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
 
       if (matchedCandidate) {
         const matchedTrack = matchedCandidate.match;
-        const comparison = evaluateMetadataImprovement(matchedTrack, tags, fallback, probe.durationMs);
+        const comparison = evaluateMetadataImprovement(matchedTrack, tags, fallback, effectiveDurationMs);
         const wasBroken = matchedTrack.availability === "broken" || Boolean(matchedTrack.broken?.isBroken);
 
         if (comparison.hasImprovement || wasBroken) {
@@ -486,7 +520,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
             album: comparison.improvedAlbum ?? matchedTrack.album,
             trackNumber: comparison.improvedTrackNumber !== undefined ? comparison.improvedTrackNumber : matchedTrack.trackNumber,
             albumTrackCount: comparison.improvedAlbumTrackCount !== undefined ? comparison.improvedAlbumTrackCount : matchedTrack.albumTrackCount,
-            durationMs: matchedTrack.durationMs ?? probe.durationMs,
+            durationMs: matchedTrack.durationMs ?? effectiveDurationMs,
             metadataFromFilename: comparison.hasNewTags ? false : matchedTrack.metadataFromFilename,
             fileName: file.name,
             fileSize: file.size,
@@ -508,7 +542,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
       } else {
         // No match: add as a brand new track
         // Check for potential ambiguity / alternate recording to flag in needsReview
-        const currentDurationMs = probe.durationMs;
+        const currentDurationMs = effectiveDurationMs;
         if (normalizedTitle && normalizedArtist && currentDurationMs !== null) {
           const ambiguous = libraryTracks.find((t) => {
             if (!t.title || !t.artist || !t.durationMs) return false;
@@ -530,12 +564,12 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
 
         const track: Track = {
           id: createId(),
-          title: normalized.title || tags.title || fallback.title,
-          artist: normalized.artist || tags.artist || fallback.artist,
-          album: normalized.album ?? tags.album ?? "",
+          title: rawTitle,
+          artist: rawArtist,
+          album: (normalized.album && !isCorruptedOrSuspiciousMetadata(normalized.album)) ? normalized.album : initialAlbum,
           trackNumber: tags.trackNumber ?? fallback.trackNumber ?? null,
           albumTrackCount: tags.albumTrackCount ?? null,
-          durationMs: probe.durationMs,
+          durationMs: effectiveDurationMs,
           fileName: file.name,
           fileSize: file.size,
           mimeType: file.type || "",
@@ -546,7 +580,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           availability: "available",
           accessMode,
           fingerprint,
-          metadataFromFilename: tags.title === undefined,
+          metadataFromFilename: !validTagTitle,
         };
 
         if (tags.artwork) {
