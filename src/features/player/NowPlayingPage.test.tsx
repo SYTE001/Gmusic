@@ -3,7 +3,6 @@ import { MemoryRouter } from "react-router-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
 import { MiniPlayer } from "../../components/MiniPlayer";
-import { SettingsPage } from "../settings/SettingsPage";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { DEFAULT_PREFERENCES, useSettingsStore } from "../../stores/settingsStore";
@@ -24,6 +23,12 @@ vi.mock("react-router-dom", async () => {
     useNavigate: () => mockNavigate,
   };
 });
+
+function setViewport(width: number, height: number) {
+  Object.defineProperty(window, "innerWidth", { writable: true, configurable: true, value: width });
+  Object.defineProperty(window, "innerHeight", { writable: true, configurable: true, value: height });
+  window.dispatchEvent(new Event("resize"));
+}
 
 function createTrack(id: string = "track-1", overrides: Partial<Track> = {}): Track {
   return {
@@ -53,6 +58,7 @@ describe("NowPlayingPage component", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearPaletteCache();
+    setViewport(390, 844);
     const track = createTrack();
     useLibraryStore.setState({
       tracks: [track],
@@ -116,7 +122,6 @@ describe("NowPlayingPage component", () => {
   });
 
   it("applies solid album-adaptive CSS variables (--bg, --lyric-active, --lyric-inactive, --accent) on root in Stage 2 and restores Stage 1 when hidden", () => {
-    // Seed a red album palette into cache for Test Artist::Test Album
     const redPixels = new Uint8ClampedArray(32 * 32 * 4);
     for (let i = 0; i < redPixels.length; i += 4) {
       redPixels[i] = 215;
@@ -224,13 +229,16 @@ describe("NowPlayingPage component", () => {
     expect(container.querySelectorAll(".lyrics-bg-blob").length).toBe(0);
   });
 
-  it("renders track title, artist, artwork, and playback controls in Now Playing mode", () => {
+  it("renders track title, artist, artwork, and playback controls in Mobile Now Playing mode", () => {
+    setViewport(390, 844);
     render(
       <MemoryRouter initialEntries={["/now-playing"]}>
         <NowPlayingPage />
       </MemoryRouter>,
     );
 
+    const root = screen.getByRole("region", { name: "Now playing" });
+    expect(root.getAttribute("data-viewport")).toBe("mobile");
     expect(screen.getByRole("heading", { name: "Test Song" })).toBeTruthy();
     expect(screen.getByText("Test Artist")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close Now Playing" })).toBeTruthy();
@@ -248,7 +256,8 @@ describe("NowPlayingPage component", () => {
     expect(screen.getByRole("button", { name: "Open queue" })).toBeTruthy();
   });
 
-  it("wires playback controls, favorite, seek bar, queue, and overflow Share action in Now Playing mode", () => {
+  it("wires playback controls, favorite, seek bar, queue, and overflow Share action in Mobile Now Playing mode", () => {
+    setViewport(412, 915);
     const togglePlay = vi.fn();
     const previous = vi.fn();
     const next = vi.fn();
@@ -308,7 +317,8 @@ describe("NowPlayingPage component", () => {
     expect(screen.getByRole("complementary", { name: "Play queue" })).toBeTruthy();
   });
 
-  it("transitions between Now Playing and Fullscreen Lyrics modes while hiding extra controls and preserving playback", () => {
+  it("transitions between Mobile Now Playing and Fullscreen Lyrics modes while hiding extra controls and preserving playback", () => {
+    setViewport(390, 844);
     const togglePlay = vi.fn();
     usePlaybackStore.setState({ togglePlay });
 
@@ -373,74 +383,123 @@ describe("NowPlayingPage component", () => {
     expect(mockNavigate).toHaveBeenCalledWith(-1);
   });
 
-  it("renders lightweight AmbientRainDrops only when enabled in Now Playing mode, unmounts when disabled or in Lyrics mode, and respects reduced motion", () => {
-    const { container } = render(
+  it("uses explicit navigation actions so downward chevron returns to Now Playing without closing and X button closes player without navigating to lyrics", () => {
+    setViewport(390, 844);
+    mockNavigate.mockClear();
+    const { unmount } = render(
       <MemoryRouter initialEntries={["/now-playing"]}>
         <NowPlayingPage />
       </MemoryRouter>,
     );
 
-    // Default state is OFF: zero rain elements or canvas
-    expect(screen.queryByTestId("ambient-rain-drops")).toBeNull();
-    expect(container.querySelectorAll("[data-raindrop]").length).toBe(0);
-    expect(container.querySelectorAll("canvas").length).toBe(0);
+    const root = screen.getByRole("region", { name: "Now playing" });
+    expect(root.getAttribute("data-stage")).toBe("album");
 
-    // Turn ON -> immediately renders 10 lightweight droplets (between 6 and 12)
-    act(() => {
-      useSettingsStore.getState().update({ ambientRainDrops: true });
-    });
-
-    const layer = screen.getByTestId("ambient-rain-drops");
-    expect(layer).toBeTruthy();
-    expect(layer.className).toContain("pointer-events-none");
-    expect(layer.getAttribute("data-reduced-motion")).toBe("false");
-    const droplets = container.querySelectorAll("[data-raindrop]");
-    expect(droplets.length).toBeGreaterThanOrEqual(6);
-    expect(droplets.length).toBeLessThanOrEqual(12);
-    expect(container.querySelectorAll("canvas").length).toBe(0);
-
-    // Respects reduced motion: disables continuous animations
-    act(() => {
-      useSettingsStore.getState().update({ reducedMotion: "on" });
-    });
-    expect(screen.getByTestId("ambient-rain-drops").getAttribute("data-reduced-motion")).toBe("true");
-    expect((droplets[0] as HTMLElement).style.animation).toBe("none");
-
-    // Switching to Fullscreen Lyrics unmounts the rain droplets
+    // 1. Click Lyrics button -> enters Fullscreen Lyrics mode
     fireEvent.click(screen.getByRole("button", { name: "Show lyrics" }));
-    expect(screen.queryByTestId("ambient-rain-drops")).toBeNull();
+    expect(root.getAttribute("data-stage")).toBe("lyrics");
+    const chevronBtn = screen.getByRole("button", { name: "Hide lyrics" });
+    expect(chevronBtn.getAttribute("title")).toBe("Return to Now Playing");
 
-    // Return to Now Playing -> droplets reappear while setting is ON
-    fireEvent.click(screen.getByRole("button", { name: "Hide lyrics" }));
-    expect(screen.getByTestId("ambient-rain-drops")).toBeTruthy();
+    // 2. Click downward chevron -> returns to Now Playing mode, does NOT close player (no navigate(-1))
+    fireEvent.click(chevronBtn);
+    expect(root.getAttribute("data-stage")).toBe("album");
+    expect(mockNavigate).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Show lyrics" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close Now Playing" })).toBeTruthy();
 
-    // Turn OFF -> immediately removes all droplet elements
-    act(() => {
-      useSettingsStore.getState().update({ ambientRainDrops: false });
-    });
-    expect(screen.queryByTestId("ambient-rain-drops")).toBeNull();
-    expect(container.querySelectorAll("[data-raindrop]").length).toBe(0);
+    // 3. Click X button -> closes fullscreen player via navigate(-1), does NOT navigate to Lyrics
+    fireEvent.click(screen.getByRole("button", { name: "Close Now Playing" }));
+    expect(mockNavigate).toHaveBeenCalledWith(-1);
+    expect(mockNavigate).not.toHaveBeenCalledWith(expect.stringContaining("lyrics"));
+    expect(usePlaybackStore.getState().isPlaying).toBe(true);
+    expect(usePlaybackStore.getState().currentTimeMs).toBe(30000);
+
+    // 4. Reopen Now Playing -> opens fresh in Now Playing mode, not Lyrics mode
+    unmount();
+    render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+    const reopenedRoot = screen.getByRole("region", { name: "Now playing" });
+    expect(reopenedRoot.getAttribute("data-stage")).toBe("album");
+    expect(screen.getByRole("button", { name: "Show lyrics" })).toBeTruthy();
   });
 
-  it("toggles Ambient Rain Drops from the Appearance section in SettingsPage", () => {
+  it("renders original Desktop player layout at >= 768px (768x1024, 1366x768, 1920x1080) with side-by-side artwork and lyrics in Stage 2", () => {
+    for (const [width, height] of [
+      [768, 1024],
+      [1366, 768],
+      [1920, 1080],
+    ] as const) {
+      setViewport(width, height);
+      const { unmount } = render(
+        <MemoryRouter initialEntries={["/now-playing"]}>
+          <NowPlayingPage />
+        </MemoryRouter>,
+      );
+
+      const root = screen.getByRole("region", { name: "Now playing" });
+      expect(root.getAttribute("data-viewport")).toBe("desktop");
+      expect(root.getAttribute("data-stage")).toBe("album");
+
+      // Desktop top bar has Close button on left and Lyrics toggle button with aria-pressed on right (no mobile More options menu)
+      expect(screen.getByRole("button", { name: "Close Now Playing" })).toBeTruthy();
+      const lyricsToggle = screen.getByRole("button", { name: "Show lyrics" });
+      expect(lyricsToggle.getAttribute("aria-pressed")).toBe("false");
+      expect(screen.queryByRole("button", { name: "More options" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Open queue" })).toBeNull();
+
+      // Toggle lyrics on desktop -> enters Stage 2 with side-by-side artwork + controls AND lyrics simultaneously
+      fireEvent.click(lyricsToggle);
+      expect(root.getAttribute("data-stage")).toBe("lyrics");
+      const hideLyricsBtn = screen.getByRole("button", { name: "Hide lyrics" });
+      expect(hideLyricsBtn.getAttribute("aria-pressed")).toBe("true");
+      // Desktop keeps album artwork and transport controls visible alongside lyrics
+      expect(screen.getByRole("img", { name: /Test Song artwork/i })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Previous track" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Next track" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Enable shuffle" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Enable repeat all" })).toBeTruthy();
+
+      unmount();
+    }
+  });
+
+  it("handles responsive transitions between Desktop (1366x768) and Mobile (390x844) without interrupting playback or duplicating controls", () => {
+    setViewport(1366, 768);
     render(
-      <MemoryRouter>
-        <SettingsPage />
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
       </MemoryRouter>,
     );
 
-    expect(screen.getByText("Ambient Rain Drops")).toBeTruthy();
-    expect(screen.getByText("Show subtle animated water droplets in the Now Playing background.")).toBeTruthy();
+    const root = screen.getByRole("region", { name: "Now playing" });
+    expect(root.getAttribute("data-viewport")).toBe("desktop");
+    expect(screen.getAllByRole("slider", { name: "Seek" }).length).toBe(1);
 
-    const toggle = screen.getByRole("switch", { name: "Ambient Rain Drops" });
-    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    // Resize Desktop -> Mobile (390x844)
+    act(() => {
+      setViewport(390, 844);
+    });
+    expect(root.getAttribute("data-viewport")).toBe("mobile");
+    expect(screen.getAllByRole("slider", { name: "Seek" }).length).toBe(1);
+    expect(screen.getByRole("button", { name: "More options" })).toBeTruthy();
 
-    fireEvent.click(toggle);
-    expect(useSettingsStore.getState().prefs.ambientRainDrops).toBe(true);
-    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    // Open mobile queue panel, then resize Mobile -> Desktop (1920x1080)
+    fireEvent.click(screen.getByRole("button", { name: "Open queue" }));
+    expect(screen.getByRole("complementary", { name: "Play queue" })).toBeTruthy();
 
-    fireEvent.click(toggle);
-    expect(useSettingsStore.getState().prefs.ambientRainDrops).toBe(false);
-    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    act(() => {
+      setViewport(1920, 1080);
+    });
+    expect(root.getAttribute("data-viewport")).toBe("desktop");
+    expect(screen.queryByRole("complementary", { name: "Play queue" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "More options" })).toBeNull();
+    expect(screen.getAllByRole("slider", { name: "Seek" }).length).toBe(1);
+    expect(usePlaybackStore.getState().currentTrackId).toBe("track-1");
+    expect(usePlaybackStore.getState().currentTimeMs).toBe(30000);
+    expect(usePlaybackStore.getState().isPlaying).toBe(true);
   });
 });

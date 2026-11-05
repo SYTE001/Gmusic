@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useLibraryStore, useTrackById } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
-import { useSettingsStore } from "../../stores/settingsStore";
 import { toast } from "../../stores/toastStore";
 import { recordComponentRender } from "../../utils/perf";
 import { Artwork } from "../../components/Artwork";
@@ -13,13 +12,13 @@ import { TransportToggle } from "../../components/TransportToggle";
 import { useTrackActionsContext } from "../library/useTrackActions";
 import { LyricsView } from "../lyrics/LyricsView";
 import { useAdaptiveLyricsPalette } from "../lyrics/useAdaptiveLyricsPalette";
-import { AmbientRainDrops } from "./AmbientRainDrops";
 import {
   ChevronDownIcon,
   ChevronUpIcon,
   CloseIcon,
   CopyIcon,
   HeartIcon,
+  LyricsIcon,
   MoreIcon,
   NextIcon,
   PauseIcon,
@@ -31,12 +30,48 @@ import {
   ShareIcon,
   ShuffleIcon,
 } from "../../components/Icons";
-import type { Track } from "../../types";
+import type { RepeatMode, Track } from "../../types";
 
 /**
  * Flip to `true` to adopt the adaptive background in Stage 1 (album-only view) as well.
  */
 export const ENABLE_STAGE_1_BACKGROUND = false;
+
+export const MOBILE_PLAYER_BREAKPOINT_PX = 768;
+
+function getIsMobileViewport(): boolean {
+  if (typeof window === "undefined") return false;
+  if (typeof window.innerWidth === "number" && window.innerWidth > 0) {
+    return window.innerWidth < MOBILE_PLAYER_BREAKPOINT_PX;
+  }
+  if (typeof window.matchMedia === "function") {
+    return window.matchMedia(`(max-width: ${MOBILE_PLAYER_BREAKPOINT_PX - 1}px)`).matches;
+  }
+  return false;
+}
+
+export function useIsMobileViewport(): boolean {
+  const [isMobile, setIsMobile] = useState<boolean>(getIsMobileViewport);
+
+  useEffect(() => {
+    const update = () => {
+      setIsMobile(getIsMobileViewport());
+    };
+    update();
+    window.addEventListener("resize", update);
+    const mql =
+      typeof window.matchMedia === "function"
+        ? window.matchMedia(`(max-width: ${MOBILE_PLAYER_BREAKPOINT_PX - 1}px)`)
+        : null;
+    mql?.addEventListener?.("change", update);
+    return () => {
+      window.removeEventListener("resize", update);
+      mql?.removeEventListener?.("change", update);
+    };
+  }, []);
+
+  return isMobile;
+}
 
 function copyShareText(text: string) {
   if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
@@ -61,52 +96,488 @@ function shareTrackInfo(track: Track) {
   copyShareText(text);
 }
 
+export type PlayerPresentationMode = "now-playing" | "lyrics";
+
+type SharedPlayerProps = {
+  track: Track;
+  lyricsMode: boolean;
+  isPlaying: boolean;
+  shuffleEnabled: boolean;
+  repeatMode: RepeatMode;
+  openLyrics: () => void;
+  returnToNowPlaying: () => void;
+  closeFullscreenPlayer: () => void;
+};
+
 /**
- * Immersive two-mode player experience:
- * - Mode 1 (Now Playing / Stage 1): Album artwork and essential playback controls.
- * - Mode 2 (Fullscreen Lyrics / Stage 2): Immersive synchronized lyrics with minimal playback controls
- *   on a solid, contrast-verified album-adaptive dark background (`--bg`, `--lyric-active`, `--lyric-inactive`, `--accent`).
+ * Original Desktop Now Playing presentation (>= 768px):
+ * - Stage 1 (album only): centered artwork + inline seek bar + transport row.
+ * - Stage 2 (album + lyrics side by side): artwork & controls column on the left,
+ *   synchronized LyricsView column on the right.
+ */
+export function DesktopPlayer({
+  track,
+  lyricsMode,
+  isPlaying,
+  shuffleEnabled,
+  repeatMode,
+  openLyrics,
+  returnToNowPlaying,
+  closeFullscreenPlayer,
+}: SharedPlayerProps) {
+  return (
+    <>
+      {/* Top bar: close button on left, song title centered, lyrics toggle button on right */}
+      <div className="relative z-10 flex items-center px-4 py-3 md:px-6 shrink-0">
+        <button
+          type="button"
+          className="icon-btn shrink-0"
+          aria-label="Close Now Playing"
+          onClick={closeFullscreenPlayer}
+        >
+          <CloseIcon size={18} />
+        </button>
+        <span className="min-w-0 flex-1 truncate px-3 text-center text-sm font-medium text-text-secondary">
+          {track.title}
+        </span>
+        <button
+          type="button"
+          className={`icon-btn shrink-0 ${lyricsMode ? "text-text-primary" : ""}`}
+          aria-label={lyricsMode ? "Hide lyrics" : "Show lyrics"}
+          aria-pressed={lyricsMode}
+          onClick={lyricsMode ? returnToNowPlaying : openLyrics}
+        >
+          <LyricsIcon size={18} />
+        </button>
+      </div>
+
+      {/* Main content area */}
+      <div
+        className={`relative z-10 flex min-h-0 flex-1 px-6 pb-6 md:px-10 ${
+          lyricsMode
+            ? "flex-col lg:flex-row gap-6 lg:gap-10"
+            : "flex-col items-center justify-center"
+        }`}
+      >
+        {/* Artwork + Controls column */}
+        <div
+          className={`flex min-h-0 flex-col items-center justify-center ${
+            lyricsMode ? "lg:w-[38%] shrink-0 w-full" : "w-full flex-1"
+          }`}
+        >
+          <div
+            className={`flex flex-col items-center w-full ${
+              lyricsMode
+                ? "max-w-[230px] sm:max-w-[260px] lg:max-w-[min(340px,calc(100dvh-270px))]"
+                : "max-w-[min(280px,calc(100dvh-270px))] sm:max-w-[min(340px,calc(100dvh-270px))] md:max-w-[min(380px,calc(100dvh-270px))]"
+            }`}
+          >
+            {/* Artwork container */}
+            <div
+              className={`aspect-square w-full overflow-hidden rounded-[20px] shadow-2xl ${
+                isPlaying ? "scale-100" : "scale-[0.94]"
+              }`}
+              style={{
+                transition: "transform 300ms cubic-bezier(0.22, 1, 0.36, 1)",
+                backfaceVisibility: "hidden",
+              }}
+            >
+              <Artwork trackId={track.id} alt={`${track.title} artwork`} className="size-full" rounded="rounded-[20px]" />
+            </div>
+
+            {/* Controls under artwork, same width as artwork */}
+            <div className="w-full flex flex-col gap-3.5 mt-5">
+              {/* 1. Title row: title + artist below it, LEFT-aligned. Like/heart button moves to right end */}
+              <div className="flex items-center justify-between gap-3 min-w-0 w-full">
+                <div className="min-w-0 flex-1 text-left">
+                  <h1 className="truncate text-lg font-semibold tracking-tight sm:text-xl md:text-2xl text-text-primary">
+                    {track.title}
+                  </h1>
+                  <p className="truncate text-xs sm:text-sm text-text-secondary">
+                    {track.artist || "Unknown artist"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="icon-btn shrink-0"
+                  title="Like (L)"
+                  aria-label={track.isLiked ? "Remove from liked songs" : "Add to liked songs"}
+                  aria-pressed={track.isLiked}
+                  onClick={() => void useLibraryStore.getState().toggleLike(track.id)}
+                >
+                  <HeartIcon size={19} filled={track.isLiked} className={track.isLiked ? "text-text-primary" : ""} />
+                </button>
+              </div>
+
+              {/* 2. SeekBar */}
+              <SeekBar />
+
+              {/* 3. Transport row, centered */}
+              <div className="flex items-center justify-center gap-2 sm:gap-3 w-full">
+                <TransportToggle
+                  active={shuffleEnabled}
+                  label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
+                  title="Shuffle (S)"
+                  onClick={() => usePlaybackStore.getState().toggleShuffle()}
+                >
+                  <ShuffleIcon size={18} />
+                </TransportToggle>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label="Previous track"
+                  onClick={() => usePlaybackStore.getState().previous()}
+                >
+                  <PrevIcon size={22} />
+                </button>
+                <button
+                  type="button"
+                  className="grid size-14 place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
+                  title="Play/Pause (Space)"
+                  aria-label={isPlaying ? "Pause" : "Play"}
+                  onClick={() => usePlaybackStore.getState().togglePlay()}
+                >
+                  {isPlaying ? <PauseIcon size={24} /> : <PlayIcon size={24} />}
+                </button>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  aria-label="Next track"
+                  onClick={() => usePlaybackStore.getState().next(true)}
+                >
+                  <NextIcon size={22} />
+                </button>
+                <TransportToggle
+                  active={repeatMode !== "off"}
+                  label={
+                    repeatMode === "off"
+                      ? "Enable repeat all"
+                      : repeatMode === "all"
+                        ? "Enable repeat one"
+                        : "Disable repeat"
+                  }
+                  title="Repeat (R)"
+                  onClick={() => usePlaybackStore.getState().cycleRepeat()}
+                >
+                  {repeatMode === "one" ? <RepeatOneIcon size={18} /> : <RepeatIcon size={18} />}
+                </TransportToggle>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Lyrics column — sits directly on the solid background */}
+        {lyricsMode && (
+          <div className="min-h-0 flex-1 pb-2">
+            <LyricsView />
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/**
+ * Redesigned Mobile Player presentation (< 768px):
+ * - Mode 1 (Mobile Now Playing): Fullscreen artwork, stacked seek bar, transport controls,
+ *   bottom-center Lyrics button, bottom-right Queue button, and top-right overflow menu.
+ * - Mode 2 (Mobile Fullscreen Lyrics): Downward chevron header, immersive mobile LyricsView,
+ *   and compact bottom SeekBar + central Play/Pause button.
+ */
+export function MobilePlayer({
+  track,
+  lyricsMode,
+  isPlaying,
+  shuffleEnabled,
+  repeatMode,
+  openLyrics,
+  returnToNowPlaying,
+  closeFullscreenPlayer,
+  queueOpen,
+  setQueueOpen,
+  buildOverflowMenuItems,
+}: SharedPlayerProps & {
+  queueOpen: boolean;
+  setQueueOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  buildOverflowMenuItems: () => MenuItemSpec[];
+}) {
+  return lyricsMode ? (
+    /* Mode 2: Fullscreen Lyrics */
+    <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col animate-fade-in">
+      {/* Compact Lyrics Header: downward chevron on left returns to Now Playing */}
+      <header className="flex shrink-0 items-center justify-between px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]">
+        <button
+          type="button"
+          className="icon-btn shrink-0 text-text-secondary hover:text-text-primary"
+          aria-label="Hide lyrics"
+          title="Return to Now Playing"
+          onClick={returnToNowPlaying}
+        >
+          <ChevronDownIcon size={22} />
+        </button>
+        <div className="min-w-0 flex-1 px-3 text-center">
+          <h1 className="truncate text-[15px] font-semibold tracking-tight text-text-primary sm:text-base">
+            {track.title}
+          </h1>
+          <p className="truncate text-xs font-medium text-text-secondary sm:text-[13px]">
+            {track.artist || "Unknown artist"}
+          </p>
+        </div>
+        <div className="size-9 shrink-0" aria-hidden="true" />
+      </header>
+
+      {/* Immersive Synchronized Lyrics Container */}
+      <div className="min-h-0 flex-1 px-6">
+        <LyricsView mobile />
+      </div>
+
+      {/* Minimal Bottom Playback Area: Progress bar + time labels + central Play/Pause */}
+      <div className="flex shrink-0 flex-col items-center gap-3 px-6 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2">
+        <SeekBar stackedLabels />
+        <button
+          type="button"
+          className="grid size-16 sm:size-[72px] place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
+          title="Play/Pause (Space)"
+          aria-label={isPlaying ? "Pause" : "Play"}
+          onClick={() => usePlaybackStore.getState().togglePlay()}
+        >
+          {isPlaying ? <PauseIcon size={28} /> : <PlayIcon size={28} />}
+        </button>
+      </div>
+    </div>
+  ) : (
+    /* Mode 1: Now Playing */
+    <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col justify-between animate-fade-in">
+      {/* Top Navigation: X button left closes fullscreen player */}
+      <header className="flex shrink-0 items-center justify-between px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]">
+        <button
+          type="button"
+          className="icon-btn shrink-0 text-text-secondary hover:text-text-primary"
+          aria-label="Close Now Playing"
+          title="Close Now Playing"
+          onClick={closeFullscreenPlayer}
+        >
+          <CloseIcon size={20} />
+        </button>
+        <span className="min-w-0 flex-1 truncate px-3 text-center text-sm font-medium text-text-secondary">
+          {track.title}
+        </span>
+        <Menu
+          buttonLabel="More options"
+          trigger={<MoreIcon size={20} />}
+          items={buildOverflowMenuItems}
+        />
+      </header>
+
+      {/* Main Content: Responsive 1:1 Album Artwork + Controls */}
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-between px-6 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
+        {/* Album Artwork */}
+        <div className="flex min-h-0 w-full flex-1 items-center justify-center py-2">
+          <div className="aspect-square w-full max-w-[min(82vw,calc(100dvh-350px))] sm:max-w-[min(360px,calc(100dvh-350px))] overflow-hidden rounded-[28px]">
+            <Artwork
+              trackId={track.id}
+              alt={`${track.title} artwork`}
+              className="size-full object-cover"
+              rounded="rounded-[28px]"
+            />
+          </div>
+        </div>
+
+        {/* Track Info, SeekBar, Transport Controls, and Bottom Actions */}
+        <div className="flex w-full shrink-0 flex-col gap-3.5">
+          {/* Track Information + Favorite */}
+          <div className="flex min-w-0 w-full items-center justify-between gap-3">
+            <div className="min-w-0 flex-1 text-left">
+              <h1 className="truncate text-xl font-bold tracking-tight text-text-primary sm:text-2xl">
+                {track.title}
+              </h1>
+              <p className="mt-0.5 truncate text-base font-medium text-text-secondary">
+                {track.artist || "Unknown artist"}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="icon-btn shrink-0 text-text-secondary hover:text-text-primary transition-transform active:scale-90"
+              title="Like (L)"
+              aria-label={track.isLiked ? "Remove from liked songs" : "Add to liked songs"}
+              aria-pressed={track.isLiked}
+              onClick={() => void useLibraryStore.getState().toggleLike(track.id)}
+            >
+              <HeartIcon size={22} filled={track.isLiked} className={track.isLiked ? "text-text-primary" : ""} />
+            </button>
+          </div>
+
+          {/* Progress Bar */}
+          <SeekBar stackedLabels />
+
+          {/* Main Playback Controls: Shuffle | Previous | Play/Pause | Next | Repeat */}
+          <div className="flex w-full items-center justify-between px-1 sm:px-3">
+            <TransportToggle
+              active={shuffleEnabled}
+              label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
+              title="Shuffle (S)"
+              onClick={() => usePlaybackStore.getState().toggleShuffle()}
+            >
+              <ShuffleIcon size={20} />
+            </TransportToggle>
+            <button
+              type="button"
+              className="icon-btn text-text-primary"
+              aria-label="Previous track"
+              onClick={() => usePlaybackStore.getState().previous()}
+            >
+              <PrevIcon size={26} />
+            </button>
+            <button
+              type="button"
+              className="grid size-[72px] sm:size-20 place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
+              title="Play/Pause (Space)"
+              aria-label={isPlaying ? "Pause" : "Play"}
+              onClick={() => usePlaybackStore.getState().togglePlay()}
+            >
+              {isPlaying ? <PauseIcon size={30} /> : <PlayIcon size={30} />}
+            </button>
+            <button
+              type="button"
+              className="icon-btn text-text-primary"
+              aria-label="Next track"
+              onClick={() => usePlaybackStore.getState().next(true)}
+            >
+              <NextIcon size={26} />
+            </button>
+            <TransportToggle
+              active={repeatMode !== "off"}
+              label={
+                repeatMode === "off"
+                  ? "Enable repeat all"
+                  : repeatMode === "all"
+                    ? "Enable repeat one"
+                    : "Disable repeat"
+              }
+              title="Repeat (R)"
+              onClick={() => usePlaybackStore.getState().cycleRepeat()}
+            >
+              {repeatMode === "one" ? <RepeatOneIcon size={20} /> : <RepeatIcon size={20} />}
+            </TransportToggle>
+          </div>
+
+          {/* Bottom Secondary Actions: Primary Lyrics button bottom-center, Queue icon bottom-right */}
+          <div className="grid w-full grid-cols-3 items-center pt-0.5">
+            <div aria-hidden="true" />
+            <div className="flex justify-center">
+              <button
+                type="button"
+                className="inline-flex min-h-11 flex-col items-center justify-center gap-0.5 rounded-xl px-4 py-1 text-text-secondary transition-colors hover:text-text-primary active:scale-95"
+                aria-label="Show lyrics"
+                onClick={openLyrics}
+              >
+                <ChevronUpIcon size={16} />
+                <span className="text-xs font-medium tracking-tight">Lyrics</span>
+              </button>
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="button"
+                className={`icon-btn ${queueOpen ? "text-text-primary" : "text-text-secondary"}`}
+                title="Queue (Q)"
+                aria-label={queueOpen ? "Close queue" : "Open queue"}
+                aria-pressed={queueOpen}
+                onClick={() => setQueueOpen((open) => !open)}
+              >
+                <QueueIcon size={20} />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <QueuePanel open={queueOpen} onClose={() => setQueueOpen(false)} dockedBottom />
+    </div>
+  );
+}
+
+/**
+ * Responsive Now Playing page:
+ * - Desktop (>= 768px): Original Gmusic desktop player experience (`DesktopPlayer`).
+ * - Mobile (< 768px): Redesigned mobile Now Playing & Fullscreen Lyrics experience (`MobilePlayer`).
+ * Both share the single playback engine, Zustand stores, and audio clock.
  */
 export function NowPlayingPage() {
   recordComponentRender("NowPlayingPage");
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
-  const lyricsMode = searchParams.get("lyrics") === "1";
+  const isMobile = useIsMobileViewport();
+
+  // Distinct presentation states: "now-playing" vs "lyrics"
+  const [mode, setMode] = useState<PlayerPresentationMode>(() =>
+    searchParams.get("lyrics") === "1" ? "lyrics" : "now-playing",
+  );
+
+  useEffect(() => {
+    const desiredMode: PlayerPresentationMode = searchParams.get("lyrics") === "1" ? "lyrics" : "now-playing";
+    setMode(desiredMode);
+  }, [searchParams]);
+
+  const lyricsMode = mode === "lyrics";
   const showBackground = lyricsMode || ENABLE_STAGE_1_BACKGROUND;
   const [queueOpen, setQueueOpen] = useState(false);
+
+  // Close mobile-only docked queue panel if viewport transitions to desktop
+  useEffect(() => {
+    if (!isMobile && queueOpen) {
+      setQueueOpen(false);
+    }
+  }, [isMobile, queueOpen]);
 
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const track = useTrackById(currentTrackId);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
-  const ambientRainDrops = useSettingsStore((state) => state.prefs.ambientRainDrops);
   const trackActionsContext = useTrackActionsContext();
 
   const palette = useAdaptiveLyricsPalette(track, showBackground);
+
+  // Explicit navigation action: open lyrics presentation state
+  const openLyrics = useCallback(() => {
+    setQueueOpen(false);
+    setMode("lyrics");
+    setSearchParams({ lyrics: "1" }, { replace: true });
+  }, [setSearchParams]);
+
+  // Explicit navigation action: return to Now Playing mode (artwork + controls).
+  // Must NOT close the fullscreen player or push a history entry.
+  const returnToNowPlaying = useCallback(() => {
+    setMode("now-playing");
+    setSearchParams({}, { replace: true });
+  }, [setSearchParams]);
+
+  // Explicit navigation action: close fullscreen player to previous application screen.
+  // Must NOT navigate to Lyrics mode.
+  const closeFullscreenPlayer = useCallback(() => {
+    navigate(-1);
+  }, [navigate]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.stopPropagation();
-        if (queueOpen) {
-          setQueueOpen(false);
-          return;
+        if (isMobile) {
+          if (queueOpen) {
+            setQueueOpen(false);
+            return;
+          }
+          if (mode === "lyrics") {
+            returnToNowPlaying();
+            return;
+          }
         }
-        navigate(-1);
+        closeFullscreenPlayer();
       }
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [navigate, queueOpen]);
-
-  const setLyricsMode = useCallback(
-    (on: boolean) => {
-      if (on) setQueueOpen(false);
-      setSearchParams(on ? { lyrics: "1" } : {});
-    },
-    [setSearchParams],
-  );
+  }, [closeFullscreenPlayer, isMobile, mode, queueOpen, returnToNowPlaying]);
 
   const buildOverflowMenuItems = useCallback((): MenuItemSpec[] => {
     if (!track) return [];
@@ -175,206 +646,42 @@ export function NowPlayingPage() {
 
   return (
     <div
-      className="fixed inset-0 z-30 flex flex-col overflow-hidden animate-fade-in select-none bg-app-bg"
+      className={`fixed inset-0 ${
+        isMobile ? "z-30" : "z-10"
+      } flex flex-col overflow-hidden animate-fade-in select-none bg-app-bg`}
       role="region"
       aria-label="Now playing"
+      data-viewport={isMobile ? "mobile" : "desktop"}
       data-stage={showBackground ? "lyrics" : "album"}
       data-theme={showBackground ? "dark" : undefined}
       data-cover-category={showBackground ? palette.category : undefined}
       style={rootStyle}
     >
-      {ambientRainDrops && !lyricsMode && <AmbientRainDrops />}
-      {lyricsMode ? (
-        /* Mode 2: Fullscreen Lyrics */
-        <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col animate-fade-in">
-          {/* Compact Lyrics Header: downward chevron on left, centered title & artist */}
-          <header className="flex shrink-0 items-center justify-between px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]">
-            <button
-              type="button"
-              className="icon-btn shrink-0 text-text-secondary hover:text-text-primary"
-              aria-label="Hide lyrics"
-              title="Return to Now Playing"
-              onClick={() => setLyricsMode(false)}
-            >
-              <ChevronDownIcon size={22} />
-            </button>
-            <div className="min-w-0 flex-1 px-3 text-center">
-              <h1 className="truncate text-[15px] font-semibold tracking-tight text-text-primary sm:text-base">
-                {track.title}
-              </h1>
-              <p className="truncate text-xs font-medium text-text-secondary sm:text-[13px]">
-                {track.artist || "Unknown artist"}
-              </p>
-            </div>
-            <div className="size-9 shrink-0" aria-hidden="true" />
-          </header>
-
-          {/* Immersive Synchronized Lyrics Container */}
-          <div className="min-h-0 flex-1 px-6">
-            <LyricsView />
-          </div>
-
-          {/* Minimal Bottom Playback Area: Progress bar + time labels + central Play/Pause */}
-          <div className="flex shrink-0 flex-col items-center gap-3 px-6 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2">
-            <SeekBar />
-            <button
-              type="button"
-              className="grid size-16 sm:size-[72px] place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
-              title="Play/Pause (Space)"
-              aria-label={isPlaying ? "Pause" : "Play"}
-              onClick={() => usePlaybackStore.getState().togglePlay()}
-            >
-              {isPlaying ? <PauseIcon size={28} /> : <PlayIcon size={28} />}
-            </button>
-          </div>
-        </div>
+      {isMobile ? (
+        <MobilePlayer
+          track={track}
+          lyricsMode={lyricsMode}
+          isPlaying={isPlaying}
+          shuffleEnabled={shuffleEnabled}
+          repeatMode={repeatMode}
+          openLyrics={openLyrics}
+          returnToNowPlaying={returnToNowPlaying}
+          closeFullscreenPlayer={closeFullscreenPlayer}
+          queueOpen={queueOpen}
+          setQueueOpen={setQueueOpen}
+          buildOverflowMenuItems={buildOverflowMenuItems}
+        />
       ) : (
-        /* Mode 1: Now Playing */
-        <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col justify-between animate-fade-in">
-          {/* Top Navigation: X button left, truncated song title center, three-dot overflow menu right */}
-          <header className="flex shrink-0 items-center justify-between px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]">
-            <button
-              type="button"
-              className="icon-btn shrink-0 text-text-secondary hover:text-text-primary"
-              aria-label="Close Now Playing"
-              onClick={() => navigate(-1)}
-            >
-              <CloseIcon size={20} />
-            </button>
-            <span className="min-w-0 flex-1 truncate px-3 text-center text-sm font-medium text-text-secondary">
-              {track.title}
-            </span>
-            <Menu
-              buttonLabel="More options"
-              trigger={<MoreIcon size={20} />}
-              items={buildOverflowMenuItems}
-            />
-          </header>
-
-          {/* Main Content: Responsive 1:1 Album Artwork + Controls */}
-          <div className="flex min-h-0 flex-1 flex-col items-center justify-between px-6 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
-            {/* Album Artwork */}
-            <div className="flex min-h-0 w-full flex-1 items-center justify-center py-2">
-              <div className="aspect-square w-full max-w-[min(82vw,calc(100dvh-350px))] sm:max-w-[min(360px,calc(100dvh-350px))] overflow-hidden rounded-[28px]">
-                <Artwork
-                  trackId={track.id}
-                  alt={`${track.title} artwork`}
-                  className="size-full object-cover"
-                  rounded="rounded-[28px]"
-                />
-              </div>
-            </div>
-
-            {/* Track Info, SeekBar, Transport Controls, and Bottom Actions */}
-            <div className="flex w-full shrink-0 flex-col gap-3.5">
-              {/* Track Information + Favorite */}
-              <div className="flex min-w-0 w-full items-center justify-between gap-3">
-                <div className="min-w-0 flex-1 text-left">
-                  <h1 className="truncate text-xl font-bold tracking-tight text-text-primary sm:text-2xl">
-                    {track.title}
-                  </h1>
-                  <p className="mt-0.5 truncate text-base font-medium text-text-secondary">
-                    {track.artist || "Unknown artist"}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="icon-btn shrink-0 text-text-secondary hover:text-text-primary transition-transform active:scale-90"
-                  title="Like (L)"
-                  aria-label={track.isLiked ? "Remove from liked songs" : "Add to liked songs"}
-                  aria-pressed={track.isLiked}
-                  onClick={() => void useLibraryStore.getState().toggleLike(track.id)}
-                >
-                  <HeartIcon size={22} filled={track.isLiked} className={track.isLiked ? "text-text-primary" : ""} />
-                </button>
-              </div>
-
-              {/* Progress Bar */}
-              <SeekBar />
-
-              {/* Main Playback Controls: Shuffle | Previous | Play/Pause | Next | Repeat */}
-              <div className="flex w-full items-center justify-between px-1 sm:px-3">
-                <TransportToggle
-                  active={shuffleEnabled}
-                  label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
-                  title="Shuffle (S)"
-                  onClick={() => usePlaybackStore.getState().toggleShuffle()}
-                >
-                  <ShuffleIcon size={20} />
-                </TransportToggle>
-                <button
-                  type="button"
-                  className="icon-btn text-text-primary"
-                  aria-label="Previous track"
-                  onClick={() => usePlaybackStore.getState().previous()}
-                >
-                  <PrevIcon size={26} />
-                </button>
-                <button
-                  type="button"
-                  className="grid size-[72px] sm:size-20 place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
-                  title="Play/Pause (Space)"
-                  aria-label={isPlaying ? "Pause" : "Play"}
-                  onClick={() => usePlaybackStore.getState().togglePlay()}
-                >
-                  {isPlaying ? <PauseIcon size={30} /> : <PlayIcon size={30} />}
-                </button>
-                <button
-                  type="button"
-                  className="icon-btn text-text-primary"
-                  aria-label="Next track"
-                  onClick={() => usePlaybackStore.getState().next(true)}
-                >
-                  <NextIcon size={26} />
-                </button>
-                <TransportToggle
-                  active={repeatMode !== "off"}
-                  label={
-                    repeatMode === "off"
-                      ? "Enable repeat all"
-                      : repeatMode === "all"
-                        ? "Enable repeat one"
-                        : "Disable repeat"
-                  }
-                  title="Repeat (R)"
-                  onClick={() => usePlaybackStore.getState().cycleRepeat()}
-                >
-                  {repeatMode === "one" ? <RepeatOneIcon size={20} /> : <RepeatIcon size={20} />}
-                </TransportToggle>
-              </div>
-
-              {/* Bottom Secondary Actions: Primary Lyrics button bottom-center, Queue icon bottom-right */}
-              <div className="grid w-full grid-cols-3 items-center pt-0.5">
-                <div aria-hidden="true" />
-                <div className="flex justify-center">
-                  <button
-                    type="button"
-                    className="inline-flex min-h-11 flex-col items-center justify-center gap-0.5 rounded-xl px-4 py-1 text-text-secondary transition-colors hover:text-text-primary active:scale-95"
-                    aria-label="Show lyrics"
-                    onClick={() => setLyricsMode(true)}
-                  >
-                    <ChevronUpIcon size={16} />
-                    <span className="text-xs font-medium tracking-tight">Lyrics</span>
-                  </button>
-                </div>
-                <div className="flex justify-end">
-                  <button
-                    type="button"
-                    className={`icon-btn ${queueOpen ? "text-text-primary" : "text-text-secondary"}`}
-                    title="Queue (Q)"
-                    aria-label={queueOpen ? "Close queue" : "Open queue"}
-                    aria-pressed={queueOpen}
-                    onClick={() => setQueueOpen((open) => !open)}
-                  >
-                    <QueueIcon size={20} />
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <QueuePanel open={queueOpen} onClose={() => setQueueOpen(false)} dockedBottom />
-        </div>
+        <DesktopPlayer
+          track={track}
+          lyricsMode={lyricsMode}
+          isPlaying={isPlaying}
+          shuffleEnabled={shuffleEnabled}
+          repeatMode={repeatMode}
+          openLyrics={openLyrics}
+          returnToNowPlaying={returnToNowPlaying}
+          closeFullscreenPlayer={closeFullscreenPlayer}
+        />
       )}
     </div>
   );

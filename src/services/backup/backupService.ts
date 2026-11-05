@@ -69,7 +69,6 @@ export async function buildBackup(): Promise<BackupFile> {
           repeatMode: prefs.repeatMode,
           reducedMotion: prefs.reducedMotion,
           artworkTint: prefs.artworkTint,
-          ambientRainDrops: prefs.ambientRainDrops,
           lyricsStyle: prefs.lyricsStyle,
           lyricFontSize: prefs.lyricFontSize,
           lyricAlignment: prefs.lyricAlignment,

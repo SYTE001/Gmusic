@@ -8,7 +8,7 @@ import { formatClock } from "../utils/misc";
  * authority) while playing, and pauses the rAF loop when hidden or paused
  * (PRD §7.7, rules §12).
  */
-export function SeekBar({ compact = false }: { compact?: boolean }) {
+export function SeekBar({ compact = false, stackedLabels = false }: { compact?: boolean; stackedLabels?: boolean }) {
   const durationMs = usePlaybackStore((state) => state.durationMs);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const seek = usePlaybackStore((state) => state.seek);
@@ -140,7 +140,9 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
       aria-valuetext={`${formatClock(effectiveMs)} of ${formatClock(durationMs)}`}
       aria-disabled={disabled}
       tabIndex={disabled ? -1 : 0}
-      className={`group relative cursor-pointer touch-none ${compact ? "h-5 flex-1" : "h-6 w-full"}`}
+      className={`group relative cursor-pointer touch-none ${
+        stackedLabels ? "h-6 w-full" : compact ? "h-5 flex-1" : "h-6 flex-1"
+      }`}
       style={{ contain: "layout style" }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -158,12 +160,18 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
         }
       }}
     >
-      <div className={`absolute inset-x-0 top-1/2 -translate-y-1/2 rounded-full bg-surface-hover ${compact ? "h-1.5" : "h-1"}`} />
+      <div
+        className={`absolute inset-x-0 top-1/2 -translate-y-1/2 rounded-full bg-surface-hover ${
+          stackedLabels ? "h-1" : "h-1.5"
+        }`}
+      />
       {/* Fill uses scaleX: GPU-composited, perfectly in sync with the rAF
           clock, and immune to width-transition lag on resume/seek jumps. */}
       <div
         ref={fillRef}
-        className={`absolute left-0 top-1/2 w-full -translate-y-1/2 origin-left rounded-full bg-accent ${compact ? "h-1.5" : "h-1"}`}
+        className={`absolute left-0 top-1/2 w-full -translate-y-1/2 origin-left rounded-full bg-accent ${
+          stackedLabels ? "h-1" : "h-1.5"
+        }`}
         style={{ transform: `scaleX(${safeFraction})`, willChange: "transform" }}
       />
       <div
@@ -175,7 +183,7 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
           className={`size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent shadow-sm transition-[opacity,transform] duration-150 ${
             scrubMs !== null
               ? "scale-110 opacity-100"
-              : !compact || isPlaying
+              : stackedLabels || isPlaying
                 ? "opacity-100"
                 : "opacity-0 scale-90 group-hover:scale-105 group-hover:opacity-100"
           }`}
@@ -184,27 +192,30 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
     </div>
   );
 
-  if (compact) {
+  if (stackedLabels) {
     return (
-      <div className="flex w-full items-center gap-2">
-        <span ref={timeLabelRef} className="w-9 text-[11px] tabular-nums text-text-muted">
-          {formatClock(effectiveMs)}
-        </span>
+      <div className="flex w-full flex-col">
         {slider}
-        <span className="w-9 text-right text-[11px] tabular-nums text-text-muted">
-          {formatClock(durationMs)}
-        </span>
+        <div className="-mt-0.5 flex w-full items-center justify-between text-xs font-medium tabular-nums text-text-muted">
+          <span ref={timeLabelRef}>{formatClock(effectiveMs)}</span>
+          <span>{formatClock(durationMs)}</span>
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="flex w-full flex-col">
+    <div className={`flex w-full items-center ${compact ? "gap-2" : "gap-3"}`}>
+      <span
+        ref={timeLabelRef}
+        className={`tabular-nums text-text-muted ${compact ? "w-9 text-[11px]" : "w-11 text-xs"}`}
+      >
+        {formatClock(effectiveMs)}
+      </span>
       {slider}
-      <div className="-mt-0.5 flex w-full items-center justify-between text-xs font-medium tabular-nums text-text-muted">
-        <span ref={timeLabelRef}>{formatClock(effectiveMs)}</span>
-        <span>{formatClock(durationMs)}</span>
-      </div>
+      <span className={`tabular-nums text-text-muted ${compact ? "w-9 text-right text-[11px]" : "w-11 text-right text-xs"}`}>
+        {formatClock(durationMs)}
+      </span>
     </div>
   );
 }

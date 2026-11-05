@@ -170,8 +170,6 @@ export type AppPreferences = {
   repeatMode: RepeatMode;
   reducedMotion: ReducedMotionSetting;
   artworkTint: boolean;
-  /** Show subtle animated water droplets in the Now Playing background. */
-  ambientRainDrops: boolean;
   lyricsStyle: "line" | "word";
   lyricFontSize: "sm" | "md" | "lg";
   lyricAlignment: "left" | "center";

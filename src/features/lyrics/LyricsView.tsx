@@ -25,6 +25,12 @@ import { LyricsOffsetControls } from "./LyricsOffsetControls";
 const AmllLyricPlayer = lazy(() => import("./AmllLyricPlayer"));
 
 const FONT_SIZES = {
+  sm: "clamp(1.1rem, 2.6vw, 1.6rem)",
+  md: "clamp(1.35rem, 3.2vw, 2.1rem)",
+  lg: "clamp(1.6rem, 3.8vw, 2.7rem)",
+} as const;
+
+const MOBILE_FONT_SIZES = {
   sm: "clamp(1.5rem, 6.8vw, 2.15rem)",
   md: "clamp(1.75rem, 8.5vw, 2.5rem)",
   lg: "clamp(2rem, 9.6vw, 2.75rem)",
@@ -39,7 +45,7 @@ const FOLLOW_TRANSITION = "transform 360ms cubic-bezier(0.22, 1, 0.36, 1)";
  * and stalls can never make lyrics drift on an independent clock. Plain and
  * instrumental results keep this view's own static UI.
  */
-export function LyricsView() {
+export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const playbackStatus = usePlaybackStore((state) => state.status);
   const track = useTrackById(currentTrackId);
@@ -520,7 +526,7 @@ export function LyricsView() {
               lines={amllLines}
               offsetMs={lyrics.offsetMs}
               isPlaying={isPlaying}
-              fontSize={FONT_SIZES[lyricFontSize]}
+              fontSize={(mobile ? MOBILE_FONT_SIZES : FONT_SIZES)[lyricFontSize]}
               onSeek={seekToAudioMs}
             />
           </Suspense>
@@ -567,7 +573,7 @@ export function LyricsView() {
             }}
           >
             {lyrics.lines.map((line, index) => (
-              <LyricLineItem key={index} line={line} fontSize={FONT_SIZES[lyricFontSize]} />
+              <LyricLineItem key={index} line={line} fontSize={(mobile ? MOBILE_FONT_SIZES : FONT_SIZES)[lyricFontSize]} />
             ))}
           </div>
           <div
