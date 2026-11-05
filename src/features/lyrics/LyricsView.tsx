@@ -25,9 +25,9 @@ import { LyricsOffsetControls } from "./LyricsOffsetControls";
 const AmllLyricPlayer = lazy(() => import("./AmllLyricPlayer"));
 
 const FONT_SIZES = {
-  sm: "clamp(1.1rem, 2.6vw, 1.6rem)",
-  md: "clamp(1.35rem, 3.2vw, 2.1rem)",
-  lg: "clamp(1.6rem, 3.8vw, 2.7rem)",
+  sm: "clamp(1.5rem, 6.8vw, 2.15rem)",
+  md: "clamp(1.75rem, 8.5vw, 2.5rem)",
+  lg: "clamp(2rem, 9.6vw, 2.75rem)",
 } as const;
 
 const FOLLOW_TRANSITION = "transform 360ms cubic-bezier(0.22, 1, 0.36, 1)";

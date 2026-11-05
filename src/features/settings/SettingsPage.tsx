@@ -21,6 +21,7 @@ import { SegmentedControl } from "../../components/SegmentedControl";
 import { Select, type SelectOption } from "../../components/Select";
 import { CloudAccountSection } from "./CloudAccountSection";
 import { CloudMigrationSection } from "./CloudMigrationSection";
+import { LibraryMetadataSection } from "./LibraryMetadataSection";
 
 const REDUCED_MOTION_OPTIONS: SelectOption[] = [
   { value: "system", label: "Follow system" },
@@ -313,6 +314,8 @@ export function SettingsPage() {
       </Section>
 
       <CloudAccountSection />
+
+      <LibraryMetadataSection />
 
       <Section title="Backup">
         <p className="px-1 text-sm text-text-secondary">

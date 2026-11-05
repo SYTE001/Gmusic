@@ -1,4 +1,4 @@
-import type { AppPreferences, LyricsCacheMeta, Playlist, Track, TrackLyrics } from "../../types";
+import type { AppPreferences, LyricsCacheMeta, PendingMetadataSync, Playlist, Track, TrackLyrics } from "../../types";
 import { requestToPromise, STORES, toDBError, withTransaction } from "./db";
 
 /**
@@ -10,6 +10,7 @@ export type ArtworkRecord = { trackId: string; blob: Blob };
 export type AudioRecord = { trackId: string; blob: Blob };
 export type HandleRecord = { trackId: string; handle: FileSystemFileHandle };
 export type PrefsRecord = { name: "app"; prefs: AppPreferences };
+export type { PendingMetadataSync };
 
 /**
  * A cloud deletion whose object or metadata removal failed midway. Kept here
@@ -26,6 +27,7 @@ export type PendingCloudDeletion = {
 };
 
 type PendingDeletionsRecord = { name: "cloud-deletions"; items: PendingCloudDeletion[] };
+type PendingMetadataSyncRecord = { name: "pending-metadata-sync"; items: PendingMetadataSync[] };
 
 export class LibraryRepository {
   // ---- Tracks ----
@@ -108,6 +110,9 @@ export class LibraryRepository {
         }
       },
     );
+    for (const id of ids) {
+      await this.removePendingMetadataSync(id).catch(() => undefined);
+    }
   }
 
   // ---- Artwork / audio blobs / file handles ----
@@ -274,6 +279,36 @@ export class LibraryRepository {
       const record = await requestToPromise(store.get("cloud-deletions") as IDBRequest<PendingDeletionsRecord | undefined>);
       if (!record) return;
       store.put({ name: "cloud-deletions", items: record.items.filter((entry) => entry.trackId !== trackId) });
+    });
+  }
+
+  // ---- Pending metadata synchronization ----
+
+  async listPendingMetadataSync(): Promise<PendingMetadataSync[]> {
+    return withTransaction([STORES.prefs], "readonly", async (tx) => {
+      const record = await requestToPromise(
+        tx.objectStore(STORES.prefs).get("pending-metadata-sync") as IDBRequest<PendingMetadataSyncRecord | undefined>,
+      );
+      return record?.items ?? [];
+    });
+  }
+
+  async putPendingMetadataSync(item: PendingMetadataSync): Promise<void> {
+    await withTransaction([STORES.prefs], "readwrite", async (tx) => {
+      const store = tx.objectStore(STORES.prefs);
+      const record = (await requestToPromise(store.get("pending-metadata-sync") as IDBRequest<PendingMetadataSyncRecord | undefined>))
+        ?? { name: "pending-metadata-sync" as const, items: [] };
+      const others = record.items.filter((entry) => entry.trackId !== item.trackId);
+      store.put({ name: "pending-metadata-sync", items: [...others, item] });
+    });
+  }
+
+  async removePendingMetadataSync(trackId: string): Promise<void> {
+    await withTransaction([STORES.prefs], "readwrite", async (tx) => {
+      const store = tx.objectStore(STORES.prefs);
+      const record = await requestToPromise(store.get("pending-metadata-sync") as IDBRequest<PendingMetadataSyncRecord | undefined>);
+      if (!record) return;
+      store.put({ name: "pending-metadata-sync", items: record.items.filter((entry) => entry.trackId !== trackId) });
     });
   }
 

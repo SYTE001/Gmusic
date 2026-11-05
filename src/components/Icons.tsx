@@ -411,3 +411,14 @@ export function RefreshIcon({ size, ...props }: IconProps) {
     </svg>
   );
 }
+
+export function ShareIcon({ size, ...props }: IconProps) {
+  return (
+    <svg {...base(size, props)}>
+      <circle cx="18" cy="5" r="2.5" />
+      <circle cx="6" cy="12" r="2.5" />
+      <circle cx="18" cy="19" r="2.5" />
+      <path d="M8.3 10.7l7.4-4.4M8.3 13.3l7.4 4.4" />
+    </svg>
+  );
+}

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
+import { MiniPlayer } from "../../components/MiniPlayer";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import {
@@ -64,6 +65,8 @@ describe("NowPlayingPage component", () => {
       repeatMode: "off",
       currentTimeMs: 30000,
       durationMs: 180000,
+      queueTrackIds: ["track-1"],
+      queueIndex: 0,
     });
   });
 
@@ -77,6 +80,21 @@ describe("NowPlayingPage component", () => {
 
     expect(screen.getByText(/Nothing is playing/i)).toBeTruthy();
     expect(screen.getByRole("link", { name: /Pick a song/i })).toBeTruthy();
+  });
+
+  it("opens Now Playing from MiniPlayer without restarting or resetting playback position", () => {
+    render(
+      <MemoryRouter>
+        <MiniPlayer onToggleQueue={() => undefined} queueOpen={false} />
+      </MemoryRouter>,
+    );
+
+    const openBtn = screen.getByRole("button", { name: "Open Now Playing" });
+    fireEvent.click(openBtn);
+
+    expect(mockNavigate).toHaveBeenCalledWith("/now-playing");
+    expect(usePlaybackStore.getState().currentTimeMs).toBe(30000);
+    expect(usePlaybackStore.getState().isPlaying).toBe(true);
   });
 
   it("mounts with untouched bg-app-bg on root container in Stage 1 (album only)", () => {
@@ -203,29 +221,151 @@ describe("NowPlayingPage component", () => {
     expect(container.querySelectorAll(".lyrics-bg-blob").length).toBe(0);
   });
 
-  it("renders track title, artist, artwork, and playback controls", () => {
+  it("renders track title, artist, artwork, and playback controls in Now Playing mode", () => {
     render(
-      <MemoryRouter>
+      <MemoryRouter initialEntries={["/now-playing"]}>
         <NowPlayingPage />
       </MemoryRouter>,
     );
 
     expect(screen.getByRole("heading", { name: "Test Song" })).toBeTruthy();
     expect(screen.getByText("Test Artist")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Close Now Playing" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "More options" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Add to liked songs" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Seek" })).toBeTruthy();
+    expect(screen.getByText("0:30")).toBeTruthy();
+    expect(screen.getByText("3:00")).toBeTruthy();
     expect(screen.getByRole("button", { name: /Pause/i })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Previous track" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Next track" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Enable shuffle" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Enable repeat all" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Show lyrics" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open queue" })).toBeTruthy();
   });
 
-  it("navigates back when Escape key is pressed", () => {
+  it("wires playback controls, favorite, seek bar, queue, and overflow Share action in Now Playing mode", () => {
+    const togglePlay = vi.fn();
+    const previous = vi.fn();
+    const next = vi.fn();
+    const toggleShuffle = vi.fn();
+    const cycleRepeat = vi.fn();
+    const seek = vi.fn();
+    const toggleLike = vi.fn().mockResolvedValue(undefined);
+
+    usePlaybackStore.setState({
+      togglePlay,
+      previous,
+      next,
+      toggleShuffle,
+      cycleRepeat,
+      seek,
+    });
+    useLibraryStore.setState({ toggleLike });
+
     render(
-      <MemoryRouter>
+      <MemoryRouter initialEntries={["/now-playing"]}>
         <NowPlayingPage />
       </MemoryRouter>,
     );
 
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    expect(togglePlay).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous track" }));
+    expect(previous).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next track" }));
+    expect(next).toHaveBeenCalledWith(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Enable shuffle" }));
+    expect(toggleShuffle).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Enable repeat all" }));
+    expect(cycleRepeat).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Add to liked songs" }));
+    expect(toggleLike).toHaveBeenCalledWith("track-1");
+
+    // Seek via pointer down + up on the SeekBar slider
+    const slider = screen.getByRole("slider", { name: "Seek" });
+    fireEvent(slider, Object.assign(new Event("pointerdown", { bubbles: true }), { clientX: 100, pointerId: 1 }));
+    fireEvent(slider, Object.assign(new Event("pointerup", { bubbles: true }), { clientX: 100, pointerId: 1 }));
+    expect(seek).toHaveBeenCalledWith(90000);
+
+    // Open overflow menu and verify Share is inside the menu (not standalone on the bottom bar)
+    fireEvent.click(screen.getByRole("button", { name: "More options" }));
+    const shareItem = screen.getByRole("menuitem", { name: "Share" });
+    expect(shareItem).toBeTruthy();
+    fireEvent.click(shareItem);
+
+    // Open queue panel
+    fireEvent.click(screen.getByRole("button", { name: "Open queue" }));
+    expect(screen.getByRole("complementary", { name: "Play queue" })).toBeTruthy();
+  });
+
+  it("transitions between Now Playing and Fullscreen Lyrics modes while hiding extra controls and preserving playback", () => {
+    const togglePlay = vi.fn();
+    usePlaybackStore.setState({ togglePlay });
+
+    render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    // Click bottom-center Lyrics button -> transitions to Fullscreen Lyrics
+    fireEvent.click(screen.getByRole("button", { name: "Show lyrics" }));
+
+    const root = screen.getByRole("region", { name: "Now playing" });
+    expect(root.getAttribute("data-stage")).toBe("lyrics");
+
+    // Header has downward chevron ("Hide lyrics") and centered track title + artist
+    expect(screen.getByRole("button", { name: "Hide lyrics" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Test Song" })).toBeTruthy();
+    expect(screen.getByText("Test Artist")).toBeTruthy();
+
+    // Retains only progress bar (with elapsed & duration) and central Play/Pause button
+    expect(screen.getByRole("slider", { name: "Seek" })).toBeTruthy();
+    expect(screen.getByText("0:30")).toBeTruthy();
+    expect(screen.getByText("3:00")).toBeTruthy();
+    const pauseBtn = screen.getByRole("button", { name: "Pause" });
+    expect(pauseBtn).toBeTruthy();
+    fireEvent.click(pauseBtn);
+    expect(togglePlay).toHaveBeenCalledTimes(1);
+
+    // Hides artwork, favorite, shuffle, previous/next, repeat, queue, and three-dot menu in Fullscreen Lyrics mode
+    expect(screen.queryByRole("button", { name: "More options" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Add to liked songs" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Enable shuffle" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Previous track" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Next track" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Enable repeat all" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open queue" })).toBeNull();
+    expect(screen.queryByAltText("Test Song artwork")).toBeNull();
+
+    // Clicking downward chevron returns to Now Playing without interrupting playback
+    fireEvent.click(screen.getByRole("button", { name: "Hide lyrics" }));
+    expect(root.getAttribute("data-stage")).toBe("album");
+    expect(screen.getByRole("button", { name: "Show lyrics" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Previous track" })).toBeTruthy();
+    expect(usePlaybackStore.getState().currentTimeMs).toBe(30000);
+    expect(usePlaybackStore.getState().isPlaying).toBe(true);
+  });
+
+  it("closes Now Playing with X button or Escape key without stopping playback", () => {
+    render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Now Playing" }));
+    expect(mockNavigate).toHaveBeenCalledWith(-1);
+    expect(usePlaybackStore.getState().isPlaying).toBe(true);
+
+    mockNavigate.mockClear();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(mockNavigate).toHaveBeenCalledWith(-1);
   });

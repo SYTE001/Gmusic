@@ -24,6 +24,7 @@ import { useSettingsStore } from "./settingsStore";
 import { toast } from "./toastStore";
 import { bindLyricsTrackLookup, useLyricsStore } from "./lyricsStore";
 import { currentAuthState } from "../services/cloud/cloudAuthService";
+import { syncTrackMetadata } from "../services/cloud/cloudMetadataSyncService";
 import { removeTrackFromCloud } from "../services/cloud/cloudDeletionService";
 import { getPlayUrl, invalidatePlayUrl } from "../services/cloud/r2StorageService";
 import { releaseActiveTrackSource } from "../services/file-access/FileAccessService";
@@ -73,6 +74,10 @@ type LibraryState = {
   restoreBrokenTrack: (trackId: string) => Promise<void>;
   /** Downloads and stores a local copy of a cloud track (explicit action). */
   keepLocalCopyFromCloud: (trackId: string) => Promise<void>;
+  updateTrackMetadata: (
+    trackId: string,
+    metadata: { title: string; description: string },
+  ) => Promise<{ syncStatus: "synced" | "queued" | "local"; error?: string }>;
 };
 
 function sessionPayload(): ReturnType<typeof savePlaybackSession> | null {
@@ -624,6 +629,52 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     });
   },
 
+  updateTrackMetadata: async (trackId, metadata) => {
+    const track = get().tracks.find((item) => item.id === trackId);
+    if (!track) {
+      throw new Error("Track not found.");
+    }
+    const cleanTitle = metadata.title.trim();
+    if (!cleanTitle) {
+      throw new Error("Track title cannot be empty.");
+    }
+    const cleanDescription = metadata.description.trim();
+    const now = Date.now();
+    const patch: Partial<Track> = {
+      title: cleanTitle,
+      description: cleanDescription,
+      updatedAt: now,
+    };
+
+    // 1. Save locally in IndexedDB first
+    await repository.updateTrack(trackId, patch);
+    const updatedTrack: Track = { ...track, ...patch };
+    set({
+      tracks: get().tracks.map((item) => (item.id === trackId ? updatedTrack : item)),
+    });
+
+    // 2. Check cloud sync
+    const auth = await currentAuthState().catch(() => ({ status: "anonymous" as const }));
+    if (auth.status !== "authenticated") {
+      return { syncStatus: "local" };
+    }
+
+    // 3. Attempt cloud sync
+    try {
+      await syncTrackMetadata(updatedTrack);
+      const syncedPatch: Partial<Track> = { lastSyncedAt: Date.now() };
+      await repository.updateTrack(trackId, syncedPatch);
+      set({
+        tracks: get().tracks.map((item) => (item.id === trackId ? { ...item, ...syncedPatch } : item)),
+      });
+      return { syncStatus: "synced" };
+    } catch (error) {
+      // Sync failed; syncTrackMetadata has queued it for retry
+      const message = error instanceof Error ? error.message : "Sync failed";
+      return { syncStatus: "queued", error: message };
+    }
+  },
+
   restoreBrokenTrack: async (trackId) => {
     const track = get().tracks.find((item) => item.id === trackId);
     if (!track) return;
@@ -666,7 +717,8 @@ export function useTrackById(trackId: string | null): Track | null {
       prev.availability === found.availability &&
       prev.accessMode === found.accessMode &&
       prev.objectKey === found.objectKey &&
-      prev.cloudStatus === found.cloudStatus
+      prev.cloudStatus === found.cloudStatus &&
+      prev.description === found.description
     ) {
       return prev;
     }

@@ -13,7 +13,7 @@ export type LyricLineItemProps = {
 export const LyricLineItem = React.memo(function LyricLineItem({ line, fontSize }: LyricLineItemProps) {
   return (
     <p
-      className="px-2 text-[0.92em] font-normal"
+      className="px-1 font-semibold leading-[1.35] break-words"
       style={{
         fontSize,
         color: "var(--lyric-inactive, var(--text-secondary))",

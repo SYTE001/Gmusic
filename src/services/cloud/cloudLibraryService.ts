@@ -32,6 +32,8 @@ export type CloudTrackRow = {
   last_played_at: string | null;
   added_at: string | null;
   last_synced_at: string | null;
+  description?: string;
+  updated_at?: string | null;
 };
 
 export type CloudPlaylistRow = {
@@ -221,6 +223,8 @@ export function trackToRow(track: Track, userId = ""): CloudTrackRow {
     last_played_at: toIso(track.lastPlayedAt),
     added_at: toIso(track.addedAt),
     last_synced_at: toIso(track.lastSyncedAt),
+    description: sanitizeTextForDatabase(track.description ?? ""),
+    updated_at: toIso(track.updatedAt),
   };
 }
 
@@ -251,6 +255,8 @@ export function rowToTrack(row: CloudTrackRow): Track {
     storageProvider: row.object_key ? "r2" : null,
     cloudStatus: row.object_key ? "ready" : "local",
     lastSyncedAt: fromIso(row.last_synced_at),
+    description: row.description ?? "",
+    updatedAt: fromIso(row.updated_at) ?? undefined,
   };
 }
 

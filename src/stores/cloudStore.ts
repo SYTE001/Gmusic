@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { registerCloudSyncCallback, useLibraryStore } from "./libraryStore";
 import { removeTrackFromCloud, retryPendingCloudDeletions } from "../services/cloud/cloudDeletionService";
-export { removeTrackFromCloud, retryPendingCloudDeletions };
+import { retryPendingMetadataSync } from "../services/cloud/cloudMetadataSyncService";
+export { removeTrackFromCloud, retryPendingCloudDeletions, retryPendingMetadataSync };
 import type { Playlist, Track, TrackLyrics } from "../types";
 import { repository } from "../services/indexeddb/LibraryRepository";
 import { toast } from "./toastStore";
@@ -89,8 +90,16 @@ export function mergeCloudIntoLocal(localTracks: Track[], cloudTracks: Track[]):
       // Keep the local copy plugged into the same cloud object; metadata the
       // user already has locally (e.g. an edited title) wins unless the local
       // track was never synced.
+      const cloudUpdated = cloud.updatedAt ?? cloud.lastSyncedAt ?? 0;
+      const localUpdated = byIdMatch.updatedAt ?? byIdMatch.lastSyncedAt ?? 0;
+      const preferCloud = cloudUpdated > localUpdated;
+
       byId.set(cloud.id, {
         ...byIdMatch,
+        title: preferCloud ? cloud.title : byIdMatch.title,
+        description: preferCloud ? (cloud.description ?? "") : (byIdMatch.description ?? ""),
+        updatedAt: Math.max(localUpdated, cloudUpdated) || undefined,
+
         objectKey: cloud.objectKey ?? byIdMatch.objectKey ?? null,
         artworkObjectKey: cloud.artworkObjectKey ?? byIdMatch.artworkObjectKey ?? null,
         storageProvider: cloud.objectKey ? "r2" : byIdMatch.storageProvider ?? null,
@@ -249,6 +258,18 @@ export const useCloudStore = create<CloudState>((set, get) => ({
         if (lyrics) localLyricsList.push(lyrics);
       }
       await upsertCloudLyrics(localLyricsList);
+
+      try {
+        const pendingMetadata = await retryPendingMetadataSync();
+        if (pendingMetadata.remaining > 0) {
+          toast(
+            "info",
+            `${pendingMetadata.remaining} metadata change${pendingMetadata.remaining === 1 ? "" : "s"} still syncing — it will be retried on the next sync.`,
+          );
+        }
+      } catch {
+        // Sweeping is best-effort
+      }
 
       // Finish any cloud deletion that a previous run had to leave halfway;
       // entries only drop out once their objects AND metadata are both gone.

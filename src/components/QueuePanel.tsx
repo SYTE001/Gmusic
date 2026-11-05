@@ -15,7 +15,15 @@ const EMPTY_QUEUE_IDS: string[] = [];
  * remove items, clear upcoming. The current track is clearly distinguished
  * (PRD §7.9). Playback continues while the panel is open.
  */
-export function QueuePanel({ open, onClose }: { open: boolean; onClose: () => void }) {
+export function QueuePanel({
+  open,
+  onClose,
+  dockedBottom = false,
+}: {
+  open: boolean;
+  onClose: () => void;
+  dockedBottom?: boolean;
+}) {
   recordComponentRender("QueuePanel");
   const tracks = useLibraryStore((state) => (open ? state.tracks : EMPTY_TRACKS));
   const queueTrackIds = usePlaybackStore((state) => (open ? state.queueTrackIds : EMPTY_QUEUE_IDS));
@@ -45,7 +53,9 @@ export function QueuePanel({ open, onClose }: { open: boolean; onClose: () => vo
   return (
     <aside
       aria-label="Play queue"
-      className="fixed inset-x-0 bottom-[157px] z-30 flex max-h-[70vh] flex-col border-t bg-surface animate-panel-up md:inset-y-0 md:left-auto md:right-0 md:bottom-0 md:w-[360px] md:border-l md:border-t-0 md:animate-panel-right"
+      className={`fixed inset-x-0 ${
+        dockedBottom ? "bottom-0 z-50" : "bottom-[157px] z-30"
+      } flex max-h-[70vh] flex-col border-t bg-surface animate-panel-up md:inset-y-0 md:left-auto md:right-0 md:bottom-0 md:w-[360px] md:border-l md:border-t-0 md:animate-panel-right`}
       style={{ borderColor: "var(--border-subtle)" }}
     >
       <div className="flex items-center justify-between px-4 py-3.5">

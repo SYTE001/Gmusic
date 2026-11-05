@@ -170,6 +170,7 @@ function normalizeTrack(track: Track, hasHandle: boolean, hasStoredCopy: boolean
     ...track,
     artist: str(track.artist, "Unknown Artist"),
     album: str(track.album, ""),
+    description: str(track.description, ""),
     trackNumber: numOrNull(track.trackNumber),
     albumTrackCount: numOrNull(track.albumTrackCount),
     durationMs: numOrNull(track.durationMs),

@@ -76,6 +76,10 @@ export type Track = {
   metadataFromFilename: boolean;
   /** Broken status details if playback permanently failed. */
   broken?: BrokenInfo | null;
+  /** Optional user-editable description or personal notes for this track. */
+  description?: string;
+  /** Epoch ms when this track's metadata was last modified locally. */
+  updatedAt?: number;
 
   // ---- Cloud fields (all optional: every pre-existing record is a valid cloud-less record) ----
 
@@ -200,6 +204,14 @@ export type ImportOutcome = {
   newTracks?: Track[];
   /** The updated Track records. */
   updatedTracks?: Track[];
+};
+
+export type PendingMetadataSync = {
+  trackId: string;
+  title: string;
+  description: string;
+  queuedAt: number;
+  lastError?: string;
 };
 
 export const APP_NAME = "Gmusic";

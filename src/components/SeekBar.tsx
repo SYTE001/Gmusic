@@ -58,8 +58,8 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
   useEffect(() => {
     lastSecRef.current = -1;
     lastFracRef.current = -1;
+    applyVisualPosition(usePlaybackStore.getState().currentTimeMs, true);
     if (!isPlaying) {
-      applyVisualPosition(usePlaybackStore.getState().currentTimeMs, true);
       return;
     }
     let frame = 0;
@@ -92,7 +92,9 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
       const bar = barRef.current;
       if (!bar || durationMs === null) return 0;
       const rect = bar.getBoundingClientRect();
-      const fraction = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      const width = rect.width > 0 ? rect.width : 200;
+      const safeX = Number.isFinite(clientX) ? clientX : rect.left;
+      const fraction = Math.min(1, Math.max(0, (safeX - rect.left) / width));
       return fraction * durationMs;
     },
     [durationMs],
@@ -106,7 +108,7 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
     const next = positionFromEvent(event.clientX);
     setScrubMs(next);
     applyVisualPosition(next, true);
-    (event.target as HTMLElement).setPointerCapture(event.pointerId);
+    (event.target as HTMLElement).setPointerCapture?.(event.pointerId);
   };
   const onPointerMove = (event: React.PointerEvent) => {
     if (!scrubbingRef.current || disabled) return;
@@ -123,73 +125,86 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
     applyVisualPosition(target, true);
   };
 
-  const effectiveMs = scrubMs ?? 0;
+  const effectiveMs = scrubMs ?? usePlaybackStore.getState().currentTimeMs;
   const fraction = durationMs ? Math.min(1, Math.max(0, effectiveMs / durationMs)) : 0;
   const safeFraction = Number.isFinite(fraction) ? fraction : 0;
 
-  return (
-    <div className={`flex w-full items-center ${compact ? "gap-2" : "gap-3"}`}>
-      <span
-        ref={timeLabelRef}
-        className={`tabular-nums text-text-muted ${compact ? "w-9 text-[11px]" : "w-11 text-xs"}`}
-      >
-        {formatClock(effectiveMs)}
-      </span>
+  const slider = (
+    <div
+      ref={barRef}
+      role="slider"
+      aria-label="Seek"
+      aria-valuemin={0}
+      aria-valuemax={durationMs ? Math.round(durationMs / 1000) : 0}
+      aria-valuenow={Math.round(effectiveMs / 1000)}
+      aria-valuetext={`${formatClock(effectiveMs)} of ${formatClock(durationMs)}`}
+      aria-disabled={disabled}
+      tabIndex={disabled ? -1 : 0}
+      className={`group relative cursor-pointer touch-none ${compact ? "h-5 flex-1" : "h-6 w-full"}`}
+      style={{ contain: "layout style" }}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onKeyDown={(event) => {
+        if (disabled) return;
+        if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+          event.preventDefault();
+          const direction = event.key === "ArrowRight" ? 1 : -1;
+          usePlaybackStore.getState().seekBy(direction * 5000);
+        } else if (event.key === "Home") {
+          seek(0);
+        } else if (event.key === "End" && durationMs) {
+          seek(durationMs - 500);
+        }
+      }}
+    >
+      <div className={`absolute inset-x-0 top-1/2 -translate-y-1/2 rounded-full bg-surface-hover ${compact ? "h-1.5" : "h-1"}`} />
+      {/* Fill uses scaleX: GPU-composited, perfectly in sync with the rAF
+          clock, and immune to width-transition lag on resume/seek jumps. */}
       <div
-        ref={barRef}
-        role="slider"
-        aria-label="Seek"
-        aria-valuemin={0}
-        aria-valuemax={durationMs ? Math.round(durationMs / 1000) : 0}
-        aria-valuenow={Math.round(effectiveMs / 1000)}
-        aria-valuetext={`${formatClock(effectiveMs)} of ${formatClock(durationMs)}`}
-        aria-disabled={disabled}
-        tabIndex={disabled ? -1 : 0}
-        className="group relative h-5 flex-1 cursor-pointer touch-none"
-        style={{ contain: "layout style" }}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onKeyDown={(event) => {
-          if (disabled) return;
-          if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
-            event.preventDefault();
-            const direction = event.key === "ArrowRight" ? 1 : -1;
-            usePlaybackStore.getState().seekBy(direction * 5000);
-          } else if (event.key === "Home") {
-            seek(0);
-          } else if (event.key === "End" && durationMs) {
-            seek(durationMs - 500);
-          }
-        }}
+        ref={fillRef}
+        className={`absolute left-0 top-1/2 w-full -translate-y-1/2 origin-left rounded-full bg-accent ${compact ? "h-1.5" : "h-1"}`}
+        style={{ transform: `scaleX(${safeFraction})`, willChange: "transform" }}
+      />
+      <div
+        ref={thumbRef}
+        className="pointer-events-none absolute inset-x-0 top-1/2"
+        style={{ transform: `translate3d(${safeFraction * 100}%, 0, 0)`, willChange: "transform" }}
       >
-        <div className="absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-surface-hover" />
-        {/* Fill uses scaleX: GPU-composited, perfectly in sync with the rAF
-            clock, and immune to width-transition lag on resume/seek jumps. */}
         <div
-          ref={fillRef}
-          className="absolute left-0 top-1/2 h-1.5 w-full -translate-y-1/2 origin-left rounded-full bg-accent"
-          style={{ transform: `scaleX(${safeFraction})`, willChange: "transform" }}
+          className={`size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent shadow-sm transition-[opacity,transform] duration-150 ${
+            scrubMs !== null
+              ? "scale-110 opacity-100"
+              : !compact || isPlaying
+                ? "opacity-100"
+                : "opacity-0 scale-90 group-hover:scale-105 group-hover:opacity-100"
+          }`}
         />
-        <div
-          ref={thumbRef}
-          className="pointer-events-none absolute inset-x-0 top-1/2"
-          style={{ transform: `translate3d(${safeFraction * 100}%, 0, 0)`, willChange: "transform" }}
-        >
-          <div
-            className={`size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent shadow-sm transition-[opacity,transform] duration-150 ${
-              scrubMs !== null
-                ? "scale-110 opacity-100"
-                : isPlaying
-                  ? "opacity-100"
-                  : "opacity-0 scale-90 group-hover:scale-105 group-hover:opacity-100"
-            }`}
-          />
-        </div>
       </div>
-      <span className={`tabular-nums text-text-muted ${compact ? "w-9 text-right text-[11px]" : "w-11 text-right text-xs"}`}>
-        {formatClock(durationMs)}
-      </span>
+    </div>
+  );
+
+  if (compact) {
+    return (
+      <div className="flex w-full items-center gap-2">
+        <span ref={timeLabelRef} className="w-9 text-[11px] tabular-nums text-text-muted">
+          {formatClock(effectiveMs)}
+        </span>
+        {slider}
+        <span className="w-9 text-right text-[11px] tabular-nums text-text-muted">
+          {formatClock(durationMs)}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex w-full flex-col">
+      {slider}
+      <div className="-mt-0.5 flex w-full items-center justify-between text-xs font-medium tabular-nums text-text-muted">
+        <span ref={timeLabelRef}>{formatClock(effectiveMs)}</span>
+        <span>{formatClock(durationMs)}</span>
+      </div>
     </div>
   );
 }
