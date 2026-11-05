@@ -27,6 +27,7 @@ import { currentAuthState } from "../services/cloud/cloudAuthService";
 import { removeTrackFromCloud } from "../services/cloud/cloudDeletionService";
 import { getPlayUrl, invalidatePlayUrl } from "../services/cloud/r2StorageService";
 import { releaseActiveTrackSource } from "../services/file-access/FileAccessService";
+import { requestPersistentStorage } from "../services/offline/offlineService";
 import { perfMark, perfMeasure } from "../utils/perf";
 
 export type LibraryStatus = "loading" | "ready" | "error";
@@ -346,6 +347,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
         onProgress: (progress) => set({ importProgress: progress }),
       });
       if (outcome.added > 0 || (outcome.updated && outcome.updated > 0)) {
+        requestPersistentStorage();
         const fresh = await repository.listTracks();
         set({ tracks: fresh });
         if (outcome.newTracks && outcome.newTracks.length > 0) {

@@ -39,6 +39,13 @@ const putAudioBlob = vi.fn(async (id: string, blob: Blob) => {
 vi.mock("../indexeddb/LibraryRepository", () => ({
   repository: {
     putTracks: (...args: unknown[]) => putTracks(...(args as [Track[]])),
+    // Mirrors the real all-or-nothing write: files first, the track only if they succeeded.
+    putTrackWithFiles: async (track: Track, files: { artwork?: Blob; handle?: FileSystemFileHandle; audio?: Blob }) => {
+      if (files.artwork) await putArtwork(track.id, files.artwork);
+      if (files.handle) await putHandle(track.id, files.handle);
+      if (files.audio) await putAudioBlob(track.id, files.audio);
+      await putTracks([track]);
+    },
     putArtwork: (...args: unknown[]) => putArtwork(...(args as [string, Blob])),
     putHandle: (...args: unknown[]) => putHandle(...(args as [string, FileSystemFileHandle])),
     putAudioBlob: (...args: unknown[]) => putAudioBlob(...(args as [string, Blob])),

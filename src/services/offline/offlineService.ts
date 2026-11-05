@@ -45,3 +45,22 @@ export function registerServiceWorker(): void {
     })
     .catch(() => setStatus("failed"));
 }
+
+let persistRequested = false;
+
+/**
+ * Asks the browser once per session not to evict this app's IndexedDB data
+ * (file handles, stored copies, library). Best effort: a refusal changes
+ * nothing, and it is requested only after the user actually has data to lose.
+ */
+export function requestPersistentStorage(): void {
+  if (persistRequested) return;
+  if (typeof navigator === "undefined" || typeof navigator.storage?.persist !== "function") return;
+  persistRequested = true;
+  void navigator.storage.persist().catch(() => undefined);
+}
+
+/** Test hook: lets a test observe the once-per-session request again. */
+export function resetPersistentStorageRequest(): void {
+  persistRequested = false;
+}

@@ -482,33 +482,6 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           matchedTrack.availability === "offline";
 
         if (comparison.hasImprovement || needsRelink) {
-          // Safe audio replacement: do not overwrite track if audio replacement fails
-          let audioUpdateSucceeded = true;
-          try {
-            if (isHandle) {
-              await repository.putHandle(matchedTrack.id, item as FileSystemFileHandle);
-            } else if (options.storeCopies) {
-              await repository.putAudioBlob(matchedTrack.id, file);
-            } else {
-              rememberSessionFile(matchedTrack.id, file);
-            }
-          } catch (error) {
-            audioUpdateSucceeded = false;
-            outcome.failed.push({
-              fileName: file.name,
-              reason: error instanceof Error ? error.message : "Failed to replace audio file",
-            });
-          }
-
-          if (!audioUpdateSucceeded) {
-            done += 1;
-            continue;
-          }
-
-          if (comparison.improvedArtwork) {
-            await repository.putArtwork(matchedTrack.id, comparison.improvedArtwork);
-          }
-
           const updatedTrack: Track = {
             ...matchedTrack,
             id: matchedTrack.id,
@@ -537,7 +510,23 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
             accessMode: isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only",
           };
 
-          await repository.putTracks([updatedTrack]);
+          // Audio source, artwork and metadata are replaced together or not at all:
+          // a failed write leaves the original track and audio exactly as they were.
+          try {
+            await repository.putTrackWithFiles(updatedTrack, {
+              artwork: comparison.improvedArtwork,
+              handle: isHandle ? (item as FileSystemFileHandle) : undefined,
+              audio: !isHandle && options.storeCopies ? file : undefined,
+            });
+          } catch (error) {
+            outcome.failed.push({
+              fileName: file.name,
+              reason: error instanceof Error ? error.message : "Failed to replace audio file",
+            });
+            done += 1;
+            continue;
+          }
+          if (!isHandle && !options.storeCopies) rememberSessionFile(matchedTrack.id, file);
           outcome.updated = (outcome.updated ?? 0) + 1;
           outcome.updatedTracks!.push(updatedTrack);
 
@@ -591,18 +580,13 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           metadataFromFilename: !validTagTitle,
         };
 
-        if (tags.artwork) {
-          await repository.putArtwork(track.id, tags.artwork);
-        }
-        if (isHandle) {
-          await repository.putHandle(track.id, item as FileSystemFileHandle);
-        } else if (options.storeCopies) {
-          await repository.putAudioBlob(track.id, file);
-        } else {
-          rememberSessionFile(track.id, file);
-        }
-
-        await repository.putTracks([track]);
+        // One transaction: no orphan artwork/audio/handle if the track write fails.
+        await repository.putTrackWithFiles(track, {
+          artwork: tags.artwork,
+          handle: isHandle ? (item as FileSystemFileHandle) : undefined,
+          audio: !isHandle && options.storeCopies ? file : undefined,
+        });
+        if (!isHandle && !options.storeCopies) rememberSessionFile(track.id, file);
         outcome.newTracks!.push(track);
         if (accessMode === "session-only") outcome.sessionOnlyAdded += 1;
         outcome.added += 1;

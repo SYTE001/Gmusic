@@ -74,7 +74,16 @@ function openDatabase(indexedDBFactory: IDBFactory): Promise<IDBDatabase> {
         db.createObjectStore(STORES.lyricsMeta, { keyPath: "trackId" });
       }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const db = request.result;
+      // Another tab (e.g. a newer app version) needs to upgrade the schema:
+      // release this connection so the upgrade is not blocked, and reopen lazily.
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
     request.onerror = () => reject(toDBError(request.error, "opening the database"));
     request.onblocked = () =>
       reject(new DBError("unavailable", "The database is open in another tab and cannot be upgraded. Close other tabs of this app and reload."));
@@ -131,7 +140,15 @@ export async function withTransaction<T>(
     tx.onerror = () => {
       if (!settled) reject(toDBError(tx.error, "writing to the database"));
     };
-    void Promise.resolve(work(tx)).then(
+    // A synchronous throw from `work` must abort the transaction too, otherwise
+    // the writes queued before the throw would still be committed.
+    let pending: Promise<T>;
+    try {
+      pending = Promise.resolve(work(tx));
+    } catch (error) {
+      pending = Promise.reject(error);
+    }
+    void pending.then(
       (value) => {
         result = value;
         // Readonly work resolves once its requests succeed; readwrite waits

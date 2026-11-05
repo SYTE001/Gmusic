@@ -53,6 +53,23 @@ export class LibraryRepository {
     });
   }
 
+  /**
+   * Writes a track together with its artwork and audio source (handle or stored
+   * copy) in ONE transaction, so a failure can never leave orphan blobs without
+   * a track, or a track without the source it was imported with.
+   */
+  async putTrackWithFiles(
+    track: Track,
+    files: { artwork?: Blob; handle?: FileSystemFileHandle; audio?: Blob },
+  ): Promise<void> {
+    await withTransaction([STORES.tracks, STORES.artwork, STORES.handles, STORES.audio], "readwrite", (tx) => {
+      if (files.artwork) tx.objectStore(STORES.artwork).put({ trackId: track.id, blob: files.artwork } satisfies ArtworkRecord);
+      if (files.handle) tx.objectStore(STORES.handles).put({ trackId: track.id, handle: files.handle } satisfies HandleRecord);
+      if (files.audio) tx.objectStore(STORES.audio).put({ trackId: track.id, blob: files.audio } satisfies AudioRecord);
+      tx.objectStore(STORES.tracks).put(track);
+    });
+  }
+
   async updateTrack(id: string, patch: Partial<Track>): Promise<void> {
     await withTransaction([STORES.tracks], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.tracks);
