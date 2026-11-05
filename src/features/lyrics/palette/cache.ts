@@ -1,18 +1,18 @@
-import { extractClustersFromPixels, selectDistinctClusters } from "./extraction";
-import { enforceLegibility, createFallbackPalette } from "./legibility";
-import { selectPreset } from "./presets";
-import type { BackgroundTier, LyricsPalette } from "./types";
+import { extractClustersFromPixels } from "./extraction";
+import { createFallbackPalette, selectSolidPalette } from "./legibility";
+import type { LyricsPalette } from "./types";
 import { loadArtworkUrl } from "../../../services/artwork/artworkCache";
+import { getAlbumArtworkCacheKey } from "../../../services/artwork/artworkService";
+import { repository } from "../../../services/indexeddb/LibraryRepository";
 import type { Track } from "../../../types";
 
 const MEMORY_CACHE = new Map<string, LyricsPalette>();
 const MAX_MEMORY_ITEMS = 200;
-const STORAGE_KEY = "gmusic_lyrics_palette_cache";
-const TIER_STORAGE_KEY = "gmusic_lyrics_bg_tier";
+const STORAGE_KEY = "gmusic_lyrics_solid_palette_v2";
 const MAX_STORAGE_ITEMS = 100;
 const CANVAS_SIZE = 32;
 
-// Single reused 32x32 canvas to prevent DOM/GPU allocation churn during rapid skips (PRD §7, §8.8)
+// Single reused 32x32 canvas to prevent DOM/GPU allocation churn during rapid skips
 let sharedOffscreenCtx: OffscreenCanvasRenderingContext2D | null = null;
 let sharedDomCtx: CanvasRenderingContext2D | null = null;
 
@@ -37,55 +37,19 @@ function getShared32x32Context(): OffscreenCanvasRenderingContext2D | CanvasRend
 }
 
 /**
- * Capability detection for the 3-tier system (`full` | `lite` | `static`, PRD §8.1).
- * Degrades by default on low-spec hardware and remembers automatic step-downs.
+ * Computes a collision-free cache key for a track's cover palette.
+ * Uses the normalized album-or-track artwork key when available, falling back to `track.id`.
  */
-export function detectInitialTier(): BackgroundTier {
-  if (typeof window !== "undefined") {
-    try {
-      const saved = window.localStorage?.getItem(TIER_STORAGE_KEY);
-      if (saved === "full" || saved === "lite" || saved === "static") {
-        return saved;
-      }
-    } catch {
-      // Ignore storage access errors
-    }
-
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
-      return "static";
-    }
-  }
-
-  if (typeof navigator !== "undefined") {
-    const cores = navigator.hardwareConcurrency ?? 8;
-    const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8;
-    if (cores <= 2 || memory <= 2) {
-      return "static";
-    }
-    if (cores <= 4 || memory <= 4) {
-      return "lite";
-    }
-  }
-
-  return "full";
+export function getTrackPaletteKey(track: Track | null | undefined): string {
+  if (!track) return "none";
+  const key = getAlbumArtworkCacheKey({
+    title: track.title,
+    artist: track.artist,
+    album: track.album,
+  });
+  return key || track.id;
 }
 
-/**
- * Steps down one performance tier (`full` -> `lite` -> `static`) and persists the choice (PRD §8.1).
- */
-export function stepDownTier(current: BackgroundTier): BackgroundTier {
-  const next: BackgroundTier = current === "full" ? "lite" : "static";
-  if (typeof window !== "undefined" && window.localStorage) {
-    try {
-      window.localStorage.setItem(TIER_STORAGE_KEY, next);
-    } catch {
-      // Ignore storage quota/permission errors
-    }
-  }
-  return next;
-}
-
-// Load persistent cache from localStorage on startup
 function readStorageCache(): Record<string, LyricsPalette> {
   if (typeof window === "undefined" || !window.localStorage) return {};
   try {
@@ -105,11 +69,25 @@ function writeStorageCache(cache: Record<string, LyricsPalette>): void {
   }
 }
 
-// Hydrate memory cache from storage
+function isValidPersistedPalette(val: unknown): val is LyricsPalette {
+  if (!val || typeof val !== "object") return false;
+  const p = val as Partial<LyricsPalette>;
+  return (
+    typeof p.bg === "string" &&
+    typeof p.lyricActive === "string" &&
+    typeof p.lyricInactive === "string" &&
+    typeof p.accent === "string" &&
+    p.category !== "fallback"
+  );
+}
+
+// Hydrate memory cache from storage on startup
 try {
   const persisted = readStorageCache();
   for (const [key, val] of Object.entries(persisted)) {
-    MEMORY_CACHE.set(key, val);
+    if (isValidPersistedPalette(val)) {
+      MEMORY_CACHE.set(key, val);
+    }
   }
 } catch {
   // Ignore hydration failures
@@ -121,7 +99,8 @@ export function getCachedPalette(coverKey: string): LyricsPalette | undefined {
 }
 
 export function setCachedPalette(coverKey: string, palette: LyricsPalette): void {
-  if (!coverKey || !palette) return;
+  // Never persist fallback palettes into the cache so transient load delays never poison future plays
+  if (!coverKey || !palette || palette.category === "fallback") return;
 
   if (!MEMORY_CACHE.has(coverKey) && MEMORY_CACHE.size >= MAX_MEMORY_ITEMS) {
     const firstKey = MEMORY_CACHE.keys().next().value;
@@ -129,7 +108,6 @@ export function setCachedPalette(coverKey: string, palette: LyricsPalette): void
   }
   MEMORY_CACHE.set(coverKey, palette);
 
-  // Persist asynchronously
   try {
     const stored = readStorageCache();
     stored[coverKey] = palette;
@@ -143,42 +121,104 @@ export function setCachedPalette(coverKey: string, palette: LyricsPalette): void
   }
 }
 
+export function clearPaletteCache(): void {
+  MEMORY_CACHE.clear();
+  if (typeof window !== "undefined" && window.localStorage) {
+    try {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }
+}
+
 /**
- * Extracts a 32x32 pixel buffer from an image URL and produces an enforced LyricsPalette.
- * Runs non-blocking using ImageBitmap or shared 32x32 canvas (PRD §4.1, §8.8).
+ * Extracts a 32x32 pixel buffer from a track's embedded artwork Blob or image URL
+ * and produces a contrast-verified solid LyricsPalette.
  */
 export async function extractPaletteFromImageUrl(
-  imageUrl: string,
+  imageUrl: string | undefined,
   coverKey: string,
+  trackId?: string,
 ): Promise<LyricsPalette> {
   const cached = getCachedPalette(coverKey);
   if (cached) return cached;
 
   try {
-    const pixels = await load32x32Pixels(imageUrl);
-    if (!pixels || pixels.length === 0) {
-      const fallback = createFallbackPalette(coverKey);
-      setCachedPalette(coverKey, fallback);
-      return fallback;
+    let pixels: Uint8ClampedArray | null = null;
+
+    // 1. Prefer reading the local embedded Blob directly from IndexedDB when available
+    // (avoids CORS canvas taint and unnecessary network/URL roundtrips)
+    if (trackId) {
+      try {
+        const blob = await repository.getArtwork(trackId);
+        if (blob) {
+          pixels = await load32x32PixelsFromBlob(blob);
+        }
+      } catch {
+        // Proceed to imageUrl extraction
+      }
     }
 
-    const rawClusters = extractClustersFromPixels(pixels);
-    const distinct = selectDistinctClusters(rawClusters);
-    const preset = selectPreset(distinct);
-    const palette = enforceLegibility(distinct, preset, coverKey);
+    // 2. Extract from imageUrl if no blob pixels were obtained
+    if ((!pixels || pixels.length === 0) && imageUrl) {
+      pixels = await load32x32Pixels(imageUrl);
+    }
 
+    if (!pixels || pixels.length === 0) {
+      return createFallbackPalette(coverKey);
+    }
+
+    const clusters = extractClustersFromPixels(pixels);
+    if (clusters.length === 0) {
+      return createFallbackPalette(coverKey);
+    }
+
+    const palette = selectSolidPalette(clusters, coverKey);
     setCachedPalette(coverKey, palette);
     return palette;
   } catch {
-    const fallback = createFallbackPalette(coverKey);
-    setCachedPalette(coverKey, fallback);
-    return fallback;
+    return createFallbackPalette(coverKey);
+  }
+}
+
+async function load32x32PixelsFromBlob(blob: Blob): Promise<Uint8ClampedArray | null> {
+  try {
+    const ctx = getShared32x32Context();
+    if (!ctx) return null;
+
+    if (typeof createImageBitmap === "function") {
+      try {
+        const bitmap = await createImageBitmap(blob, {
+          resizeWidth: CANVAS_SIZE,
+          resizeHeight: CANVAS_SIZE,
+          resizeQuality: "low",
+        });
+        ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        ctx.drawImage(bitmap, 0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        bitmap.close();
+        return ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE).data;
+      } catch {
+        // Fall through to object URL
+      }
+    }
+
+    if (typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+      const tempUrl = URL.createObjectURL(blob);
+      try {
+        return await load32x32Pixels(tempUrl);
+      } finally {
+        URL.revokeObjectURL(tempUrl);
+      }
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Loads image downscaled directly to 32x32 pixels onto a reused canvas,
- * never decoding at full size on the main thread when ImageBitmap resize is supported (PRD §4.1, §8.4, §8.8).
+ * Loads image downscaled directly to 32x32 pixels onto a reused canvas.
  */
 async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
   return new Promise((resolve) => {
@@ -192,7 +232,9 @@ async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
     }, 1500);
 
     const img = new Image();
-    img.crossOrigin = "anonymous";
+    if (!url.startsWith("blob:") && !url.startsWith("data:")) {
+      img.crossOrigin = "anonymous";
+    }
     img.decoding = "async";
 
     img.onload = () => {
@@ -219,7 +261,7 @@ async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
               resolve(ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE).data);
               return;
             } catch {
-              // Fallback to direct drawImage below if resize options unsupported
+              // Fallback to direct drawImage below
             }
           }
 
@@ -243,17 +285,17 @@ async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
 }
 
 /**
- * Schedules background palette precomputation for the next track during idle time (PRD §4.1).
+ * Schedules background palette precomputation for the next track in queue during idle time.
  */
 export function scheduleNextTrackPrecompute(track: Track): void {
   if (!track) return;
-  const coverKey = track.album ? `${track.album}-${track.artist}` : track.id;
+  const coverKey = getTrackPaletteKey(track);
   if (getCachedPalette(coverKey)) return;
 
   const runTask = () => {
     void loadArtworkUrl(track).then((artworkUrl) => {
       if (artworkUrl) {
-        void extractPaletteFromImageUrl(artworkUrl, coverKey);
+        void extractPaletteFromImageUrl(artworkUrl, coverKey, track.id);
       }
     });
   };

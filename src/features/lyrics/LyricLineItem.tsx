@@ -7,12 +7,18 @@ export type LyricLineItemProps = {
 };
 
 /**
- * Static line of plain (unsynchronized) lyrics. Timed lyrics are rendered and
- * animated by the AMLL player instead (see AmllLyricPlayer).
+ * Static line of plain (unsynchronized) lyrics. Uses `--lyric-inactive` (>= 3:1 contrast)
+ * directly rather than a fixed low opacity.
  */
 export const LyricLineItem = React.memo(function LyricLineItem({ line, fontSize }: LyricLineItemProps) {
   return (
-    <p className="px-2 text-[0.92em] font-normal text-text-primary opacity-50" style={{ fontSize }}>
+    <p
+      className="px-2 text-[0.92em] font-normal"
+      style={{
+        fontSize,
+        color: "var(--lyric-inactive, var(--text-secondary))",
+      }}
+    >
       {line.text || "♪"}
     </p>
   );

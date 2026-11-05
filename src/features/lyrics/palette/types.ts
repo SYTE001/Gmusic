@@ -18,29 +18,29 @@ export type ColorCluster = {
   score: number;
 };
 
-export type PresetName = "calm" | "dim" | "flow" | "balanced";
-
-export type BackgroundTier = "full" | "lite" | "static";
-
-export type PresetConfig = {
-  name: PresetName;
-  blobCount: number;
-  duration: number; // seconds for keyframe loop
-  blobOpacity: number;
-  scrimTop: number;
-  scrimBottom: number;
-  travelScale: number;
-};
+export type CoverCategory = "light" | "saturated" | "dark" | "grayscale" | "fallback";
 
 export type LyricsPalette = {
   coverKey: string;
-  baseColor: string; // CSS color string (hsl)
-  blobColors: [string, string, string, string]; // 4 blob colors (hsl)
-  accentColor: string; // ~70% lightness accent
-  preset: PresetName;
-  presetConfig: PresetConfig;
-  scrimTop: number;
-  scrimBottom: number;
-  worstCaseContrast: number;
-  averageLuminance: number;
+  category: CoverCategory;
+  /** Solid background color (`--bg`, hsl string) */
+  bg: string;
+  bgHsl: HslColor;
+  bgRgb: RgbColor;
+  /** Active lyric line color (`--lyric-active`, `#ffffff`) */
+  lyricActive: string;
+  /** Inactive lyric line color (`--lyric-inactive`, hsl string with >= 3:1 contrast against `--bg`) */
+  lyricInactive: string;
+  /** UI secondary text / control icons (`--text-secondary`, >= 4.5:1 contrast against `--bg`) */
+  textSecondary: string;
+  /** UI muted text / time labels (`--text-muted`, >= 4.5:1 contrast against `--bg`) */
+  textMuted: string;
+  /** Accent color (`--accent`, only used for non-text elements like progress bar) */
+  accent: string;
+  /** Computed WCAG contrast ratios against `--bg` */
+  contrasts: {
+    active: number;
+    inactive: number;
+    uiText: number;
+  };
 };

@@ -29,7 +29,7 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
       const frac = dur > 0 ? Math.min(1, Math.max(0, ms / dur)) : 0;
       const safeFrac = Number.isFinite(frac) ? frac : 0;
       const now = performance.now();
-      if (force || (Math.abs(safeFrac - lastFracRef.current) >= 0.0008 && now - lastBarWriteRef.current >= 50)) {
+      if (force || (Math.abs(safeFrac - lastFracRef.current) >= 0.001 && now - lastBarWriteRef.current >= 120)) {
         lastFracRef.current = safeFrac;
         lastBarWriteRef.current = now;
         if (fillRef.current) {
@@ -168,7 +168,7 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
             clock, and immune to width-transition lag on resume/seek jumps. */}
         <div
           ref={fillRef}
-          className="absolute left-0 top-1/2 h-1.5 w-full -translate-y-1/2 origin-left rounded-full bg-accent-strong"
+          className="absolute left-0 top-1/2 h-1.5 w-full -translate-y-1/2 origin-left rounded-full bg-accent"
           style={{ transform: `scaleX(${safeFraction})`, willChange: "transform" }}
         />
         <div
@@ -177,7 +177,7 @@ export function SeekBar({ compact = false }: { compact?: boolean }) {
           style={{ transform: `translate3d(${safeFraction * 100}%, 0, 0)`, willChange: "transform" }}
         >
           <div
-            className={`size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent-strong shadow-sm transition-[opacity,transform] duration-150 ${
+            className={`size-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-accent shadow-sm transition-[opacity,transform] duration-150 ${
               scrubMs !== null
                 ? "scale-110 opacity-100"
                 : isPlaying

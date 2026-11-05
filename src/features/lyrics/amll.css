@@ -1,35 +1,55 @@
 /*
- * Gmusic — Smooth Synchronized Lyrics & Theme Bridge
+ * Gmusic — Single-Container GPU Synchronized Lyrics
  *
- * Eliminates spring bounce, 3D perspective warping, center-origin scale horizontal
- * shifts, and content-visibility layout jumps so lyrics scroll and highlight with
- * zero stuttering or shifting.
- *
- * Performance Contract:
- * - Purely GPU-composited transform (vertical translateY on line wrapper) and opacity.
- * - Zero horizontal or vertical shifting when lines activate or deactivate.
- * - No layout-triggering animated properties (width, height, top/left, margin, padding, blur).
- * - No per-word entrance/exit float or character matrix3d glow animations; word spans are locked.
- * - Word-by-word highlight sync uses CSS mask-image (WebMaskAnimator) at full precision.
+ * Performance & Legibility Contract (Task §4, §5, §6):
+ * - `contain: layout paint` on the lyrics container.
+ * - `will-change: transform` ONLY on the single scrolling track (`.gm-amll-scroll-track`),
+ *   never on individual lyric lines.
+ * - Scrolling moves one container with `transform: translate3d(0, y, 0)` and a 380ms
+ *   ease-out transition (`cubic-bezier(0.22, 1, 0.36, 1)`).
+ * - Zero `filter: blur`, `text-shadow`, `backdrop-filter`, `box-shadow`, or `mask-image`
+ *   on the player container or inactive lines.
+ * - Active line uses `var(--lyric-active, #ffffff)` (>= 7:1 contrast).
+ * - Inactive lines use `var(--lyric-inactive, var(--text-secondary))` (>= 3:1 contrast)
+ *   with `opacity: 1` and slight scale (`scale(0.985)` -> `scale(1)`) via transform only.
  */
 
 .gm-amll {
   height: 100%;
   min-height: 0;
+  contain: layout paint;
 }
 
 .gm-amll .amll-lyric-player {
-  --amll-lp-color: var(--text-primary);
+  --amll-lp-color: var(--lyric-active, var(--text-primary));
   --amll-lp-hover-bg-color: var(--surface-hover);
   --amll-lp-font-size: var(--gm-lyric-font-size);
-  /* AMLL defaults to plus-lighter, which turns text invisible on a light theme. */
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
   mix-blend-mode: normal;
+  mask-image: none !important;
+  -webkit-mask-image: none !important;
+  contain: layout paint;
 }
 
 /*
- * Suppress transitions during initial synchronous layout measurement or instant seeks
- * so lines never slide from estimated fallback heights into their real positions.
+ * Single scrolling container moved by `translate3d(0, y, 0)`.
+ * Only element in the lyrics tree with `will-change: transform`.
  */
+.gm-amll-scroll-track {
+  position: relative;
+  width: 100%;
+  will-change: transform;
+  backface-visibility: hidden;
+  transition: transform 380ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/*
+ * Suppress transitions during initial synchronous layout measurement or instant seeks.
+ */
+.gm-amll.gm-amll-no-transition .gm-amll-scroll-track,
 .gm-amll.gm-amll-no-transition *,
 .gm-amll .FmKaba_tmpDisableTransition,
 .gm-amll .FmKaba_tmpDisableTransition * {
@@ -37,39 +57,45 @@
 }
 
 /*
- * Line scrolling wrapper:
- * Smooth GPU transform scrolling without spring overshoot or bouncy oscillation.
+ * Individual line wrapper: sits in static/relative flow inside `.gm-amll-scroll-track`.
+ * No `will-change`, no `filter`, no `box-shadow`, no `backdrop-filter`.
  */
 .gm-amll .FmKaba_lyricLineWrapper {
-  transition:
-    transform 340ms cubic-bezier(0.22, 1, 0.36, 1),
-    opacity 260ms cubic-bezier(0.22, 1, 0.36, 1),
-    background-color 200ms ease !important;
-  will-change: transform;
+  position: relative !important;
+  top: auto !important;
+  left: auto !important;
+  transform: none !important;
+  opacity: 1 !important;
+  will-change: auto !important;
   filter: none !important;
-  backface-visibility: hidden;
+  text-shadow: none !important;
+  box-shadow: none !important;
+  backdrop-filter: none !important;
+  transition: background-color 180ms ease !important;
 }
 
-/*
- * Prevent browser content-visibility placeholder height swaps (auto 40px -> real height)
- * that cause mid-playback ResizeObserver triggers and vertical layout shifts.
- */
 .gm-amll .FmKaba_lyricLine {
   content-visibility: visible !important;
   contain-intrinsic-size: none !important;
   contain: layout style !important;
   filter: none !important;
+  text-shadow: none !important;
   box-shadow: none !important;
+  backdrop-filter: none !important;
   transform: none !important;
-  transition:
-    --bright-mask-alpha var(--mask-alpha-duration) ease-out,
-    --dark-mask-alpha var(--mask-alpha-duration) ease-out !important;
 }
 
 /*
- * Lock all inner word and character spans to prevent sequential entrance/exit,
- * rubber-like bouncing, or independent motion. Word-by-word highlight sync uses
- * CSS mask-image (WebMaskAnimator), which remains 100% active and unhindered.
+ * Do not dim inactive lines with AMLL's internal mask alpha; their legibility
+ * is controlled directly via `var(--lyric-inactive)` (>= 3:1 contrast).
+ */
+.gm-amll .FmKaba_lyricLineWrapper:not(.FmKaba_active) .FmKaba_lyricLine {
+  mask-image: none !important;
+  -webkit-mask-image: none !important;
+}
+
+/*
+ * Lock inner word and character spans against float/glow animations.
  */
 .gm-amll .FmKaba_lyricMainLine span,
 .gm-amll .FmKaba_lyricMainLine .FmKaba_emphasizeWrapper,
@@ -79,54 +105,59 @@
   transform: none !important;
   transition: none !important;
   animation: none !important;
+  filter: none !important;
+  text-shadow: none !important;
 }
 
 /*
- * Stable, zero-shift line presentation:
- * Lines stay locked to their exact horizontal and vertical geometry (`translate3d(0, 0, 0)`)
- * without center-origin scale shifts or 3D perspective rasterization snaps.
+ * Inactive lyric line: contrast-verified `var(--lyric-inactive)` (>= 3:1 against `--bg`),
+ * full opacity (never a fixed low opacity), and subtle scale via transform only.
  */
 .gm-amll .FmKaba_lyricMainLine {
   display: block;
-  backface-visibility: hidden;
-  transform: translate3d(0, 0, 0) !important;
-  opacity: 0.38;
-  transition: opacity 260ms cubic-bezier(0.22, 1, 0.36, 1) !important;
-  will-change: opacity;
+  color: var(--lyric-inactive, var(--text-secondary));
+  opacity: 1 !important;
+  transform-origin: left center;
+  transform: scale(0.985) translate3d(0, 0, 0) !important;
+  transition:
+    color 240ms ease-out,
+    transform 240ms ease-out !important;
+  will-change: auto !important;
+  filter: none !important;
+  text-shadow: none !important;
 }
 
 /*
- * Active line: full opacity, zero geometric shift.
+ * Active lyric line: pure white `var(--lyric-active)` (>= 7:1 contrast against `--bg`)
+ * and `scale(1)`.
  */
 .gm-amll .FmKaba_active .FmKaba_lyricMainLine,
 .gm-amll .FmKaba_lyricMainLine.FmKaba_active {
-  transform: translate3d(0, 0, 0) !important;
-  opacity: 1;
+  color: var(--lyric-active, #ffffff);
+  opacity: 1 !important;
+  transform: scale(1) translate3d(0, 0, 0) !important;
 }
 
-/* Background lines (duet / background vocals) */
+/* Background vocals / sub lines use the same >= 3:1 contrast token */
 .gm-amll .FmKaba_lyricBgLine .FmKaba_lyricMainLine,
 .gm-amll .FmKaba_lyricSubLine {
-  opacity: 0.35;
-  transition: opacity 260ms cubic-bezier(0.22, 1, 0.36, 1) !important;
+  color: var(--lyric-inactive, var(--text-secondary));
+  opacity: 1 !important;
 }
 
-/*
- * Respect prefers-reduced-motion and in-app data-motion="on":
- */
 @media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="off"]) .gm-amll-scroll-track {
+    transition: transform 150ms ease-out !important;
+  }
   html:not([data-motion="off"]) .gm-amll .FmKaba_lyricMainLine {
-    transition: opacity 150ms ease !important;
+    transition: color 150ms ease-out !important;
   }
-  html:not([data-motion="off"]) .gm-amll .FmKaba_lyricLineWrapper {
-    transition: transform 150ms ease !important;
-  }
+}
+
+html[data-motion="on"] .gm-amll-scroll-track {
+  transition: transform 150ms ease-out !important;
 }
 
 html[data-motion="on"] .gm-amll .FmKaba_lyricMainLine {
-  transition: opacity 150ms ease !important;
-}
-
-html[data-motion="on"] .gm-amll .FmKaba_lyricLineWrapper {
-  transition: transform 150ms ease !important;
+  transition: color 150ms ease-out !important;
 }

@@ -4,6 +4,13 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
+import {
+  setCachedPalette,
+  clearPaletteCache,
+  selectSolidPalette,
+  extractClustersFromPixels,
+  getTrackPaletteKey,
+} from "../lyrics/palette";
 import type { Track } from "../../types";
 
 const mockNavigate = vi.fn();
@@ -15,7 +22,7 @@ vi.mock("react-router-dom", async () => {
   };
 });
 
-function createTrack(id: string = "track-1"): Track {
+function createTrack(id: string = "track-1", overrides: Partial<Track> = {}): Track {
   return {
     id,
     title: "Test Song",
@@ -35,12 +42,14 @@ function createTrack(id: string = "track-1"): Track {
     accessMode: "stored-copy",
     fingerprint: "fp-1",
     metadataFromFilename: false,
+    ...overrides,
   };
 }
 
 describe("NowPlayingPage component", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearPaletteCache();
     const track = createTrack();
     useLibraryStore.setState({
       tracks: [track],
@@ -70,7 +79,7 @@ describe("NowPlayingPage component", () => {
     expect(screen.getByRole("link", { name: /Pick a song/i })).toBeTruthy();
   });
 
-  it("mounts with solid neutral bg-app-bg on root container in Stage 1 (album only)", () => {
+  it("mounts with untouched bg-app-bg on root container in Stage 1 (album only)", () => {
     const { container } = render(
       <MemoryRouter initialEntries={["/now-playing"]}>
         <NowPlayingPage />
@@ -81,12 +90,22 @@ describe("NowPlayingPage component", () => {
     expect(root).toBeTruthy();
     expect(root.className).toContain("bg-app-bg");
     expect(root.getAttribute("data-stage")).toBe("album");
-    // Stage 1 has no adaptive background mounted
+    expect(root.style.getPropertyValue("--bg")).toBe("");
     expect(container.querySelector(".lyrics-bg-container")).toBeNull();
   });
 
-  it("mounts full-screen LyricsBackground in Stage 2 and fades out before unmounting on return to Stage 1", () => {
-    vi.useFakeTimers();
+  it("applies solid album-adaptive CSS variables (--bg, --lyric-active, --lyric-inactive, --accent) on root in Stage 2 and restores Stage 1 when hidden", () => {
+    // Seed a red album palette into cache for Test Artist::Test Album
+    const redPixels = new Uint8ClampedArray(32 * 32 * 4);
+    for (let i = 0; i < redPixels.length; i += 4) {
+      redPixels[i] = 215;
+      redPixels[i + 1] = 20;
+      redPixels[i + 2] = 32;
+      redPixels[i + 3] = 255;
+    }
+    const key = getTrackPaletteKey(useLibraryStore.getState().tracks[0]);
+    const redPalette = selectSolidPalette(extractClustersFromPixels(redPixels), key);
+    setCachedPalette(key, redPalette);
 
     const { container } = render(
       <MemoryRouter initialEntries={["/now-playing?lyrics=1"]}>
@@ -97,32 +116,83 @@ describe("NowPlayingPage component", () => {
     const root = screen.getByRole("region", { name: "Now playing" });
     expect(root.getAttribute("data-stage")).toBe("lyrics");
     expect(root.getAttribute("data-theme")).toBe("dark");
-
-    const bg = container.querySelector(".lyrics-bg-container") as HTMLElement | null;
-    expect(bg).not.toBeNull();
+    expect(root.getAttribute("data-cover-category")).toBe("saturated");
+    expect(root.style.getPropertyValue("--bg")).toBe(redPalette.bg);
+    expect(root.style.getPropertyValue("--lyric-active")).toBe("#ffffff");
+    expect(root.style.getPropertyValue("--lyric-inactive")).toBe(redPalette.lyricInactive);
+    expect(root.style.getPropertyValue("--accent")).toBe(redPalette.accent);
+    // No animated blob/grain layers exist
+    expect(container.querySelector(".lyrics-bg-container")).toBeNull();
+    expect(container.querySelector(".lyrics-bg-blob")).toBeNull();
 
     // Toggle back to Stage 1 (Hide lyrics)
     const hideBtn = screen.getByRole("button", { name: "Hide lyrics" });
     fireEvent.click(hideBtn);
 
     expect(root.getAttribute("data-stage")).toBe("album");
-    // Still mounted during 500ms fade-out with opacity 0
-    const bgFading = container.querySelector(".lyrics-bg-container") as HTMLElement | null;
-    expect(bgFading).not.toBeNull();
-    expect(bgFading?.style.opacity).toBe("0");
-
-    // Unmounts after 500ms fade-out completes
-    act(() => {
-      vi.advanceTimersByTime(520);
-    });
-    expect(container.querySelector(".lyrics-bg-container")).toBeNull();
-
-    vi.useRealTimers();
+    expect(root.style.getPropertyValue("--bg")).toBe("");
   });
 
-  it("does not render any ambient canvas, sheen, or .gm-ambient elements", () => {
+  it("produces visibly different solid --bg for a white cover vs a red cover and updates when track changes", () => {
+    const whiteTrack = createTrack("rihanna-white", {
+      title: "Breakin' Dishes",
+      artist: "Rihanna",
+      album: "Good Girl Gone Bad",
+    });
+    const redTrack = createTrack("megan-red", {
+      title: "Thot Shit",
+      artist: "Megan Thee Stallion",
+      album: "Something for Thee Hotties",
+    });
+
+    const whitePixels = new Uint8ClampedArray(32 * 32 * 4).fill(252);
+    const redPixels = new Uint8ClampedArray(32 * 32 * 4);
+    for (let i = 0; i < redPixels.length; i += 4) {
+      redPixels[i] = 215;
+      redPixels[i + 1] = 20;
+      redPixels[i + 2] = 32;
+      redPixels[i + 3] = 255;
+    }
+
+    const whiteKey = getTrackPaletteKey(whiteTrack);
+    const redKey = getTrackPaletteKey(redTrack);
+    const whitePalette = selectSolidPalette(extractClustersFromPixels(whitePixels), whiteKey);
+    const redPalette = selectSolidPalette(extractClustersFromPixels(redPixels), redKey);
+    setCachedPalette(whiteKey, whitePalette);
+    setCachedPalette(redKey, redPalette);
+
+    useLibraryStore.setState({ tracks: [whiteTrack, redTrack], playlists: [], status: "ready", loadError: null });
+    usePlaybackStore.setState({ currentTrackId: "rihanna-white" });
+
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/now-playing?lyrics=1"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const root = screen.getByRole("region", { name: "Now playing" });
+    const whiteBg = root.style.getPropertyValue("--bg");
+    expect(whiteBg).toBe(whitePalette.bg);
+    expect(root.getAttribute("data-cover-category")).toBe("light");
+
+    act(() => {
+      usePlaybackStore.setState({ currentTrackId: "megan-red" });
+    });
+    rerender(
+      <MemoryRouter initialEntries={["/now-playing?lyrics=1"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const redBg = root.style.getPropertyValue("--bg");
+    expect(redBg).toBe(redPalette.bg);
+    expect(redBg).not.toBe(whiteBg);
+    expect(root.getAttribute("data-cover-category")).toBe("saturated");
+  });
+
+  it("does not render any ambient canvas, animated blobs, or .gm-ambient elements", () => {
     const { container } = render(
-      <MemoryRouter>
+      <MemoryRouter initialEntries={["/now-playing?lyrics=1"]}>
         <NowPlayingPage />
       </MemoryRouter>,
     );
@@ -130,6 +200,7 @@ describe("NowPlayingPage component", () => {
     expect(container.querySelectorAll("canvas").length).toBe(0);
     expect(container.querySelectorAll(".gm-ambient").length).toBe(0);
     expect(container.querySelectorAll("[data-ambient]").length).toBe(0);
+    expect(container.querySelectorAll(".lyrics-bg-blob").length).toBe(0);
   });
 
   it("renders track title, artist, artwork, and playback controls", () => {

@@ -1,5 +1,5 @@
-import { colorDistance, hslToRgb, hueDistance, relativeLuminance, rgbToHsl } from "./colorUtils";
-import type { ColorCluster, HslColor, RgbColor } from "./types";
+import { colorDistance, relativeLuminance, rgbToHsl } from "./colorUtils";
+import type { ColorCluster, RgbColor } from "./types";
 
 const K_CLUSTERS = 5;
 const MAX_ITERATIONS = 8;
@@ -8,8 +8,32 @@ const MIN_ALPHA = 200;
 export type PixelData = Uint8ClampedArray | number[];
 
 /**
- * Extracts raw color clusters from a 32x32 RGBA pixel buffer (1024 pixels).
- * Filters out low-alpha pixels and quantizes with k-means.
+ * Computes a meaningfulness score for a color cluster (Task §3):
+ * Scores by population and saturation so a large white or black border
+ * never outranks a saturated subject (e.g., red figure on white cover).
+ */
+export function scoreClusterMeaningfulness(population: number, s: number, l: number): number {
+  let chromaWeight = 1.0;
+
+  // Penalize near-white (white border / background) and near-black (black border / shadows)
+  if (l > 0.88 && s < 0.25) {
+    chromaWeight = 0.08;
+  } else if (l < 0.08) {
+    chromaWeight = 0.12;
+  } else if (s < 0.12) {
+    chromaWeight = 0.18;
+  } else if (l > 0.78 && s < 0.35) {
+    chromaWeight = 0.35;
+  }
+
+  const midtonePreference = Math.max(0, 1 - Math.abs(l - 0.5) * 1.4);
+  return (population * 0.42 + s * 0.48 + midtonePreference * 0.1) * chromaWeight;
+}
+
+/**
+ * Extracts ~5 color clusters from a 32x32 RGBA pixel buffer (1024 pixels).
+ * Ignores pixels with alpha < 200 and quantizes via k-means.
+ * Clusters are returned sorted by meaningfulness score descending.
  */
 export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
   const validPixels: RgbColor[] = [];
@@ -30,16 +54,15 @@ export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
     return [];
   }
 
-  // Initialize k centroids using evenly distributed steps
+  // Initialize k centroids using evenly distributed steps across the image
   const k = Math.min(K_CLUSTERS, validPixels.length);
   const centroids: RgbColor[] = [];
-  const step = Math.floor(validPixels.length / k);
+  const step = Math.max(1, Math.floor(validPixels.length / k));
 
   for (let i = 0; i < k; i++) {
-    centroids.push({ ...validPixels[i * step] });
+    centroids.push({ ...validPixels[Math.min(validPixels.length - 1, i * step)] });
   }
 
-  // Run k-means iterations
   const assignments = new Int32Array(validPixels.length);
   const counts = new Int32Array(k);
   const sumR = new Float64Array(k);
@@ -54,7 +77,6 @@ export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
 
     let changed = false;
 
-    // Assign each pixel to the nearest centroid
     for (let p = 0; p < validPixels.length; p++) {
       const pixel = validPixels[p];
       let bestDist = Infinity;
@@ -81,7 +103,6 @@ export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
 
     if (!changed && iter > 0) break;
 
-    // Update centroids
     for (let c = 0; c < k; c++) {
       if (counts[c] > 0) {
         centroids[c] = {
@@ -93,7 +114,6 @@ export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
     }
   }
 
-  // Compute cluster statistics and score
   const totalPixels = validPixels.length;
   const clusters: ColorCluster[] = [];
 
@@ -105,9 +125,7 @@ export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
     const hsl = rgbToHsl(rgb);
     const population = count / totalPixels;
     const luminance = relativeLuminance(rgb);
-
-    // PRD 4.1: score = population * 0.5 + saturation * 0.4 + (1 - |lightness - 0.5|) * 0.1
-    const score = population * 0.5 + hsl.s * 0.4 + (1 - Math.abs(hsl.l - 0.5)) * 0.1;
+    const score = scoreClusterMeaningfulness(population, hsl.s, hsl.l);
 
     clusters.push({
       rgb,
@@ -118,63 +136,6 @@ export function extractClustersFromPixels(pixels: PixelData): ColorCluster[] {
     });
   }
 
-  // Sort by score descending
   clusters.sort((a, b) => b.score - a.score);
   return clusters;
-}
-
-/**
- * Picks 3-4 distinct clusters from sorted candidates.
- * Distinct condition: hue distance > 25 degrees OR lightness distance > 0.2.
- */
-export function selectDistinctClusters(clusters: ColorCluster[]): ColorCluster[] {
-  if (clusters.length === 0) return [];
-
-  const selected: ColorCluster[] = [];
-
-  for (const cluster of clusters) {
-    const isDistinct = selected.every((s) => {
-      // If either is very desaturated, hue comparison is noisy; rely on lightness
-      if (cluster.hsl.s < 0.1 || s.hsl.s < 0.1) {
-        return Math.abs(cluster.hsl.l - s.hsl.l) > 0.15;
-      }
-      return (
-        hueDistance(cluster.hsl.h, s.hsl.h) > 25 ||
-        Math.abs(cluster.hsl.l - s.hsl.l) > 0.2
-      );
-    });
-
-    if (isDistinct) {
-      selected.push(cluster);
-      if (selected.length >= 4) break;
-    }
-  }
-
-  // If we couldn't find enough distinct clusters, synthesize harmonious variations
-  if (selected.length < 4 && selected.length > 0) {
-    const dominant = selected[0];
-    const needed = 4 - selected.length;
-    const hueOffsets = [30, -30, 60, -60, 180];
-    const lightnessOffsets = [-0.15, 0.12, -0.08, 0.18];
-
-    for (let i = 0; i < needed; i++) {
-      const hOffset = hueOffsets[i % hueOffsets.length];
-      const lOffset = lightnessOffsets[i % lightnessOffsets.length];
-      const h = (dominant.hsl.h + hOffset + 360) % 360;
-      const s = Math.max(0.2, Math.min(0.8, dominant.hsl.s * 0.9));
-      const l = Math.max(0.25, Math.min(0.65, dominant.hsl.l + lOffset));
-      const synthHsl: HslColor = { h, s, l };
-      const synthRgb = hslToRgb(synthHsl);
-
-      selected.push({
-        rgb: synthRgb,
-        hsl: synthHsl,
-        population: 0.1,
-        luminance: relativeLuminance(synthRgb),
-        score: dominant.score * 0.8,
-      });
-    }
-  }
-
-  return selected;
 }

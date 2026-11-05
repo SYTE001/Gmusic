@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, type CSSProperties } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useLibraryStore, useTrackById } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
@@ -7,7 +7,7 @@ import { Artwork } from "../../components/Artwork";
 import { SeekBar } from "../../components/SeekBar";
 import { TransportToggle } from "../../components/TransportToggle";
 import { LyricsView } from "../lyrics/LyricsView";
-import { LyricsBackground } from "../lyrics/LyricsBackground";
+import { useAdaptiveLyricsPalette } from "../lyrics/useAdaptiveLyricsPalette";
 import {
   CloseIcon,
   HeartIcon,
@@ -22,17 +22,16 @@ import {
 } from "../../components/Icons";
 
 /**
- * Flip to `true` to adopt the adaptive background in Stage 1 (album-only view) as well (PRD §1).
+ * Flip to `true` to adopt the adaptive background in Stage 1 (album-only view) as well.
  */
 export const ENABLE_STAGE_1_BACKGROUND = false;
 
-const STAGE_FADE_MS = 500;
-
 /**
- * Immersive Now Playing (PRD §7.8, Adaptive Lyrics Background PRD §1, §6.5):
- * - Stage 1 (album only): plain dark background (`bg-app-bg`).
- * - Stage 2 (album + lyrics side by side): full-screen adaptive background behind top bar,
- *   album, controls, and lyrics, fading in/out over 500ms and unmounting when closed.
+ * Immersive Now Playing:
+ * - Stage 1 (album only): plain theme background (`bg-app-bg`), untouched.
+ * - Stage 2 (album + lyrics side by side): solid, album-adaptive dark background color
+ *   with contrast-verified CSS variables (`--bg`, `--lyric-active`, `--lyric-inactive`, `--accent`)
+ *   applied directly on the single root element with a 480ms `background-color` transition.
  */
 export function NowPlayingPage() {
   recordComponentRender("NowPlayingPage");
@@ -47,31 +46,7 @@ export function NowPlayingPage() {
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
 
-  // Stage 1 <-> Stage 2 background fade-in (500ms) and fade-out before unmount (PRD §1, §5)
-  const [bgMounted, setBgMounted] = useState(showBackground);
-  const [bgVisible, setBgVisible] = useState(showBackground);
-
-  useEffect(() => {
-    if (showBackground) {
-      setBgMounted(true);
-      let raf2 = 0;
-      const raf1 = requestAnimationFrame(() => {
-        raf2 = requestAnimationFrame(() => {
-          setBgVisible(true);
-        });
-      });
-      return () => {
-        cancelAnimationFrame(raf1);
-        cancelAnimationFrame(raf2);
-      };
-    } else {
-      setBgVisible(false);
-      const timer = setTimeout(() => {
-        setBgMounted(false);
-      }, STAGE_FADE_MS);
-      return () => clearTimeout(timer);
-    }
-  }, [showBackground]);
+  const palette = useAdaptiveLyricsPalette(track, showBackground);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -96,23 +71,32 @@ export function NowPlayingPage() {
     );
   }
 
+  const rootStyle: CSSProperties = showBackground
+    ? ({
+        "--bg": palette.bg,
+        "--lyric-active": palette.lyricActive,
+        "--lyric-inactive": palette.lyricInactive,
+        "--accent": palette.accent,
+        "--text-primary": palette.lyricActive,
+        "--text-secondary": palette.textSecondary,
+        "--text-muted": palette.textMuted,
+        backgroundColor: "var(--bg)",
+        transition: "background-color 480ms ease-out",
+      } as CSSProperties)
+    : {
+        transition: "background-color 480ms ease-out",
+      };
+
   return (
     <div
       className="fixed inset-0 z-10 flex flex-col overflow-hidden animate-fade-in select-none bg-app-bg"
       role="region"
       aria-label="Now playing"
       data-stage={showBackground ? "lyrics" : "album"}
-      data-theme={bgMounted ? "dark" : undefined}
+      data-theme={showBackground ? "dark" : undefined}
+      data-cover-category={showBackground ? palette.category : undefined}
+      style={rootStyle}
     >
-      {/* Full-screen adaptive background mounted once at player root during Stage 2 (PRD §1, §6.5) */}
-      {bgMounted && (
-        <LyricsBackground
-          track={track}
-          isPlaying={isPlaying}
-          visible={bgVisible}
-        />
-      )}
-
       {/* Top bar: close button on left, song title centered, lyrics toggle button on right */}
       <div className="relative z-10 flex items-center px-4 py-3 md:px-6 shrink-0">
         <button
@@ -128,7 +112,7 @@ export function NowPlayingPage() {
         </span>
         <button
           type="button"
-          className={`icon-btn shrink-0 ${lyricsMode ? "text-accent" : ""}`}
+          className={`icon-btn shrink-0 ${lyricsMode ? "text-text-primary" : ""}`}
           aria-label={lyricsMode ? "Hide lyrics" : "Show lyrics"}
           aria-pressed={lyricsMode}
           onClick={() => setLyricsMode(!lyricsMode)}
@@ -165,7 +149,6 @@ export function NowPlayingPage() {
               }`}
               style={{
                 transition: "transform 300ms cubic-bezier(0.22, 1, 0.36, 1)",
-                willChange: "transform",
                 backfaceVisibility: "hidden",
               }}
             >
@@ -192,11 +175,11 @@ export function NowPlayingPage() {
                   aria-pressed={track.isLiked}
                   onClick={() => void useLibraryStore.getState().toggleLike(track.id)}
                 >
-                  <HeartIcon size={19} filled={track.isLiked} className={track.isLiked ? "text-accent" : ""} />
+                  <HeartIcon size={19} filled={track.isLiked} className={track.isLiked ? "text-text-primary" : ""} />
                 </button>
               </div>
 
-              {/* 2. SeekBar (reuse existing component as-is) */}
+              {/* 2. SeekBar */}
               <SeekBar />
 
               {/* 3. Transport row, centered */}
@@ -219,7 +202,7 @@ export function NowPlayingPage() {
                 </button>
                 <button
                   type="button"
-                  className="grid size-14 place-items-center rounded-full bg-accent text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
+                  className="grid size-14 place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
                   title="Play/Pause (Space)"
                   aria-label={isPlaying ? "Pause" : "Play"}
                   onClick={() => usePlaybackStore.getState().togglePlay()}
@@ -253,7 +236,7 @@ export function NowPlayingPage() {
           </div>
         </div>
 
-        {/* Lyrics column — sits directly on the full-screen background (no separate card, PRD §1) */}
+        {/* Lyrics column — sits directly on the solid background */}
         {lyricsMode && (
           <div className="min-h-0 flex-1 pb-2">
             <LyricsView />

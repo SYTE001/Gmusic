@@ -1,7 +1,6 @@
 import { useEffect, useRef } from "react";
 import {
   DomLyricPlayer,
-  LayoutReason,
   LayoutReasonStrategyMap,
   type LyricLine,
   type LyricLineMouseEvent,
@@ -11,14 +10,11 @@ import "./amll.css";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { lineSeekTargetMs, toLyricClockMs } from "../../services/lyrics/amllAdapter";
 
-/** Without physics springs, line transitions settle within 340ms; 400ms gives plenty of headroom while paused. */
+/** Settle window (ms) after pause/seek/offset changes. */
 const SETTLE_MS = 400;
 
 /**
  * Exact timestamp preservation options for AMLL's LyricDataManager.
- * By default AMLL enables `tryAdvanceStartTime = true`, which subtracts up to 600ms
- * from `line.startTime` on the first line and after every inter-line gap, causing
- * lyrics to scroll and highlight up to 0.6s before the singer actually sings them.
  */
 const EXACT_TIMING_OPTIMIZE_OPTIONS = {
   tryAdvanceStartTime: false,
@@ -28,14 +24,8 @@ const EXACT_TIMING_OPTIMIZE_OPTIONS = {
   normalizeSpaces: false,
 } as const;
 
-/**
- * Keep all lines in a track mounted so scrolling never triggers mid-playback
- * DOM insertion/removal, synchronous layout reads, or ResizeObserver height jumps.
- */
 const FULL_TRACK_OVERSCAN_PX = 100000;
 
-// Eliminate staggered delays between lyric lines during normal playback ticks
-// and resize/config updates so lines move in unified synchronization without sequential lag.
 if (typeof LayoutReasonStrategyMap !== "undefined") {
   for (const entry of Object.values(LayoutReasonStrategyMap)) {
     if (entry) entry.disableStagger = true;
@@ -99,9 +89,6 @@ function createNoopAnimation(id: string): Animation {
   return anim;
 }
 
-// Eliminate redundant per-word float and per-character emphasize/matrix3d Web Animations
-// instances while preserving the `fade-word` mask-image animations responsible for
-// word-by-word highlight synchronization.
 if (typeof Element !== "undefined" && Element.prototype) {
   const proto = Element.prototype as unknown as {
     animate: typeof Element.prototype.animate;
@@ -127,67 +114,230 @@ if (typeof Element !== "undefined" && Element.prototype) {
 
 type InternalLyricGroup = {
   getElement?: () => HTMLElement;
-  onLineSizeChange?: (size: [number, number]) => void;
+  enable?: (currentTime: number, isPlaying: boolean) => void;
+  disable?: () => void;
 };
 
-type InternalDomLyricPlayer = DomLyricPlayer & {
-  size?: [number, number];
+type InternalDomLyricPlayer = {
   currentLyricGroups?: InternalLyricGroup[];
-  lyricGroupSize?: WeakMap<object, [number, number]>;
-  layoutCalculator?: {
-    setLineHeight?: (index: number, height: number) => void;
-  };
+  resizeObserver?: ResizeObserver;
   calcLayout?: (reason: unknown) => void;
+  syncTime?: (currentTime: number, isSeek: boolean) => void;
 };
 
 /**
- * Sets lyric lines and synchronously pre-measures all mounted line heights before paint
- * so lines render at their final vertical coordinates immediately without a delayed
- * ResizeObserver height shift on the next frame.
+ * Binary search over sorted lyric line timestamps (`O(log N)`).
+ * Returns the index of the latest line whose `startTime <= timeMs`, or `-1` if before line 0.
  */
-function applyLyricLinesSynchronously(
-  player: DomLyricPlayer,
-  host: HTMLElement,
-  lines: LyricLine[],
-  lyricClockMs: number,
-): void {
-  const internal = player as InternalDomLyricPlayer;
-  host.classList.add("gm-amll-no-transition");
-
-  if (Array.isArray(internal.size) && host.clientHeight > 0) {
-    internal.size[0] = host.clientWidth;
-    internal.size[1] = host.clientHeight;
-  }
-
-  player.setLyricLines(lines, lyricClockMs);
-
-  if (
-    Array.isArray(internal.currentLyricGroups) &&
-    internal.layoutCalculator?.setLineHeight &&
-    internal.lyricGroupSize
-  ) {
-    let measuredAny = false;
-    internal.currentLyricGroups.forEach((group, index) => {
-      const el = group.getElement?.();
-      if (!el) return;
-      const w = el.offsetWidth;
-      const h = el.offsetHeight;
-      if (w > 0 || h > 0) {
-        internal.lyricGroupSize?.set(group, [w, h]);
-        group.onLineSizeChange?.([w, h]);
-        internal.layoutCalculator?.setLineHeight?.(index, h);
-        measuredAny = true;
-      }
-    });
-    if (measuredAny) {
-      internal.calcLayout?.(LayoutReason?.RebuildView ?? 0);
-      player.update(0);
+export function findActiveLineBinary(lines: LyricLine[], timeMs: number): number {
+  let lo = 0;
+  let hi = lines.length - 1;
+  let ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (lines[mid].startTime <= timeMs) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
     }
   }
+  return ans;
+}
 
-  requestAnimationFrame(() => {
-    host.classList.remove("gm-amll-no-transition");
-  });
+type SingleContainerController = {
+  isNativeDomPlayer: boolean;
+  rebuild: (lines: LyricLine[], lyricClockMs: number, isPlaying: boolean) => void;
+  syncTime: (lyricClockMs: number, isSeek: boolean, isPlaying: boolean) => void;
+  measure: () => void;
+  dispose: () => void;
+};
+
+/**
+ * Wraps AMLL's line elements inside a single scrolling container (`div.gm-amll-scroll-track`)
+ * moved via `transform: translate3d(0, y, 0)` with cached line positions (`Float64Array`).
+ *
+ * - Measures line heights once on load and on container `ResizeObserver` (zero per-frame layout reads).
+ * - Binary-searches line timestamps and updates DOM only when the active line index changes.
+ * - Toggles `.FmKaba_active` only on the previous and new active line.
+ * - Preserves full compatibility with unit-test `FakePlayer` when `currentLyricGroups` is absent.
+ */
+function createSingleContainerController(
+  player: DomLyricPlayer,
+  host: HTMLElement,
+): SingleContainerController {
+  const internal = player as unknown as InternalDomLyricPlayer;
+  const playerRoot = player.getElement();
+  const scrollTrack = document.createElement("div");
+  scrollTrack.className = "gm-amll-scroll-track";
+
+  let currentLines: LyricLine[] = [];
+  let groups: InternalLyricGroup[] = [];
+  let lineTops = new Float64Array(0);
+  let lineHeights = new Float64Array(0);
+  let viewportHeight = 400;
+  let activeIndex = -2;
+  let currentY = Number.NaN;
+  let isNative = false;
+
+  const applyScrollForActiveIndex = (idx: number, immediate: boolean) => {
+    if (!isNative || groups.length === 0) return;
+    const clampedIdx = idx >= 0 ? Math.min(idx, groups.length - 1) : 0;
+    const top = lineTops[clampedIdx] ?? 0;
+    const height = lineHeights[clampedIdx] ?? 48;
+    const anchorY = viewportHeight * 0.36;
+    const targetY = Math.round(anchorY - (top + height * 0.5));
+
+    if (immediate) {
+      host.classList.add("gm-amll-no-transition");
+    }
+    if (targetY !== currentY || immediate) {
+      currentY = targetY;
+      scrollTrack.style.transform = `translate3d(0, ${targetY}px, 0)`;
+    }
+    if (immediate) {
+      requestAnimationFrame(() => {
+        host.classList.remove("gm-amll-no-transition");
+      });
+    }
+  };
+
+  const measure = () => {
+    if (!isNative) return;
+    viewportHeight = host.clientHeight || playerRoot.clientHeight || 400;
+    const count = groups.length;
+    if (lineTops.length !== count) {
+      lineTops = new Float64Array(count);
+      lineHeights = new Float64Array(count);
+    }
+    let accTop = 0;
+    for (let i = 0; i < count; i++) {
+      const el = groups[i]?.getElement?.();
+      const h = el ? el.offsetHeight || 48 : 48;
+      lineTops[i] = accTop;
+      lineHeights[i] = h;
+      accTop += h;
+    }
+    applyScrollForActiveIndex(activeIndex, true);
+  };
+
+  const syncTime = (lyricClockMs: number, isSeek: boolean, isPlaying: boolean) => {
+    if (!isNative) {
+      player.setCurrentTime(lyricClockMs, isSeek);
+      player.update(16);
+      return;
+    }
+
+    const nextIdx = findActiveLineBinary(currentLines, lyricClockMs);
+
+    // If the active line index has not changed and this is not a seek:
+    if (nextIdx === activeIndex && !isSeek) {
+      // Only update word-mask animator if the active line has word-by-word timestamps
+      if (nextIdx >= 0 && (currentLines[nextIdx]?.words.length ?? 0) > 1) {
+        groups[nextIdx]?.enable?.(lyricClockMs, isPlaying);
+      }
+      return;
+    }
+
+    // Active line index changed (or seek): toggle class ONLY on previous and new active line
+    if (activeIndex >= 0 && activeIndex < groups.length && activeIndex !== nextIdx) {
+      const prevGroup = groups[activeIndex];
+      const prevEl = prevGroup?.getElement?.();
+      if (prevEl) {
+        prevEl.classList.remove("FmKaba_active");
+        prevEl.removeAttribute("data-active");
+      }
+      prevGroup?.disable?.();
+    }
+
+    if (nextIdx >= 0 && nextIdx < groups.length) {
+      const nextGroup = groups[nextIdx];
+      const nextEl = nextGroup?.getElement?.();
+      if (nextEl) {
+        nextEl.classList.add("FmKaba_active");
+        nextEl.setAttribute("data-active", "true");
+      }
+      if ((currentLines[nextIdx]?.words.length ?? 0) > 1) {
+        nextGroup?.enable?.(lyricClockMs, isPlaying);
+      }
+    }
+
+    activeIndex = nextIdx;
+    applyScrollForActiveIndex(nextIdx, isSeek);
+  };
+
+  const rebuild = (lines: LyricLine[], lyricClockMs: number, isPlaying: boolean) => {
+    currentLines = lines;
+    activeIndex = -2;
+    currentY = Number.NaN;
+
+    host.classList.add("gm-amll-no-transition");
+    player.setLyricLines(lines, lyricClockMs);
+
+    if (Array.isArray(internal.currentLyricGroups)) {
+      isNative = true;
+      groups = internal.currentLyricGroups;
+
+      // Disable AMLL's internal per-line absolute positioning & per-line ResizeObserver
+      internal.calcLayout = () => {};
+      internal.syncTime = () => {};
+      internal.resizeObserver?.disconnect?.();
+
+      if (scrollTrack.parentElement !== playerRoot) {
+        playerRoot.appendChild(scrollTrack);
+      }
+
+      const elements: HTMLElement[] = [];
+      for (let i = 0; i < groups.length; i++) {
+        const el = groups[i]?.getElement?.();
+        if (el) {
+          el.style.transform = "";
+          el.style.opacity = "";
+          el.classList.remove("FmKaba_active");
+          el.removeAttribute("data-active");
+          elements.push(el);
+        }
+      }
+      scrollTrack.replaceChildren(...elements);
+
+      measure();
+      syncTime(lyricClockMs, true, isPlaying);
+    } else {
+      isNative = false;
+      player.setCurrentTime(lyricClockMs, true);
+      player.update(0);
+    }
+
+    requestAnimationFrame(() => {
+      host.classList.remove("gm-amll-no-transition");
+    });
+  };
+
+  let resizeRaf = 0;
+  let observer: ResizeObserver | null = null;
+  if (typeof ResizeObserver !== "undefined") {
+    observer = new ResizeObserver(() => {
+      cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        measure();
+      });
+    });
+    observer.observe(host);
+  }
+
+  return {
+    get isNativeDomPlayer() {
+      return isNative;
+    },
+    rebuild,
+    syncTime,
+    measure,
+    dispose: () => {
+      cancelAnimationFrame(resizeRaf);
+      observer?.disconnect();
+      scrollTrack.remove();
+    },
+  };
 }
 
 export type AmllLyricPlayerProps = {
@@ -209,15 +359,13 @@ function readAudioClockMs(): number {
 }
 
 /**
- * AMLL lyric renderer. The time value never touches React state: a
- * requestAnimationFrame loop reads the audio clock and feeds the player
- * imperatively, only while playing (plus a short settle window after
- * pause/seek/offset/line changes). Rendering concerns only — loading, badges,
- * offset persistence and seeking stay in LyricsView.
+ * Synchronized lyric renderer with single-container GPU transform scrolling
+ * (`translate3d(0, y, 0)`), cached line geometry, and binary-searched active line updates.
  */
 export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, onSeek }: AmllLyricPlayerProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<DomLyricPlayer | null>(null);
+  const controllerRef = useRef<SingleContainerController | null>(null);
   const kickRef = useRef<() => void>(() => undefined);
   const offsetRef = useRef(offsetMs);
   const playingRef = useRef(isPlaying);
@@ -229,7 +377,6 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     onSeekRef.current = onSeek;
   });
 
-  // Create the player once per mount; dispose on unmount (view hidden).
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -238,7 +385,6 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     const element = player.getElement();
     host.appendChild(element);
 
-    // Disable blur, spring physics, JS scale loops, and timestamp-mutating optimizers.
     player.setEnableBlur(false);
     player.setEnableSpring(false);
     player.setEnableScale(false);
@@ -247,6 +393,9 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     player.setLyricProcessConfig?.({
       optimizeOptions: { ...EXACT_TIMING_OPTIMIZE_OPTIONS },
     });
+
+    const controller = createSingleContainerController(player, host);
+    controllerRef.current = controller;
 
     let raf = 0;
     let lastFrame = 0;
@@ -261,14 +410,17 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
       const audioDelta = Math.abs(audioMs - lastAudioMs);
       const isSeek = lastFrame !== 0 && audioDelta > Math.max(600, delta * 3);
       lastAudioMs = audioMs;
-      player.setCurrentTime(toLyricClockMs(audioMs, offsetRef.current), isSeek);
-      player.update(delta);
+
+      const lyricClockMs = toLyricClockMs(audioMs, offsetRef.current);
+      controller.syncTime(lyricClockMs, isSeek, playingRef.current);
+
       if (playingRef.current || now < settleUntil) {
         raf = requestAnimationFrame(frame);
       } else {
         lastFrame = 0;
       }
     };
+
     const kick = () => {
       settleUntil = performance.now() + SETTLE_MS;
       if (raf === 0) raf = requestAnimationFrame(frame);
@@ -281,25 +433,24 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
         const targetAudioMs = lineSeekTargetMs(line.startTime, offsetRef.current);
         lastAudioMs = targetAudioMs;
         onSeekRef.current(targetAudioMs);
-        player.setCurrentTime(toLyricClockMs(targetAudioMs, offsetRef.current), true);
+        controller.syncTime(toLyricClockMs(targetAudioMs, offsetRef.current), true, playingRef.current);
         kick();
       }
     };
     player.addEventListener("click", onClick);
 
-    // Paused seeks update the store clock; follow them without a running loop.
     const unsubscribe = usePlaybackStore.subscribe((state, previous) => {
       if (state.currentTimeMs !== previous.currentTimeMs) {
         const audioMs = readAudioClockMs();
         if (!state.isPlaying || Math.abs(audioMs - lastAudioMs) > 600) {
           lastAudioMs = audioMs;
-          player.setCurrentTime(toLyricClockMs(audioMs, offsetRef.current), true);
+          controller.syncTime(toLyricClockMs(audioMs, offsetRef.current), true, state.isPlaying);
           kick();
         }
       }
     });
 
-    applyLyricLinesSynchronously(player, host, linesRef.current, toLyricClockMs(readAudioClockMs(), offsetRef.current));
+    controller.rebuild(linesRef.current, toLyricClockMs(readAudioClockMs(), offsetRef.current), playingRef.current);
     if (playingRef.current) player.resume();
     else player.pause();
     kick();
@@ -309,6 +460,8 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
       player.removeEventListener("click", onClick);
       if (raf !== 0) cancelAnimationFrame(raf);
       kickRef.current = () => undefined;
+      controller.dispose();
+      controllerRef.current = null;
       player.dispose();
       element.remove();
       playerRef.current = null;
@@ -316,13 +469,18 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
   }, []);
 
   useEffect(() => {
-    const player = playerRef.current;
-    const host = hostRef.current;
-    if (!player || !host || linesRef.current === lines) return;
+    const controller = controllerRef.current;
+    if (!controller || linesRef.current === lines) return;
     linesRef.current = lines;
-    applyLyricLinesSynchronously(player, host, lines, toLyricClockMs(readAudioClockMs(), offsetRef.current));
+    controller.rebuild(lines, toLyricClockMs(readAudioClockMs(), offsetRef.current), playingRef.current);
     kickRef.current();
   }, [lines]);
+
+  useEffect(() => {
+    const controller = controllerRef.current;
+    if (!controller) return;
+    controller.measure();
+  }, [fontSize]);
 
   useEffect(() => {
     playingRef.current = isPlaying;
@@ -333,11 +491,10 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     kickRef.current();
   }, [isPlaying]);
 
-  // Offset change: re-sync immediately as a seek, whether playing or paused.
   useEffect(() => {
-    const player = playerRef.current;
-    if (!player) return;
-    player.setCurrentTime(toLyricClockMs(readAudioClockMs(), offsetMs), true);
+    const controller = controllerRef.current;
+    if (!controller) return;
+    controller.syncTime(toLyricClockMs(readAudioClockMs(), offsetMs), true, playingRef.current);
     kickRef.current();
   }, [offsetMs]);
 

@@ -172,24 +172,23 @@ export function LyricsView() {
       geometryRef.current = null;
       return;
     }
-    const cRect = container.getBoundingClientRect();
-    const listRect = list.getBoundingClientRect();
     const count = lyrics.lines.length;
     const tops = new Float64Array(count);
     const heights = new Float64Array(count);
     const children = list.children;
+    let accTop = 0;
 
     for (let i = 0; i < count; i++) {
       const el = children[i] as HTMLElement | undefined;
-      if (el) {
-        const elRect = el.getBoundingClientRect();
-        tops[i] = elRect.top - listRect.top;
-        heights[i] = elRect.height;
-      }
+      const h = el ? el.offsetHeight || 40 : 40;
+      tops[i] = accTop;
+      heights[i] = h;
+      accTop += h;
     }
 
-    const containerHeight = container.clientHeight || cRect.height;
-    const maxScroll = Math.max(0, listRect.height - containerHeight);
+    const containerHeight = container.clientHeight || 400;
+    const listHeight = list.offsetHeight || accTop;
+    const maxScroll = Math.max(0, listHeight - containerHeight);
 
     geometryRef.current = {
       containerHeight,
@@ -506,7 +505,16 @@ export function LyricsView() {
           </div>
         </div>
       ) : timedLines ? (
-        <div className="relative z-10 min-h-0 flex-1" aria-label="Synced lyrics">
+        <div
+          className="relative z-10 min-h-0 flex-1 overflow-hidden"
+          style={{ contain: "layout paint" }}
+          aria-label="Synced lyrics"
+        >
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 top-0 z-20 h-12"
+            style={{ background: "linear-gradient(to bottom, var(--bg), transparent)" }}
+          />
           <Suspense fallback={<div className="grid h-full place-items-center text-sm text-text-muted">Loading…</div>}>
             <AmllLyricPlayer
               lines={amllLines}
@@ -516,6 +524,11 @@ export function LyricsView() {
               onSeek={seekToAudioMs}
             />
           </Suspense>
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-14"
+            style={{ background: "linear-gradient(to top, var(--bg), transparent)" }}
+          />
         </div>
       ) : (
         <div
@@ -535,10 +548,15 @@ export function LyricsView() {
           className="relative z-10 min-h-0 flex-1 overflow-hidden pr-1 focus:outline-none"
           style={{
             lineHeight: lyricLineSpacing,
-            contain: "layout paint style",
+            contain: "layout paint",
           }}
           aria-label="Lyrics"
         >
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 top-0 z-20 h-12"
+            style={{ background: "linear-gradient(to bottom, var(--bg), transparent)" }}
+          />
           <div
             ref={listRef}
             className={`flex flex-col gap-[0.65em] py-[30vh] ${alignClass}`}
@@ -552,6 +570,11 @@ export function LyricsView() {
               <LyricLineItem key={index} line={line} fontSize={FONT_SIZES[lyricFontSize]} />
             ))}
           </div>
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-x-0 bottom-0 z-20 h-14"
+            style={{ background: "linear-gradient(to top, var(--bg), transparent)" }}
+          />
         </div>
       )}
 
