@@ -8,7 +8,7 @@
  * - Scrolling moves one container with `transform: translate3d(0, y, 0)` and a 380ms
  *   ease-out transition (`cubic-bezier(0.22, 1, 0.36, 1)`).
  * - Zero `filter: blur`, `text-shadow`, `backdrop-filter`, `box-shadow`, or `mask-image`
- *   on the player container or inactive lines.
+ *   on the player container or lyric lines.
  * - Active line uses `var(--lyric-active, #ffffff)` (>= 7:1 contrast).
  * - Inactive lines use `var(--lyric-inactive, var(--text-secondary))` (>= 3:1 contrast)
  *   with `opacity: 1` and slight scale (`scale(0.985)` -> `scale(1)`) via transform only.
@@ -16,18 +16,22 @@
 
 .gm-amll {
   height: 100%;
+  width: 100%;
   min-height: 0;
   contain: layout paint;
 }
 
-.gm-amll .amll-lyric-player {
-  --amll-lp-color: var(--lyric-active, var(--text-primary));
-  --amll-lp-hover-bg-color: var(--surface-hover);
-  --amll-lp-font-size: var(--gm-lyric-font-size);
+.gm-amll .amll-lyric-player,
+.gm-amll-viewport {
   position: relative;
   width: 100%;
   height: 100%;
   overflow: hidden;
+  font-size: var(--gm-lyric-font-size, clamp(1.35rem, 3.2vw, 2.1rem));
+  line-height: 1.35;
+  font-weight: 700;
+  letter-spacing: -0.015em;
+  user-select: none;
   mix-blend-mode: normal;
   mask-image: none !important;
   -webkit-mask-image: none !important;
@@ -50,63 +54,37 @@
  * Suppress transitions during initial synchronous layout measurement or instant seeks.
  */
 .gm-amll.gm-amll-no-transition .gm-amll-scroll-track,
-.gm-amll.gm-amll-no-transition *,
-.gm-amll .FmKaba_tmpDisableTransition,
-.gm-amll .FmKaba_tmpDisableTransition * {
+.gm-amll.gm-amll-no-transition * {
   transition: none !important;
 }
 
 /*
- * Individual line wrapper: sits in static/relative flow inside `.gm-amll-scroll-track`.
+ * Individual lyric line wrapper: sits in static/relative flow inside `.gm-amll-scroll-track`.
  * No `will-change`, no `filter`, no `box-shadow`, no `backdrop-filter`.
  */
-.gm-amll .FmKaba_lyricLineWrapper {
-  position: relative !important;
-  top: auto !important;
-  left: auto !important;
-  transform: none !important;
-  opacity: 1 !important;
-  will-change: auto !important;
-  filter: none !important;
-  text-shadow: none !important;
-  box-shadow: none !important;
-  backdrop-filter: none !important;
-  transition: background-color 180ms ease !important;
+.gm-amll .FmKaba_lyricLineWrapper,
+.gm-lyric-line {
+  position: relative;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.42em 0.85em;
+  border-radius: 0.4em;
+  cursor: pointer;
+  will-change: auto;
+  filter: none;
+  text-shadow: none;
+  box-shadow: none;
+  backdrop-filter: none;
+  transition: background-color 160ms ease;
+}
+
+.gm-lyric-line:hover {
+  background-color: rgba(255, 255, 255, 0.06);
 }
 
 .gm-amll .FmKaba_lyricLine {
-  content-visibility: visible !important;
-  contain-intrinsic-size: none !important;
-  contain: layout style !important;
-  filter: none !important;
-  text-shadow: none !important;
-  box-shadow: none !important;
-  backdrop-filter: none !important;
-  transform: none !important;
-}
-
-/*
- * Do not dim inactive lines with AMLL's internal mask alpha; their legibility
- * is controlled directly via `var(--lyric-inactive)` (>= 3:1 contrast).
- */
-.gm-amll .FmKaba_lyricLineWrapper:not(.FmKaba_active) .FmKaba_lyricLine {
-  mask-image: none !important;
-  -webkit-mask-image: none !important;
-}
-
-/*
- * Lock inner word and character spans against float/glow animations.
- */
-.gm-amll .FmKaba_lyricMainLine span,
-.gm-amll .FmKaba_lyricMainLine .FmKaba_emphasizeWrapper,
-.gm-amll .FmKaba_lyricMainLine .FmKaba_emphasize,
-.gm-amll .FmKaba_lyricMainLine .FmKaba_romanWord,
-.gm-amll .FmKaba_lyricMainLine .FmKaba_rubyWord {
-  transform: none !important;
-  transition: none !important;
-  animation: none !important;
-  filter: none !important;
-  text-shadow: none !important;
+  width: 100%;
+  contain: layout style;
 }
 
 /*
@@ -116,15 +94,16 @@
 .gm-amll .FmKaba_lyricMainLine {
   display: block;
   color: var(--lyric-inactive, var(--text-secondary));
-  opacity: 1 !important;
+  opacity: 1;
   transform-origin: left center;
-  transform: scale(0.985) translate3d(0, 0, 0) !important;
+  transform: scale(0.98) translate3d(0, 0, 0);
   transition:
     color 240ms ease-out,
-    transform 240ms ease-out !important;
-  will-change: auto !important;
-  filter: none !important;
-  text-shadow: none !important;
+    transform 240ms ease-out;
+  will-change: auto;
+  filter: none;
+  text-shadow: none;
+  overflow-wrap: break-word;
 }
 
 /*
@@ -132,17 +111,23 @@
  * and `scale(1)`.
  */
 .gm-amll .FmKaba_active .FmKaba_lyricMainLine,
-.gm-amll .FmKaba_lyricMainLine.FmKaba_active {
+.gm-lyric-line--active .FmKaba_lyricMainLine {
   color: var(--lyric-active, #ffffff);
-  opacity: 1 !important;
-  transform: scale(1) translate3d(0, 0, 0) !important;
+  opacity: 1;
+  transform: scale(1) translate3d(0, 0, 0);
 }
 
-/* Background vocals / sub lines use the same >= 3:1 contrast token */
-.gm-amll .FmKaba_lyricBgLine .FmKaba_lyricMainLine,
-.gm-amll .FmKaba_lyricSubLine {
+/*
+ * Word-level sync spans: unsung words on the active line stay at `--lyric-inactive` (>= 3:1)
+ * and transition cleanly to `--lyric-active` (`#ffffff`, >= 7:1) as they are sung.
+ */
+.gm-lyric-word {
   color: var(--lyric-inactive, var(--text-secondary));
-  opacity: 1 !important;
+  transition: color 140ms ease-out;
+}
+
+.gm-lyric-line--active .gm-lyric-word.gm-lyric-word--sung {
+  color: var(--lyric-active, #ffffff);
 }
 
 @media (prefers-reduced-motion: reduce) {

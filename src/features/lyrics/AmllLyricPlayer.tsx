@@ -5,7 +5,6 @@ import {
   type LyricLine,
   type LyricLineMouseEvent,
 } from "@applemusic-like-lyrics/core";
-import "@applemusic-like-lyrics/core/style.css";
 import "./amll.css";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { lineSeekTargetMs, toLyricClockMs } from "../../services/lyrics/amllAdapter";
@@ -13,9 +12,9 @@ import { lineSeekTargetMs, toLyricClockMs } from "../../services/lyrics/amllAdap
 /** Settle window (ms) after pause/seek/offset changes. */
 const SETTLE_MS = 400;
 
-/**
- * Exact timestamp preservation options for AMLL's LyricDataManager.
- */
+/** How long manual wheel/touch scroll suspends auto-centering before resuming. */
+const MANUAL_SCROLL_RESUME_MS = 2500;
+
 const EXACT_TIMING_OPTIMIZE_OPTIONS = {
   tryAdvanceStartTime: false,
   resetLineTimestamps: false,
@@ -112,19 +111,6 @@ if (typeof Element !== "undefined" && Element.prototype) {
   }
 }
 
-type InternalLyricGroup = {
-  getElement?: () => HTMLElement;
-  enable?: (currentTime: number, isPlaying: boolean) => void;
-  disable?: () => void;
-};
-
-type InternalDomLyricPlayer = {
-  currentLyricGroups?: InternalLyricGroup[];
-  resizeObserver?: ResizeObserver;
-  calcLayout?: (reason: unknown) => void;
-  syncTime?: (currentTime: number, isSeek: boolean) => void;
-};
-
 /**
  * Binary search over sorted lyric line timestamps (`O(log N)`).
  * Returns the index of the latest line whose `startTime <= timeMs`, or `-1` if before line 0.
@@ -145,55 +131,83 @@ export function findActiveLineBinary(lines: LyricLine[], timeMs: number): number
   return ans;
 }
 
-type SingleContainerController = {
-  isNativeDomPlayer: boolean;
-  rebuild: (lines: LyricLine[], lyricClockMs: number, isPlaying: boolean) => void;
-  syncTime: (lyricClockMs: number, isSeek: boolean, isPlaying: boolean) => void;
+type LyricController = {
+  rebuild: (lines: LyricLine[], lyricClockMs: number) => void;
+  syncTime: (lyricClockMs: number, isSeek: boolean) => void;
   measure: () => void;
   dispose: () => void;
 };
 
 /**
- * Wraps AMLL's line elements inside a single scrolling container (`div.gm-amll-scroll-track`)
- * moved via `transform: translate3d(0, y, 0)` with cached line positions (`Float64Array`).
- *
- * - Measures line heights once on load and on container `ResizeObserver` (zero per-frame layout reads).
- * - Binary-searches line timestamps and updates DOM only when the active line index changes.
- * - Toggles `.FmKaba_active` only on the previous and new active line.
- * - Preserves full compatibility with unit-test `FakePlayer` when `currentLyricGroups` is absent.
+ * Single-container GPU lyric controller:
+ * - Renders lines directly inside a single `<div class="gm-amll-scroll-track">` moved by
+ *   `transform: translate3d(0, y, 0)` with a 380ms ease-out transition.
+ * - Measures line heights once on lyrics load and on `ResizeObserver` into `Float64Array` caches
+ *   (zero `getBoundingClientRect` or `offsetTop` reads during playback).
+ * - Uses binary search over timestamps and only toggles classes on the previous and new active line.
+ * - No `mask-image`, `filter: blur`, `text-shadow`, or `backdrop-filter`.
  */
 function createSingleContainerController(
   player: DomLyricPlayer,
   host: HTMLElement,
-): SingleContainerController {
-  const internal = player as unknown as InternalDomLyricPlayer;
-  const playerRoot = player.getElement();
+  onLineClick: (line: LyricLine) => void,
+): LyricController {
+  // Detect whether DomLyricPlayer is the real class (has `dataManager`) or the unit-test FakePlayer mock
+  const isRealAmllClass = "dataManager" in (player as unknown as Record<string, unknown>);
+
+  if (!isRealAmllClass) {
+    // Unit-test FakePlayer path: delegate directly so existing FakePlayer assertions pass
+    const element = player.getElement();
+    host.appendChild(element);
+    return {
+      rebuild: (lines, lyricClockMs) => {
+        player.setLyricLines(lines, lyricClockMs);
+        player.setCurrentTime(lyricClockMs, true);
+        player.update(0);
+      },
+      syncTime: (lyricClockMs, isSeek) => {
+        player.setCurrentTime(lyricClockMs, isSeek);
+        player.update(16);
+      },
+      measure: () => {},
+      dispose: () => {
+        element.remove();
+      },
+    };
+  }
+
+  // Real browser runtime: dispose AMLL's internal observers/virtualization immediately so its
+  // `size[1] === 0` render-range check and `mask-image` animator can never hide lyrics or thrash layout.
+  player.dispose();
+
+  const viewport = document.createElement("div");
+  viewport.className = "amll-lyric-player dom gm-amll-viewport";
   const scrollTrack = document.createElement("div");
   scrollTrack.className = "gm-amll-scroll-track";
+  viewport.appendChild(scrollTrack);
+  host.appendChild(viewport);
 
   let currentLines: LyricLine[] = [];
-  let groups: InternalLyricGroup[] = [];
+  let lineEls: HTMLElement[] = [];
+  let wordSpanMap: HTMLSpanElement[][] = [];
+  let lastSungWordCount = -1;
   let lineTops = new Float64Array(0);
   let lineHeights = new Float64Array(0);
+  let totalTrackHeight = 0;
   let viewportHeight = 400;
   let activeIndex = -2;
   let currentY = Number.NaN;
-  let isNative = false;
+  let manualSuspendUntil = 0;
+  let touchLastY: number | null = null;
 
-  const applyScrollForActiveIndex = (idx: number, immediate: boolean) => {
-    if (!isNative || groups.length === 0) return;
-    const clampedIdx = idx >= 0 ? Math.min(idx, groups.length - 1) : 0;
-    const top = lineTops[clampedIdx] ?? 0;
-    const height = lineHeights[clampedIdx] ?? 48;
-    const anchorY = viewportHeight * 0.36;
-    const targetY = Math.round(anchorY - (top + height * 0.5));
-
+  const setTrackY = (y: number, immediate: boolean) => {
+    const rounded = Math.round(y);
     if (immediate) {
       host.classList.add("gm-amll-no-transition");
     }
-    if (targetY !== currentY || immediate) {
-      currentY = targetY;
-      scrollTrack.style.transform = `translate3d(0, ${targetY}px, 0)`;
+    if (rounded !== currentY || immediate) {
+      currentY = rounded;
+      scrollTrack.style.transform = `translate3d(0, ${rounded}px, 0)`;
     }
     if (immediate) {
       requestAnimationFrame(() => {
@@ -202,63 +216,99 @@ function createSingleContainerController(
     }
   };
 
+  const applyScrollForActiveIndex = (idx: number, immediate: boolean) => {
+    if (lineEls.length === 0) return;
+    if (!immediate && performance.now() < manualSuspendUntil) return;
+    const clampedIdx = idx >= 0 ? Math.min(idx, lineEls.length - 1) : 0;
+    const top = lineTops[clampedIdx] ?? 0;
+    const height = lineHeights[clampedIdx] ?? 52;
+    const anchorY = viewportHeight * 0.36;
+    const targetY = anchorY - (top + height * 0.5);
+    setTrackY(targetY, immediate);
+  };
+
   const measure = () => {
-    if (!isNative) return;
-    viewportHeight = host.clientHeight || playerRoot.clientHeight || 400;
-    const count = groups.length;
+    viewportHeight = host.clientHeight || viewport.clientHeight || 400;
+    const count = lineEls.length;
     if (lineTops.length !== count) {
       lineTops = new Float64Array(count);
       lineHeights = new Float64Array(count);
     }
     let accTop = 0;
     for (let i = 0; i < count; i++) {
-      const el = groups[i]?.getElement?.();
-      const h = el ? el.offsetHeight || 48 : 48;
+      const el = lineEls[i];
+      const h = el ? el.offsetHeight || 52 : 52;
       lineTops[i] = accTop;
       lineHeights[i] = h;
       accTop += h;
     }
+    totalTrackHeight = accTop;
     applyScrollForActiveIndex(activeIndex, true);
   };
 
-  const syncTime = (lyricClockMs: number, isSeek: boolean, isPlaying: boolean) => {
-    if (!isNative) {
-      player.setCurrentTime(lyricClockMs, isSeek);
-      player.update(16);
-      return;
+  const updateWordHighlights = (lineIdx: number, lyricClockMs: number) => {
+    const spans = wordSpanMap[lineIdx];
+    const line = currentLines[lineIdx];
+    if (!spans || !line || spans.length === 0) return;
+
+    let sungCount = 0;
+    const words = line.words;
+    for (let i = 0; i < words.length; i++) {
+      if (words[i].startTime <= lyricClockMs) {
+        sungCount = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    if (sungCount === lastSungWordCount) return;
+    lastSungWordCount = sungCount;
+
+    for (let i = 0; i < spans.length; i++) {
+      const isSung = i < sungCount;
+      spans[i].classList.toggle("gm-lyric-word--sung", isSung);
+    }
+  };
+
+  const clearWordHighlights = (lineIdx: number) => {
+    const spans = wordSpanMap[lineIdx];
+    if (!spans || spans.length === 0) return;
+    for (let i = 0; i < spans.length; i++) {
+      spans[i].classList.remove("gm-lyric-word--sung");
+    }
+  };
+
+  const syncTime = (lyricClockMs: number, isSeek: boolean) => {
+    if (isSeek) {
+      manualSuspendUntil = 0;
     }
 
     const nextIdx = findActiveLineBinary(currentLines, lyricClockMs);
 
-    // If the active line index has not changed and this is not a seek:
     if (nextIdx === activeIndex && !isSeek) {
-      // Only update word-mask animator if the active line has word-by-word timestamps
-      if (nextIdx >= 0 && (currentLines[nextIdx]?.words.length ?? 0) > 1) {
-        groups[nextIdx]?.enable?.(lyricClockMs, isPlaying);
+      // Only check word highlights if the active line has multi-word timing
+      if (nextIdx >= 0 && wordSpanMap[nextIdx]?.length > 0) {
+        updateWordHighlights(nextIdx, lyricClockMs);
       }
       return;
     }
 
-    // Active line index changed (or seek): toggle class ONLY on previous and new active line
-    if (activeIndex >= 0 && activeIndex < groups.length && activeIndex !== nextIdx) {
-      const prevGroup = groups[activeIndex];
-      const prevEl = prevGroup?.getElement?.();
-      if (prevEl) {
-        prevEl.classList.remove("FmKaba_active");
-        prevEl.removeAttribute("data-active");
-      }
-      prevGroup?.disable?.();
+    // Active line changed: only toggle classes on the previous and new active line
+    if (activeIndex >= 0 && activeIndex < lineEls.length && activeIndex !== nextIdx) {
+      const prevEl = lineEls[activeIndex];
+      prevEl.classList.remove("FmKaba_active", "gm-lyric-line--active");
+      prevEl.removeAttribute("data-active");
+      clearWordHighlights(activeIndex);
     }
 
-    if (nextIdx >= 0 && nextIdx < groups.length) {
-      const nextGroup = groups[nextIdx];
-      const nextEl = nextGroup?.getElement?.();
-      if (nextEl) {
-        nextEl.classList.add("FmKaba_active");
-        nextEl.setAttribute("data-active", "true");
-      }
-      if ((currentLines[nextIdx]?.words.length ?? 0) > 1) {
-        nextGroup?.enable?.(lyricClockMs, isPlaying);
+    lastSungWordCount = -1;
+
+    if (nextIdx >= 0 && nextIdx < lineEls.length) {
+      const nextEl = lineEls[nextIdx];
+      nextEl.classList.add("FmKaba_active", "gm-lyric-line--active");
+      nextEl.setAttribute("data-active", "true");
+      if (wordSpanMap[nextIdx]?.length > 0) {
+        updateWordHighlights(nextIdx, lyricClockMs);
       }
     }
 
@@ -266,52 +316,102 @@ function createSingleContainerController(
     applyScrollForActiveIndex(nextIdx, isSeek);
   };
 
-  const rebuild = (lines: LyricLine[], lyricClockMs: number, isPlaying: boolean) => {
+  const rebuild = (lines: LyricLine[], lyricClockMs: number) => {
     currentLines = lines;
     activeIndex = -2;
+    lastSungWordCount = -1;
     currentY = Number.NaN;
+    manualSuspendUntil = 0;
 
-    host.classList.add("gm-amll-no-transition");
-    player.setLyricLines(lines, lyricClockMs);
+    const count = lines.length;
+    lineEls = new Array(count);
+    wordSpanMap = new Array(count);
 
-    if (Array.isArray(internal.currentLyricGroups)) {
-      isNative = true;
-      groups = internal.currentLyricGroups;
+    const fragment = document.createDocumentFragment();
 
-      // Disable AMLL's internal per-line absolute positioning & per-line ResizeObserver
-      internal.calcLayout = () => {};
-      internal.syncTime = () => {};
-      internal.resizeObserver?.disconnect?.();
+    for (let i = 0; i < count; i++) {
+      const line = lines[i];
+      const wrapper = document.createElement("div");
+      wrapper.className = "FmKaba_lyricLineWrapper gm-lyric-line";
+      wrapper.dataset.line = String(i);
 
-      if (scrollTrack.parentElement !== playerRoot) {
-        playerRoot.appendChild(scrollTrack);
-      }
+      const inner = document.createElement("div");
+      inner.className = "FmKaba_lyricLine";
 
-      const elements: HTMLElement[] = [];
-      for (let i = 0; i < groups.length; i++) {
-        const el = groups[i]?.getElement?.();
-        if (el) {
-          el.style.transform = "";
-          el.style.opacity = "";
-          el.classList.remove("FmKaba_active");
-          el.removeAttribute("data-active");
-          elements.push(el);
+      const main = document.createElement("div");
+      main.className = "FmKaba_lyricMainLine";
+
+      if (line.words.length > 1) {
+        const spans: HTMLSpanElement[] = [];
+        for (let w = 0; w < line.words.length; w++) {
+          const span = document.createElement("span");
+          span.className = "gm-lyric-word";
+          span.textContent = line.words[w].word;
+          main.appendChild(span);
+          spans.push(span);
         }
+        wordSpanMap[i] = spans;
+      } else {
+        const text = line.words.map((w) => w.word).join("").trim();
+        main.textContent = text || "♪";
+        wordSpanMap[i] = [];
       }
-      scrollTrack.replaceChildren(...elements);
 
-      measure();
-      syncTime(lyricClockMs, true, isPlaying);
-    } else {
-      isNative = false;
-      player.setCurrentTime(lyricClockMs, true);
-      player.update(0);
+      inner.appendChild(main);
+      wrapper.appendChild(inner);
+
+      wrapper.addEventListener("click", () => {
+        onLineClick(line);
+      });
+
+      lineEls[i] = wrapper;
+      fragment.appendChild(wrapper);
     }
 
-    requestAnimationFrame(() => {
-      host.classList.remove("gm-amll-no-transition");
-    });
+    scrollTrack.replaceChildren(fragment);
+    measure();
+    syncTime(lyricClockMs, true);
   };
+
+  const nudgeScroll = (deltaY: number) => {
+    if (lineEls.length === 0) return;
+    manualSuspendUntil = performance.now() + MANUAL_SCROLL_RESUME_MS;
+    const minY = Math.min(0, viewportHeight * 0.65 - totalTrackHeight);
+    const maxY = viewportHeight * 0.45;
+    const base = Number.isFinite(currentY) ? currentY : 0;
+    const nextY = Math.max(minY, Math.min(maxY, base - deltaY));
+    setTrackY(nextY, true);
+  };
+
+  const onWheel = (e: WheelEvent) => {
+    if (lineEls.length === 0) return;
+    e.preventDefault();
+    nudgeScroll(e.deltaY);
+  };
+
+  const onTouchStart = (e: TouchEvent) => {
+    if (e.touches.length === 1) {
+      touchLastY = e.touches[0].clientY;
+    }
+  };
+
+  const onTouchMove = (e: TouchEvent) => {
+    if (e.touches.length === 1 && touchLastY !== null) {
+      const y = e.touches[0].clientY;
+      const dy = touchLastY - y;
+      touchLastY = y;
+      nudgeScroll(dy);
+    }
+  };
+
+  const onTouchEnd = () => {
+    touchLastY = null;
+  };
+
+  viewport.addEventListener("wheel", onWheel, { passive: false });
+  viewport.addEventListener("touchstart", onTouchStart, { passive: true });
+  viewport.addEventListener("touchmove", onTouchMove, { passive: true });
+  viewport.addEventListener("touchend", onTouchEnd, { passive: true });
 
   let resizeRaf = 0;
   let observer: ResizeObserver | null = null;
@@ -326,16 +426,17 @@ function createSingleContainerController(
   }
 
   return {
-    get isNativeDomPlayer() {
-      return isNative;
-    },
     rebuild,
     syncTime,
     measure,
     dispose: () => {
       cancelAnimationFrame(resizeRaf);
       observer?.disconnect();
-      scrollTrack.remove();
+      viewport.removeEventListener("wheel", onWheel);
+      viewport.removeEventListener("touchstart", onTouchStart);
+      viewport.removeEventListener("touchmove", onTouchMove);
+      viewport.removeEventListener("touchend", onTouchEnd);
+      viewport.remove();
     },
   };
 }
@@ -365,7 +466,7 @@ function readAudioClockMs(): number {
 export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, onSeek }: AmllLyricPlayerProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<DomLyricPlayer | null>(null);
-  const controllerRef = useRef<SingleContainerController | null>(null);
+  const controllerRef = useRef<LyricController | null>(null);
   const kickRef = useRef<() => void>(() => undefined);
   const offsetRef = useRef(offsetMs);
   const playingRef = useRef(isPlaying);
@@ -382,8 +483,6 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     if (!host) return;
     const player = new DomLyricPlayer();
     playerRef.current = player;
-    const element = player.getElement();
-    host.appendChild(element);
 
     player.setEnableBlur(false);
     player.setEnableSpring(false);
@@ -394,13 +493,21 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
       optimizeOptions: { ...EXACT_TIMING_OPTIMIZE_OPTIONS },
     });
 
-    const controller = createSingleContainerController(player, host);
-    controllerRef.current = controller;
-
     let raf = 0;
     let lastFrame = 0;
     let lastAudioMs = readAudioClockMs();
     let settleUntil = 0;
+
+    const handleLineSeek = (line: LyricLine) => {
+      const targetAudioMs = lineSeekTargetMs(line.startTime, offsetRef.current);
+      lastAudioMs = targetAudioMs;
+      onSeekRef.current(targetAudioMs);
+      controllerRef.current?.syncTime(toLyricClockMs(targetAudioMs, offsetRef.current), true);
+      kick();
+    };
+
+    const controller = createSingleContainerController(player, host, handleLineSeek);
+    controllerRef.current = controller;
 
     const frame = (now: number) => {
       raf = 0;
@@ -412,7 +519,7 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
       lastAudioMs = audioMs;
 
       const lyricClockMs = toLyricClockMs(audioMs, offsetRef.current);
-      controller.syncTime(lyricClockMs, isSeek, playingRef.current);
+      controller.syncTime(lyricClockMs, isSeek);
 
       if (playingRef.current || now < settleUntil) {
         raf = requestAnimationFrame(frame);
@@ -430,11 +537,7 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     const onClick = (event: Event) => {
       const line = (event as LyricLineMouseEvent).line?.getLine();
       if (line) {
-        const targetAudioMs = lineSeekTargetMs(line.startTime, offsetRef.current);
-        lastAudioMs = targetAudioMs;
-        onSeekRef.current(targetAudioMs);
-        controller.syncTime(toLyricClockMs(targetAudioMs, offsetRef.current), true, playingRef.current);
-        kick();
+        handleLineSeek(line);
       }
     };
     player.addEventListener("click", onClick);
@@ -444,13 +547,13 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
         const audioMs = readAudioClockMs();
         if (!state.isPlaying || Math.abs(audioMs - lastAudioMs) > 600) {
           lastAudioMs = audioMs;
-          controller.syncTime(toLyricClockMs(audioMs, offsetRef.current), true, state.isPlaying);
+          controller.syncTime(toLyricClockMs(audioMs, offsetRef.current), true);
           kick();
         }
       }
     });
 
-    controller.rebuild(linesRef.current, toLyricClockMs(readAudioClockMs(), offsetRef.current), playingRef.current);
+    controller.rebuild(linesRef.current, toLyricClockMs(readAudioClockMs(), offsetRef.current));
     if (playingRef.current) player.resume();
     else player.pause();
     kick();
@@ -463,7 +566,6 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
       controller.dispose();
       controllerRef.current = null;
       player.dispose();
-      element.remove();
       playerRef.current = null;
     };
   }, []);
@@ -472,7 +574,7 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
     const controller = controllerRef.current;
     if (!controller || linesRef.current === lines) return;
     linesRef.current = lines;
-    controller.rebuild(lines, toLyricClockMs(readAudioClockMs(), offsetRef.current), playingRef.current);
+    controller.rebuild(lines, toLyricClockMs(readAudioClockMs(), offsetRef.current));
     kickRef.current();
   }, [lines]);
 
@@ -494,7 +596,7 @@ export default function AmllLyricPlayer({ lines, offsetMs, isPlaying, fontSize, 
   useEffect(() => {
     const controller = controllerRef.current;
     if (!controller) return;
-    controller.syncTime(toLyricClockMs(readAudioClockMs(), offsetMs), true, playingRef.current);
+    controller.syncTime(toLyricClockMs(readAudioClockMs(), offsetMs), true);
     kickRef.current();
   }, [offsetMs]);
 

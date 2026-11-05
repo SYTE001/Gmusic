@@ -367,4 +367,45 @@ describe("LyricsView with the AMLL player", () => {
     expect(line0.words[1]).toEqual({ word: " up", startTime: 1500, endTime: 2000 });
     expect(line0.words[2]).toEqual({ word: " now", startTime: 2000, endTime: 5000 });
   });
+
+  it("renders visible lyric lines and word spans in the real single-container DOM path and scrolls via translate3d", async () => {
+    (FakePlayer.prototype as unknown as { dataManager?: object }).dataManager = {};
+    try {
+      const { container } = await renderView(wordLyrics, "word");
+      await waitFor(() => {
+        expect(container.querySelectorAll(".gm-lyric-line").length).toBe(2);
+      });
+
+      const scrollTrack = container.querySelector(".gm-amll-scroll-track") as HTMLElement | null;
+      expect(scrollTrack).not.toBeNull();
+      expect(scrollTrack?.style.transform).toMatch(/^translate3d\(0,\s*-?\d+px,\s*0\)$/);
+
+      const lineEls = container.querySelectorAll(".gm-lyric-line");
+      expect(lineEls[0].textContent).toBe("Word up now");
+      expect(lineEls[1].textContent).toBe("second line");
+
+      // Advance clock to 1600ms -> line 0 active, first 2 words sung ("Word", " up")
+      seekTo(1600);
+      await waitFor(() => {
+        expect(lineEls[0].classList.contains("gm-lyric-line--active")).toBe(true);
+      });
+      const sungWords = lineEls[0].querySelectorAll(".gm-lyric-word--sung");
+      expect(sungWords.length).toBe(2);
+
+      // Advance clock to 5500ms -> line 1 active, line 0 inactive
+      seekTo(5500);
+      await waitFor(() => {
+        expect(lineEls[0].classList.contains("gm-lyric-line--active")).toBe(false);
+        expect(lineEls[1].classList.contains("gm-lyric-line--active")).toBe(true);
+      });
+
+      // Clicking line 0 seeks to 1000ms
+      const seek = vi.fn();
+      usePlaybackStore.setState({ seek });
+      fireEvent.click(lineEls[0]);
+      expect(seek).toHaveBeenCalledWith(1000);
+    } finally {
+      delete (FakePlayer.prototype as unknown as { dataManager?: object }).dataManager;
+    }
+  });
 });
