@@ -677,12 +677,26 @@ Before marking a task complete, confirm:
 
 **Operating rule:** Read this guide every time. Then read only the code needed to complete the current task safely. Repository exploration should be evidence-driven, not exhaustive.
 
-## 16. Stable Checkpoint (2026-11-05)
+## 16. Stable Checkpoint (P0 Reliability & Product Stabilization - 2026-11-05)
 
-Commit `ea81272` on `main` is the known-good checkpoint: `npm run typecheck`, `npm test` (targeted lyrics/now-playing suites), `npm run lint` and `npm run build` all pass. If later work breaks lyrics, the Stage 2 background or the Vercel build, compare against it (`git diff ea81272`) or restore the affected files.
+The repository at this commit is the certified stable checkpoint: `npm run typecheck`, full `npm test` (49 test files, 587 tests), `npm run lint`, and `npm run build` all pass cleanly.
 
-State at this checkpoint:
+State and invariants at this checkpoint:
 - `@types/node` is a devDependency (fixes Vercel `TS2307: node:crypto` from `importService.test.ts`); tests stay type-checked.
 - Stage 2 background is a single solid album-adaptive color (`src/features/lyrics/palette/*`, `useAdaptiveLyricsPalette.ts`); the old animated background (`LyricsBackground.tsx`, `lyricsBackground.css`, presets, `animatedLyricsBackground` setting) is removed and must not return.
 - Lyrics render/scroll in `AmllLyricPlayer.tsx` via one `translate3d` track with directly built line/word DOM; `LyricsView.test.tsx` covers the real DOM path.
-- Known open item: `npm audit` reports vulnerabilities (8 moderate, 2 critical) - handle in a separate security audit, never with `npm audit fix --force`.
+- **Storage & Backup Reliability:**
+  - `restoreBackup` runs atomically via `repository.replaceLibrary` in one transaction. Partial writes abort cleanly, leaving the prior library intact.
+  - Restoring a backup retains valid `handles` and `audio` (stored copies) for tracks present in the backup, preventing needless re-links.
+  - Stricter backup validation rejects duplicate track IDs, non-string playlist track IDs, and malformed lyric lines.
+  - Atomic import writes via `repository.putTrackWithFiles` write track + artwork + audio/handle in a single transaction, preventing orphan records.
+  - `onversionchange` listener on IndexedDB closes stale connections when another tab initiates a schema upgrade, preventing database lockups.
+  - Automatic `requestPersistentStorage()` is called on successful imports (best-effort once per session).
+- **Library & Playback Integrity:**
+  - Re-importing matching audio files for unavailable tracks (`missing`, `permission-required`, `offline`) relinks them and sets them `available` instead of skipping as duplicate.
+  - Startup access check verifies granted handles with `handle.getFile()`, honestly marking moved/deleted files `missing`.
+  - Relinking clears `broken: null` so recovered tracks don't revert to broken status on reload.
+  - Removing tracks purges them from the active queue and context, adjusting `queueIndex` properly.
+  - Session recovery re-maps the active index accurately when preceding tracks were deleted.
+  - Session state and playback are cleanly stopped and cleared on backup restore via `resetPlaybackState()`.
+- Known open item: `npm audit` reports vulnerabilities (8 moderate, 2 critical) — handle in a separate security audit, never with `npm audit fix --force`.

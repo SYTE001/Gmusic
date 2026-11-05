@@ -245,6 +245,9 @@ Provide:
 - Explain that clearing the library database does not delete original audio files.
 - Show approximate database/storage use where supported.
 - Handle IndexedDB failures, quota errors, migration failures, and corrupted backups without losing the only copy of data silently.
+- Restore is atomic in one transaction: failures abort completely without partial data loss, while preserving existing handles and stored copies for matching tracks.
+- Atomic import writes (metadata + artwork + audio/handle) prevent orphan records on storage errors.
+- Re-importing matching audio files for unavailable tracks (missing, permission-required, offline) relinks them and sets them available.
 
 ### 7.12 Offline and PWA Behavior
 
