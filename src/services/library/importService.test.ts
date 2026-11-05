@@ -577,3 +577,56 @@ describe("importAudioItems intelligent re-import & duplicate reconciliation", ()
     });
   });
 });
+
+describe("re-import relinks tracks that have no usable audio", () => {
+  beforeEach(() => {
+    libraryMap.clear();
+    audioMap.clear();
+    artworkMap.clear();
+  });
+
+  it.each(["missing", "permission-required", "offline"] as const)(
+    "relinks a %s track with the same file instead of skipping it as a duplicate",
+    async (availability) => {
+      const first = await run([audioFile("a.mp3", "bytes-a")]);
+      const id = first.newTracks![0].id;
+      libraryMap.set(id, { ...libraryMap.get(id)!, availability, accessMode: "session-only" });
+      audioMap.clear();
+
+      const outcome = await run([audioFile("a.mp3", "bytes-a")]);
+
+      expect(outcome.added).toBe(0);
+      expect(outcome.duplicatesSkipped).toBe(0);
+      expect(outcome.updated).toBe(1);
+      expect(libraryMap.size).toBe(1);
+      expect(libraryMap.get(id)).toMatchObject({ availability: "available", accessMode: "stored-copy" });
+      expect(audioMap.has(id)).toBe(true);
+    },
+  );
+
+  it("still skips an identical file when the track already plays", async () => {
+    await run([audioFile("a.mp3", "bytes-a")]);
+    const outcome = await run([audioFile("a.mp3", "bytes-a")]);
+    expect(outcome.duplicatesSkipped).toBe(1);
+    expect(outcome.updated).toBe(0);
+  });
+});
+
+describe("realistic personal library (100 tracks)", () => {
+  beforeEach(() => {
+    libraryMap.clear();
+    audioMap.clear();
+  });
+
+  it("imports 100 distinct files, then re-importing all of them creates no duplicates", async () => {
+    const files = () => Array.from({ length: 100 }, (_, i) => audioFile(`track-${i}.mp3`, `distinct-audio-bytes-${i}-${"x".repeat(i)}`));
+    const first = await run(files());
+    expect(first.added).toBe(100);
+    expect(first.failed).toHaveLength(0);
+
+    const second = await run(files());
+    expect(second.added).toBe(0);
+    expect(second.duplicatesSkipped).toBe(100);
+    expect(libraryMap.size).toBe(100);
+  });
+});

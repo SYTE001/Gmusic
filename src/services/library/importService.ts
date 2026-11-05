@@ -472,8 +472,16 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
         const matchedTrack = matchedCandidate.match;
         const comparison = evaluateMetadataImprovement(matchedTrack, tags, fallback, effectiveDurationMs);
         const wasBroken = matchedTrack.availability === "broken" || Boolean(matchedTrack.broken?.isBroken);
+        // A matching file for a track that currently has no usable audio (broken,
+        // missing after a restore/reload, permission lost, cloud-only offline)
+        // must re-link it, not be dropped as a "duplicate".
+        const needsRelink =
+          wasBroken ||
+          matchedTrack.availability === "missing" ||
+          matchedTrack.availability === "permission-required" ||
+          matchedTrack.availability === "offline";
 
-        if (comparison.hasImprovement || wasBroken) {
+        if (comparison.hasImprovement || needsRelink) {
           // Safe audio replacement: do not overwrite track if audio replacement fails
           let audioUpdateSucceeded = true;
           try {
@@ -513,7 +521,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
             storageProvider: matchedTrack.storageProvider,
             cloudStatus: matchedTrack.cloudStatus,
             lastSyncedAt: matchedTrack.lastSyncedAt,
-            availability: wasBroken ? "available" : matchedTrack.availability,
+            availability: needsRelink ? "available" : matchedTrack.availability,
             broken: wasBroken ? null : matchedTrack.broken,
             title: comparison.improvedTitle ?? matchedTrack.title,
             artist: comparison.improvedArtist ?? matchedTrack.artist,

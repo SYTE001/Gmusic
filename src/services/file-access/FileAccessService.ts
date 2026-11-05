@@ -339,7 +339,16 @@ export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Tra
       const handle = await repository.getHandle(track.id);
       if (handle) {
         const permission = await queryHandlePermission(handle);
-        if (permission === "granted") updates.set(track.id, "available");
+        if (permission === "granted") {
+          // Granted permission alone does not prove the file still exists
+          // (moved, renamed or deleted): open it once so the status is honest.
+          try {
+            await handle.getFile();
+            updates.set(track.id, "available");
+          } catch {
+            updates.set(track.id, playableWithoutHandle ? "available" : "missing");
+          }
+        }
         // Not granted — but a stored copy plays without any permission.
         else updates.set(track.id, playableWithoutHandle ? "available" : "permission-required");
         continue;
@@ -399,7 +408,7 @@ export async function relinkTrackWithFile(
     warning = `The selected file is ${actualFile.size} bytes but this track was ${track.fileSize} bytes. Linked anyway.`;
   }
 
-  const updated: Track = { ...track, availability: "available" };
+  const updated: Track = { ...track, availability: "available", broken: null };
   if ("getFile" in file && fileSystemAccessSupported()) {
     await repository.putHandle(track.id, file);
     await repository.deleteAudioBlob(track.id);
@@ -408,6 +417,6 @@ export async function relinkTrackWithFile(
     await repository.putAudioBlob(track.id, actualFile);
     updated.accessMode = "stored-copy";
   }
-  await repository.updateTrack(track.id, { availability: "available", accessMode: updated.accessMode });
+  await repository.updateTrack(track.id, { availability: "available", accessMode: updated.accessMode, broken: null });
   return { updated, warning };
 }

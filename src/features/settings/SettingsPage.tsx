@@ -12,7 +12,7 @@ import {
   type BackupSummary,
 } from "../../services/backup/backupService";
 import { repository } from "../../services/indexeddb/LibraryRepository";
-import { flushPlaybackSessionNow } from "../../stores/libraryStore";
+import { resetPlaybackState } from "../../stores/libraryStore";
 import { fileSystemAccessSupported } from "../../services/file-access/FileAccessService";
 import { humanBytes } from "../../utils/misc";
 import { APP_VERSION } from "../../types";
@@ -120,8 +120,8 @@ export function SettingsPage() {
     }
     try {
       await restoreBackup(result.backup);
-      // Clear the saved playback session: its track references are stale.
-      flushPlaybackSessionNow();
+      // Stop playback and drop the saved session: its track references are stale.
+      await resetPlaybackState();
       await useLibraryStore.getState().init();
       setRestore({ phase: "idle" });
       toast("success", "Backup restored. Re-import or re-link your audio files to play them again.");

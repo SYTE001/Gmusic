@@ -5,6 +5,7 @@ import {
   hasSessionFile,
   revalidateAccess,
   rememberSessionFile,
+  relinkTrackWithFile,
   resolveTrackSource,
 } from "./FileAccessService";
 
@@ -318,5 +319,61 @@ describe("availability revalidation", () => {
     setOnline(false);
     const offline = await revalidateAccess([track]);
     expect(offline.get(track.id)).toBe("offline");
+  });
+});
+
+describe("unavailable source detection", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    vi.restoreAllMocks();
+    setOnline(true);
+  });
+
+  it("marks a track missing when its granted handle's file is gone", async () => {
+    const track = makeTrack({ id: "moved", accessMode: "handle" });
+    await repository.putTracks([track]);
+    vi.spyOn(repository, "getHandle").mockResolvedValue(brokenHandle("granted"));
+
+    const updates = await revalidateAccess([track]);
+    expect(updates.get(track.id)).toBe("missing");
+    // Library metadata is untouched by the check itself.
+    expect((await repository.getTrack(track.id))?.title).toBe("Song");
+  });
+
+  it("keeps a track available when the handle's file is gone but a stored copy plays", async () => {
+    const track = makeTrack({ id: "moved-copy", accessMode: "handle" });
+    await repository.putTracks([track]);
+    await repository.putAudioBlob(track.id, new Blob([new Uint8Array(4)]));
+    vi.spyOn(repository, "getHandle").mockResolvedValue(brokenHandle("granted"));
+
+    const updates = await revalidateAccess([track]);
+    expect(updates.get(track.id)).toBe("available");
+  });
+
+  it("keeps a track available when the handle's file still opens", async () => {
+    const track = makeTrack({ id: "present", accessMode: "handle" });
+    await repository.putTracks([track]);
+    vi.spyOn(repository, "getHandle").mockResolvedValue(stubHandle("granted", async () => new File([new Uint8Array(4)], "song.mp3")));
+
+    const updates = await revalidateAccess([track]);
+    expect(updates.get(track.id)).toBe("available");
+  });
+
+  it("relinking clears the broken flag so it does not come back after a reload", async () => {
+    const track = makeTrack({
+      id: "was-broken",
+      availability: "broken",
+      accessMode: "stored-copy",
+      broken: { isBroken: true, category: "missing", description: "gone", failedAt: 1, retryCount: 1 },
+    });
+    await repository.putTracks([track]);
+
+    const { updated } = await relinkTrackWithFile(track, new File([new Uint8Array(4)], "song.mp3"));
+    expect(updated.broken).toBeNull();
+
+    const stored = (await repository.getTrack(track.id))!;
+    expect(stored.broken).toBeNull();
+    const updates = await revalidateAccess([stored]);
+    expect(updates.get(track.id)).toBe("available");
   });
 });

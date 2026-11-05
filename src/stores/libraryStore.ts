@@ -89,19 +89,22 @@ function sessionPayload(): ReturnType<typeof savePlaybackSession> | null {
     currentTrackId: fresh.currentTrackId,
     positionMs: Math.round(fresh.currentTimeMs),
     savedAt: Date.now(),
+  }).catch((error) => {
+    // Best-effort save: a storage failure must not become an unhandled rejection.
+    console.warn("Failed to save the playback session", error);
   });
 }
 
 const persistSession = debounce(() => {
   const payload = sessionPayload();
-  if (!payload) void clearPlaybackSession();
+  if (!payload) void clearPlaybackSession().catch(() => undefined);
 }, 1200);
 
 /** Called on pause/track change; flushes immediately rather than debounced. */
 function persistSessionNow(): void {
   persistSession.cancel();
   const payload = sessionPayload();
-  if (!payload) void clearPlaybackSession();
+  if (!payload) void clearPlaybackSession().catch(() => undefined);
 }
 
 export function schedulePlaybackSessionPersist(): void {
@@ -111,6 +114,29 @@ export function schedulePlaybackSessionPersist(): void {
 export function flushPlaybackSessionNow(): void {
   persistSessionNow();
 }
+
+/** Stops playback and drops the queue and the saved session (their track references are stale). */
+export async function resetPlaybackState(): Promise<void> {
+  persistSession.cancel();
+  await clearPlaybackSession();
+  const playback = usePlaybackStore.getState();
+  playback.getEngine().pause();
+  playback.getEngine().setSource(null);
+  releaseActiveTrackSource();
+  usePlaybackStore.setState({
+    currentTrackId: null,
+    isPlaying: false,
+    status: "idle",
+    queueTrackIds: [],
+    queueIndex: -1,
+    contextTrackIds: [],
+    context: null,
+    currentTimeMs: 0,
+    durationMs: null,
+  });
+}
+
+let queueSubscribed = false;
 
 let cloudSyncCallback: (() => Promise<void>) | null = null;
 export function registerCloudSyncCallback(cb: () => Promise<void>): () => void {
@@ -155,6 +181,13 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   lastImportOutcome: null,
 
   init: async () => {
+    if (!queueSubscribed) {
+      queueSubscribed = true;
+      // Queue edits (add, remove, reorder, shuffle) are saved too, not only pause/seek/track change.
+      usePlaybackStore.subscribe((state, prev) => {
+        if (state.queueTrackIds !== prev.queueTrackIds) schedulePlaybackSessionPersist();
+      });
+    }
     bindLyricsTrackLookup((id) => get().tracks.find((track) => track.id === id));
     bindPlaybackHelpers({
       getTrackForPlayback: async (id) => get().tracks.find((track) => track.id === id),
@@ -276,10 +309,18 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       // Restore last session (paused; playback needs a user gesture).
       const session = await loadPlaybackSession();
       if (session?.currentTrackId && effectiveTracks.some((track) => track.id === session.currentTrackId)) {
+        const known = new Set(effectiveTracks.map((track) => track.id));
+        const queueTrackIds = session.queueTrackIds.filter((id) => known.has(id));
+        // Deleted tracks shift positions: re-derive the index of the saved slot
+        // (kept entries before it) instead of reusing the stale number.
+        const keptBefore = session.queueTrackIds.slice(0, Math.max(0, session.queueIndex)).filter((id) => known.has(id)).length;
+        const queueIndex = session.queueTrackIds[session.queueIndex] === session.currentTrackId
+          ? keptBefore
+          : queueTrackIds.indexOf(session.currentTrackId);
         usePlaybackStore.getState().restoreQueue({
-          queueTrackIds: session.queueTrackIds.filter((id) => effectiveTracks.some((track) => track.id === id)),
-          queueIndex: session.queueIndex,
-          contextTrackIds: session.contextTrackIds.filter((id) => effectiveTracks.some((track) => track.id === id)),
+          queueTrackIds,
+          queueIndex,
+          contextTrackIds: session.contextTrackIds.filter((id) => known.has(id)),
           context: session.context,
           currentTrackId: session.currentTrackId,
           positionMs: session.positionMs,
@@ -373,6 +414,14 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     if (playback.currentTrackId && idSet.has(playback.currentTrackId)) {
       usePlaybackStore.setState({ currentTrackId: null, isPlaying: false, status: "idle", queueTrackIds: [], queueIndex: -1 });
       playback.getEngine().pause();
+    } else if (playback.queueTrackIds.some((id) => idSet.has(id)) || playback.contextTrackIds.some((id) => idSet.has(id))) {
+      // Removed tracks must not stay queued: advancing onto one would stop playback with "Track not found".
+      const queueTrackIds = playback.queueTrackIds.filter((id) => !idSet.has(id));
+      usePlaybackStore.setState({
+        queueTrackIds,
+        queueIndex: playback.currentTrackId ? queueTrackIds.indexOf(playback.currentTrackId) : -1,
+        contextTrackIds: playback.contextTrackIds.filter((id) => !idSet.has(id)),
+      });
     }
     scheduleCloudPush();
   },
@@ -387,8 +436,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     set({ tracks: get().tracks.map((track) => (track.id === trackId ? { ...track, isLiked: liked } : track)) });
     try {
       await repository.updateTrack(trackId, { isLiked: liked });
+      scheduleCloudPush();
     } catch (error) {
-    scheduleCloudPush();
       set({ tracks: get().tracks.map((track) => (track.id === trackId ? { ...track, isLiked: !liked } : track)) });
       toast("error", error instanceof DBError ? error.message : "Could not save the liked state.");
     }
@@ -399,8 +448,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const playlist: Playlist = { id: createId(), name: name.trim(), description: "", trackIds: [], createdAt: now, updatedAt: now };
     await repository.putPlaylist(playlist);
     set({ playlists: [...get().playlists, playlist] });
-    return playlist;
     scheduleCloudPush();
+    return playlist;
   },
 
   renamePlaylist: async (playlistId, name) => {
@@ -500,23 +549,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
 
   clearLibrary: async () => {
     await repository.clearLibrary();
-    await clearPlaybackSession();
     set({ tracks: [], playlists: [], trackStats: {}, lastImportOutcome: null });
-    const playback = usePlaybackStore.getState();
-    playback.getEngine().pause();
-    playback.getEngine().setSource(null);
-    releaseActiveTrackSource();
-    usePlaybackStore.setState({
-      currentTrackId: null,
-      isPlaying: false,
-      status: "idle",
-      queueTrackIds: [],
-      queueIndex: -1,
-      contextTrackIds: [],
-      context: null,
-      currentTimeMs: 0,
-      durationMs: null,
-    });
+    await resetPlaybackState();
   },
 
   applyCloudUpdate: async (trackId, patch) => {

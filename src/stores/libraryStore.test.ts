@@ -3,6 +3,7 @@ import { useLibraryStore } from "./libraryStore";
 import { usePlaybackStore } from "./playbackStore";
 import type { AudioEngine } from "../services/audio/engine";
 import { repository } from "../services/indexeddb/LibraryRepository";
+import { savePlaybackSession } from "../services/library/playbackSession";
 import type { Track } from "../types";
 
 /** Minimal engine stub so store code paths never touch real media elements. */
@@ -160,5 +161,140 @@ describe("library store (IndexedDB-backed)", () => {
     // Subsequent play increments accurately
     await useLibraryStore.getState().markTrackPlayed("track-1");
     expect(useLibraryStore.getState().trackStats["track-1"].playCount).toBe(4);
+  });
+});
+
+describe("queue and session consistency", () => {
+  const resetPlayback = () =>
+    usePlaybackStore.setState({
+      currentTrackId: null,
+      isPlaying: false,
+      status: "idle",
+      queueTrackIds: [],
+      queueIndex: -1,
+      contextTrackIds: [],
+      context: null,
+      currentTimeMs: 0,
+    });
+
+  beforeEach(async () => {
+    await repository.clearAllData();
+    installEngineStub();
+    resetPlayback();
+    useLibraryStore.setState({ tracks: [], playlists: [], status: "loading", loadError: null });
+  });
+
+  it("removing an upcoming track also removes it from the live queue", async () => {
+    const [a, b, c] = [makeTrack({ id: "qa" }), makeTrack({ id: "qb" }), makeTrack({ id: "qc" })];
+    await repository.putTracks([a, b, c]);
+    await useLibraryStore.getState().init();
+    usePlaybackStore.setState({ currentTrackId: "qa", status: "ready", queueTrackIds: ["qa", "qb", "qc"], queueIndex: 0, contextTrackIds: ["qa", "qb", "qc"] });
+
+    await useLibraryStore.getState().removeTracks(["qb"]);
+
+    const playback = usePlaybackStore.getState();
+    expect(playback.queueTrackIds).toEqual(["qa", "qc"]);
+    expect(playback.contextTrackIds).toEqual(["qa", "qc"]);
+    expect(playback.queueIndex).toBe(0);
+    expect(playback.currentTrackId).toBe("qa");
+  });
+
+  it("removing a track before the current one keeps the index on the current track", async () => {
+    const [a, b, c] = [makeTrack({ id: "ra" }), makeTrack({ id: "rb" }), makeTrack({ id: "rc" })];
+    await repository.putTracks([a, b, c]);
+    await useLibraryStore.getState().init();
+    usePlaybackStore.setState({ currentTrackId: "rc", status: "ready", queueTrackIds: ["ra", "rb", "rc"], queueIndex: 2 });
+
+    await useLibraryStore.getState().removeTracks(["ra"]);
+
+    const playback = usePlaybackStore.getState();
+    expect(playback.queueTrackIds).toEqual(["rb", "rc"]);
+    expect(playback.queueIndex).toBe(1);
+  });
+
+  it("restores the saved queue at the right slot when an earlier track was deleted", async () => {
+    const [a, b] = [makeTrack({ id: "sa" }), makeTrack({ id: "sb" })];
+    await repository.putTracks([a, b]);
+    await savePlaybackSession({
+      queueTrackIds: ["gone", "sa", "sb"],
+      queueIndex: 2,
+      contextTrackIds: ["gone", "sa", "sb"],
+      context: null,
+      currentTrackId: "sb",
+      positionMs: 4200,
+      savedAt: 1,
+    });
+
+    await useLibraryStore.getState().init();
+
+    const playback = usePlaybackStore.getState();
+    expect(playback.queueTrackIds).toEqual(["sa", "sb"]);
+    expect(playback.queueIndex).toBe(1);
+    expect(playback.queueTrackIds[playback.queueIndex]).toBe(playback.currentTrackId);
+    expect(playback.currentTimeMs).toBe(4200);
+    expect(playback.isPlaying).toBe(false); // restoring never autoplays
+  });
+
+  it("does not duplicate queue entries when a session is restored twice", async () => {
+    const a = makeTrack({ id: "da" });
+    await repository.putTracks([a]);
+    await savePlaybackSession({
+      queueTrackIds: ["da"], queueIndex: 0, contextTrackIds: ["da"], context: null, currentTrackId: "da", positionMs: 0, savedAt: 1,
+    });
+    await useLibraryStore.getState().init();
+    await useLibraryStore.getState().init();
+    expect(usePlaybackStore.getState().queueTrackIds).toEqual(["da"]);
+  });
+
+  it("skips a session whose current track no longer exists", async () => {
+    await repository.putTracks([makeTrack({ id: "alive" })]);
+    await savePlaybackSession({
+      queueTrackIds: ["dead", "alive"], queueIndex: 0, contextTrackIds: [], context: null, currentTrackId: "dead", positionMs: 10, savedAt: 1,
+    });
+    await useLibraryStore.getState().init();
+    expect(usePlaybackStore.getState().currentTrackId).toBeNull();
+  });
+});
+
+describe("reload with a 100-track library", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    installEngineStub();
+    useLibraryStore.setState({ tracks: [], playlists: [], status: "loading", loadError: null });
+  });
+
+  it("persists and reloads every track, playlist and like across a fresh init", async () => {
+    const tracks = Array.from({ length: 100 }, (_, i) => makeTrack({ id: `bulk-${i}`, title: `Song ${i}`, isLiked: i % 10 === 0 }));
+    await repository.putTracks(tracks);
+    for (const track of tracks) await repository.putAudioBlob(track.id, new Blob([`audio-${track.id}`]));
+    await repository.putPlaylist({ id: "pl", name: "All", description: "", trackIds: tracks.map((track) => track.id), createdAt: 1, updatedAt: 1 });
+
+    // Simulate a reload: wipe in-memory state, then initialise from storage.
+    useLibraryStore.setState({ tracks: [], playlists: [], status: "loading" });
+    const startedAt = performance.now();
+    await useLibraryStore.getState().init();
+    const elapsedMs = performance.now() - startedAt;
+    console.info(`[perf] init() with 100 stored-copy tracks took ${elapsedMs.toFixed(0)} ms (jsdom + fake-indexeddb, not a browser number)`);
+
+    const state = useLibraryStore.getState();
+    expect(state.status).toBe("ready");
+    expect(state.tracks).toHaveLength(100);
+    expect(state.tracks.every((track) => track.availability === "available")).toBe(true);
+    expect(state.tracks.filter((track) => track.isLiked)).toHaveLength(10);
+    expect(state.playlists[0].trackIds).toHaveLength(100);
+  });
+
+  it("keeps metadata and marks tracks missing when their audio source disappears", async () => {
+    const tracks = Array.from({ length: 5 }, (_, i) => makeTrack({ id: `lost-${i}`, title: `Lost ${i}`, accessMode: "stored-copy" }));
+    await repository.putTracks(tracks);
+    // No audio blobs were ever stored: every source is unavailable.
+    await useLibraryStore.getState().init();
+
+    const state = useLibraryStore.getState();
+    expect(state.tracks).toHaveLength(5);
+    expect(state.tracks.every((track) => track.availability === "missing")).toBe(true);
+    expect(state.tracks.map((track) => track.title)).toEqual(tracks.map((track) => track.title));
+    // The "missing" status is persisted, and the records are still in the database.
+    expect((await repository.listTracks()).every((track) => track.availability === "missing")).toBe(true);
   });
 });

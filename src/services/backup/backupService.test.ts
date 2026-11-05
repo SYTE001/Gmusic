@@ -188,3 +188,89 @@ describe("backup round-trip with IndexedDB", () => {
     expect(playlists[0].trackIds).toEqual(["t1"]);
   });
 });
+
+describe("restore safety", () => {
+  const baseBackup = (tracks: Track[], extra: Record<string, unknown> = {}) => ({
+    app: "local-music" as const,
+    schemaVersion: 1,
+    exportedAt: new Date().toISOString(),
+    tracks,
+    playlists: [],
+    lyrics: [],
+    ...extra,
+  });
+
+  beforeEach(async () => {
+    await repository.clearAllData();
+  });
+
+  it("keeps the previous library untouched when a restore fails midway", async () => {
+    const old = makeTrack({ id: "old" });
+    await repository.putTracks([old]);
+    await repository.putPlaylist({ id: "p-old", name: "Old", description: "", trackIds: ["old"], createdAt: 1, updatedAt: 1 });
+
+    // A function inside a lyric line cannot be stored: the write throws after the clear was queued.
+    const poisoned = baseBackup([makeTrack({ id: "new" })], {
+      lyrics: [{ trackId: "new", format: "lrc", lines: [{ timeMs: 0, text: "x", boom: () => 1 }], offsetMs: 0, updatedAt: 1, skippedLines: 0, sourceName: "a.lrc" }],
+    });
+    await expect(restoreBackup(poisoned as unknown as Parameters<typeof restoreBackup>[0])).rejects.toBeTruthy();
+
+    expect((await repository.listTracks()).map((track) => track.id)).toEqual(["old"]);
+    expect((await repository.listPlaylists()).map((playlist) => playlist.id)).toEqual(["p-old"]);
+  });
+
+  it("keeps file handles and stored copies for tracks that are in the backup and drops the rest", async () => {
+    const kept = makeTrack({ id: "kept" });
+    const stored = makeTrack({ id: "stored" });
+    const dropped = makeTrack({ id: "dropped" });
+    await repository.putTracks([kept, stored, dropped]);
+    await repository.putHandle("kept", { kind: "file", name: "kept.mp3" } as unknown as FileSystemFileHandle);
+    await repository.putAudioBlob("stored", new Blob(["bytes"]));
+    await repository.putHandle("dropped", { kind: "file", name: "dropped.mp3" } as unknown as FileSystemFileHandle);
+    await repository.putArtwork("dropped", new Blob(["art"]));
+
+    const backup = baseBackup([
+      makeTrack({ id: "kept", availability: "missing", accessMode: "session-only" }),
+      makeTrack({ id: "stored", availability: "missing", accessMode: "session-only" }),
+      makeTrack({ id: "gone", availability: "missing", accessMode: "session-only" }),
+    ]);
+    await restoreBackup(backup);
+
+    const byId = new Map((await repository.listTracks()).map((track) => [track.id, track]));
+    expect(byId.get("kept")).toMatchObject({ availability: "available", accessMode: "handle" });
+    expect(byId.get("stored")).toMatchObject({ availability: "available", accessMode: "stored-copy" });
+    expect(byId.get("gone")).toMatchObject({ availability: "missing", accessMode: "session-only" });
+    expect(await repository.getHandle("kept")).toBeDefined();
+    expect(await repository.getAudioBlob("stored")).toBeDefined();
+    expect(await repository.getHandle("dropped")).toBeUndefined();
+    expect(await repository.getArtwork("dropped")).toBeUndefined();
+  });
+
+  it("fills defaults for fields missing from an older backup", async () => {
+    const sparse = { id: "s1", title: "Sparse", fileName: "s.mp3" } as unknown as Track;
+    await restoreBackup(baseBackup([sparse]));
+    const [restored] = await repository.listTracks();
+    expect(restored).toMatchObject({ artist: "Unknown Artist", album: "", fileSize: 0, playCount: 0, isLiked: false, durationMs: null });
+  });
+
+  it("ignores preference values of the wrong type", async () => {
+    await restoreBackup(baseBackup([makeTrack()], { preferences: { ...DEFAULT_PREFERENCES, volume: "loud", theme: DEFAULT_PREFERENCES.theme } }));
+    expect((await repository.getPreferences())?.volume).toBe(DEFAULT_PREFERENCES.volume);
+  });
+
+  it("rejects duplicate track ids, non-string playlist ids and lyric lines without text", () => {
+    const dup = validateBackupText(JSON.stringify(baseBackup([makeTrack(), makeTrack()])));
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.errors.join(" ")).toContain("repeats the id");
+
+    const badPlaylist = validateBackupText(
+      JSON.stringify(baseBackup([makeTrack()], { playlists: [{ id: "p", name: "n", trackIds: [1] }] })),
+    );
+    expect(badPlaylist.ok).toBe(false);
+
+    const badLyrics = validateBackupText(
+      JSON.stringify(baseBackup([makeTrack()], { lyrics: [{ trackId: "t1", lines: [{ timeMs: 0 }] }] })),
+    );
+    expect(badLyrics.ok).toBe(false);
+  });
+});

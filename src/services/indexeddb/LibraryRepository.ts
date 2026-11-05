@@ -274,6 +274,54 @@ export class LibraryRepository {
     );
   }
 
+  /**
+   * Atomically replaces library metadata (tracks, playlists, lyrics, optional
+   * prefs) in ONE transaction: any failure aborts and the previous library is
+   * left untouched. Artwork, stored audio copies and file handles are kept for
+   * track IDs that survive the replacement, so restoring a backup never
+   * destroys working file links; records of dropped tracks are removed.
+   * `resolveTracks` receives the IDs that still own a handle / stored copy so
+   * the caller can keep their access mode honest.
+   */
+  async replaceLibrary(data: {
+    tracks: (handleIds: Set<string>, audioIds: Set<string>) => Track[];
+    playlists: (trackIds: Set<string>) => Playlist[];
+    lyrics: (trackIds: Set<string>) => TrackLyrics[];
+    preferences?: AppPreferences;
+  }): Promise<void> {
+    await withTransaction(
+      [STORES.tracks, STORES.artwork, STORES.audio, STORES.handles, STORES.lyrics, STORES.lyricsMeta, STORES.playlists, STORES.prefs],
+      "readwrite",
+      async (tx) => {
+        const [handleKeys, audioKeys] = await Promise.all([
+          requestToPromise(tx.objectStore(STORES.handles).getAllKeys()),
+          requestToPromise(tx.objectStore(STORES.audio).getAllKeys()),
+        ]);
+        const handleIds = new Set(handleKeys.map(String));
+        const audioIds = new Set(audioKeys.map(String));
+        const tracks = data.tracks(handleIds, audioIds);
+        const trackIds = new Set(tracks.map((track) => track.id));
+
+        for (const name of [STORES.tracks, STORES.playlists, STORES.lyrics, STORES.lyricsMeta]) {
+          tx.objectStore(name).clear();
+        }
+        for (const track of tracks) tx.objectStore(STORES.tracks).put(track);
+        for (const playlist of data.playlists(trackIds)) tx.objectStore(STORES.playlists).put(playlist);
+        for (const lyrics of data.lyrics(trackIds)) tx.objectStore(STORES.lyrics).put(lyrics);
+        if (data.preferences) {
+          tx.objectStore(STORES.prefs).put({ name: "app", prefs: data.preferences } satisfies PrefsRecord);
+        }
+
+        for (const name of [STORES.artwork, STORES.audio, STORES.handles]) {
+          const store = tx.objectStore(name);
+          for (const key of await requestToPromise(store.getAllKeys())) {
+            if (!trackIds.has(String(key))) store.delete(key);
+          }
+        }
+      },
+    );
+  }
+
   async clearAllData(): Promise<void> {
     await withTransaction(
       [STORES.tracks, STORES.artwork, STORES.audio, STORES.handles, STORES.lyrics, STORES.lyricsMeta, STORES.playlists, STORES.prefs],
