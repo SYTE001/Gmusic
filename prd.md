@@ -199,9 +199,12 @@ Do not store continuously changing `currentTime` in IndexedDB on every animation
 
 Use the video as visual direction:
 - Artwork is the primary visual anchor.
-- Derive a low-saturation background tint from the current cover when practical, with a safe dark fallback.
-- Use a dark translucent overlay/gradient for text contrast.
-- Display current track title, artist, cover, transport controls, progress, and favorite action.
+- Stage 1 (album only) is unchanged. In Stage 2 (album + lyrics) the background is ONE solid, flat, album-adaptive dark color (no gradients, blobs, blur, grain or animation loop), with a safe neutral dark fallback when the cover is missing or unreadable.
+- The color is derived from a 32x32 cover sample (alpha < 200 ignored, ~5 clusters, scored by population and saturation so a white border does not beat a saturated cover). White/pastel/grayscale covers give near-black or neutral; saturated covers give a clearly recognizable deep dark hue; dark covers are lifted slightly.
+- Contrast is enforced in code: active lyric >= 7:1, inactive lyric >= 3:1 (derived from the actual background), title/artist/time/control icons >= 4.5:1. Failing candidates step lightness/saturation down. Legibility wins over color fidelity.
+- CSS variables on one root element: `--bg`, `--lyric-active`, `--lyric-inactive`, `--accent` (non-text elements only, e.g. progress bar). Song changes cross-fade with a short `background-color`/opacity transition (~400-600 ms) only.
+- Palette is cached per album (memory + persistent), precomputed for the next queue item, and debounced during rapid skipping.
+- Lyrics sit directly on the solid background (no translucent panel card); top/bottom edge fades are a static `var(--bg)` overlay, not `mask-image`.- Display current track title, artist, cover, transport controls, progress, and favorite action.
 - Lyrics mode uses a spacious vertical lyric layout with centered or left-aligned lines based on viewport; current line is bright, surrounding lines are muted.
 - Support keyboard navigation and an explicit back/close action.
 - Optional fullscreen presentation must use the browser Fullscreen API only after user interaction and gracefully fall back if denied.

@@ -124,6 +124,10 @@ Never create an external network dependency for a feature that can work locally.
 - Never simulate word- or syllable-level synchronization from line-only timestamps.
 - Validate malformed timestamps and keep valid lines when safe to do so.
 - Avoid auto-scroll on every animation frame. Scroll only when the active line changes or when visual interpolation requires it.
+- Lyrics scroll by translating ONE container (`translate3d(0, y, 0)` + short transition). Measure line positions once on load and via `ResizeObserver`; no per-frame layout reads, no `scrollTop`/`top` animation. Toggle classes only on the previous and new active line.
+- Lyric lines must never use `filter: blur`, `text-shadow`, `backdrop-filter` or large box-shadows. `will-change: transform` only on the scrolling container; `contain: layout paint` on the lyrics container.
+- Lyric line/word DOM is rendered by `AmllLyricPlayer.tsx` directly inside `.gm-amll-scroll-track`. Do not rely on AMLL's internal virtualization (`isInRenderRange` skips building line DOM while `size` is `[0, 0]`, which previously made all lyric text disappear).
+- Lyrics background in Stage 2 is one solid album-adaptive color with enforced contrast (see `src/features/lyrics/palette/`). Do not reintroduce animated/gradient/blur backgrounds, rAF loops or A/B crossfade layers.
 - Test offset boundaries, timestamps before zero, repeated timestamps, empty files, malformed lines, and track changes.
 
 ## 9. UI and Visual Rules
