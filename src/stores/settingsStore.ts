@@ -21,6 +21,8 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   storeAudioCopies: !fileSystemAccessSupported(),
   // Online lyrics discovery via lrcmux (metadata only, never audio).
   autoFetchLyrics: true,
+  // Soft, album-derived animated background in lyrics view.
+  animatedLyricsBackground: true,
   schemaVersion: DB_SCHEMA_VERSION,
 };
 

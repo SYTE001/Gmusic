@@ -174,6 +174,8 @@ export type AppPreferences = {
   storeAudioCopies: boolean;
   /** Look up lyrics on lrclib.net when a track starts and nothing is cached. */
   autoFetchLyrics: boolean;
+  /** Soft, album-derived animated background in lyrics view. */
+  animatedLyricsBackground?: boolean;
   lastTrackId?: string;
   lastPositionMs?: number;
   schemaVersion: number;

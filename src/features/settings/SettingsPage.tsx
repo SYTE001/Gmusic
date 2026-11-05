@@ -251,6 +251,11 @@ export function SettingsPage() {
           Per-song timing offsets are set in the lyrics view (−0.5s / +0.5s) and saved per track.
         </p>
         <Row
+          label="Animated background"
+          hint="Soft, album-derived animated background in lyrics view. Automatically pauses when inactive or on low power.">
+          <Toggle checked={prefs.animatedLyricsBackground ?? true} onChange={(val) => update({ animatedLyricsBackground: val })} label="Animated background" />
+        </Row>
+        <Row
           label="Find lyrics online automatically"
           hint="When a song starts and no lyrics are saved, look it up on lrcmux. Only the song's title, artist, album, and duration are sent — never the audio file. Found lyrics are cached for offline use."
         >

@@ -20,7 +20,7 @@ bucket_name = "local-music-media"
 [vars]
 # Non-secret configuration only. Secrets are injected by Cloudflare.
 R2_BUCKET_NAME = "local-music-media"
-ALLOWED_ORIGIN = "http://localhost:5173"
+ALLOWED_ORIGIN = "https://gmusic-tawny.vercel.app"
 # Max upload size in bytes (500 MB).
 MAX_UPLOAD_BYTES = "524288000"
 # Presigned URL lifetimes in seconds (keep short).

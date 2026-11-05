@@ -19,6 +19,7 @@ import { MatchPickerDialog } from "./MatchPickerDialog";
 import { LyricLineItem } from "./LyricLineItem";
 import { LyricQuickEditor } from "./LyricQuickEditor";
 import { LyricsOffsetControls } from "./LyricsOffsetControls";
+import { LyricsBackground } from "./LyricsBackground";
 
 // The AMLL renderer (and its stylesheet) is its own chunk, fetched only when
 // a timed lyrics document is actually shown.
@@ -434,12 +435,13 @@ export function LyricsView() {
   const wordStyleInactive = lyricsStyle === "word" && payloadCapability === "line";
 
   return (
-    <div className="group/lyrics relative flex h-full min-h-0 flex-col">
+    <div className="group/lyrics relative flex h-full min-h-0 flex-col overflow-hidden rounded-2xl">
+      <LyricsBackground track={track} isPlaying={isPlaying} />
       {/* Body — the top area stays completely clean */}
       {loading ? (
-        <div className="grid flex-1 place-items-center text-sm text-text-muted">Loading…</div>
+        <div className="relative z-10 grid flex-1 place-items-center text-sm text-text-muted">Loading…</div>
       ) : isInstrumental ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center">
+        <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-2 text-center">
           <div className="grid size-14 place-items-center rounded-2xl bg-surface-raised text-text-muted" aria-hidden>
             <LyricsIcon size={24} />
           </div>
@@ -449,7 +451,7 @@ export function LyricsView() {
           </p>
         </div>
       ) : !lyrics ? (
-        <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
+        <div className="relative z-10 flex flex-1 flex-col items-center justify-center gap-3 text-center">
           <div className="grid size-14 place-items-center rounded-2xl bg-surface-raised text-text-muted" aria-hidden>
             <LyricsIcon size={24} />
           </div>
@@ -506,7 +508,7 @@ export function LyricsView() {
           </div>
         </div>
       ) : timedLines ? (
-        <div className="min-h-0 flex-1" aria-label="Synced lyrics">
+        <div className="relative z-10 min-h-0 flex-1" aria-label="Synced lyrics">
           <Suspense fallback={<div className="grid h-full place-items-center text-sm text-text-muted">Loading…</div>}>
             <AmllLyricPlayer
               lines={amllLines}
@@ -532,7 +534,7 @@ export function LyricsView() {
           onPointerCancel={onPointerUpOrCancel}
           onKeyDown={onKeyDown}
           onFocusCapture={onFocusCapture}
-          className="min-h-0 flex-1 overflow-hidden pr-1 focus:outline-none"
+          className="relative z-10 min-h-0 flex-1 overflow-hidden pr-1 focus:outline-none"
           style={{
             lineHeight: lyricLineSpacing,
             contain: "layout paint style",
