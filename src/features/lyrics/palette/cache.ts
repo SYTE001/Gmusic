@@ -1,14 +1,89 @@
 import { extractClustersFromPixels, selectDistinctClusters } from "./extraction";
 import { enforceLegibility, createFallbackPalette } from "./legibility";
 import { selectPreset } from "./presets";
-import type { LyricsPalette } from "./types";
+import type { BackgroundTier, LyricsPalette } from "./types";
 import { loadArtworkUrl } from "../../../services/artwork/artworkCache";
 import type { Track } from "../../../types";
 
 const MEMORY_CACHE = new Map<string, LyricsPalette>();
 const MAX_MEMORY_ITEMS = 200;
 const STORAGE_KEY = "gmusic_lyrics_palette_cache";
+const TIER_STORAGE_KEY = "gmusic_lyrics_bg_tier";
 const MAX_STORAGE_ITEMS = 100;
+const CANVAS_SIZE = 32;
+
+// Single reused 32x32 canvas to prevent DOM/GPU allocation churn during rapid skips (PRD §7, §8.8)
+let sharedOffscreenCtx: OffscreenCanvasRenderingContext2D | null = null;
+let sharedDomCtx: CanvasRenderingContext2D | null = null;
+
+function getShared32x32Context(): OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null {
+  if (typeof OffscreenCanvas !== "undefined") {
+    if (!sharedOffscreenCtx) {
+      const offscreen = new OffscreenCanvas(CANVAS_SIZE, CANVAS_SIZE);
+      sharedOffscreenCtx = offscreen.getContext("2d", { willReadFrequently: true });
+    }
+    if (sharedOffscreenCtx) return sharedOffscreenCtx;
+  }
+  if (typeof document !== "undefined") {
+    if (!sharedDomCtx) {
+      const canvas = document.createElement("canvas");
+      canvas.width = CANVAS_SIZE;
+      canvas.height = CANVAS_SIZE;
+      sharedDomCtx = canvas.getContext("2d", { willReadFrequently: true });
+    }
+    return sharedDomCtx;
+  }
+  return null;
+}
+
+/**
+ * Capability detection for the 3-tier system (`full` | `lite` | `static`, PRD §8.1).
+ * Degrades by default on low-spec hardware and remembers automatic step-downs.
+ */
+export function detectInitialTier(): BackgroundTier {
+  if (typeof window !== "undefined") {
+    try {
+      const saved = window.localStorage?.getItem(TIER_STORAGE_KEY);
+      if (saved === "full" || saved === "lite" || saved === "static") {
+        return saved;
+      }
+    } catch {
+      // Ignore storage access errors
+    }
+
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      return "static";
+    }
+  }
+
+  if (typeof navigator !== "undefined") {
+    const cores = navigator.hardwareConcurrency ?? 8;
+    const memory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory ?? 8;
+    if (cores <= 2 || memory <= 2) {
+      return "static";
+    }
+    if (cores <= 4 || memory <= 4) {
+      return "lite";
+    }
+  }
+
+  return "full";
+}
+
+/**
+ * Steps down one performance tier (`full` -> `lite` -> `static`) and persists the choice (PRD §8.1).
+ */
+export function stepDownTier(current: BackgroundTier): BackgroundTier {
+  const next: BackgroundTier = current === "full" ? "lite" : "static";
+  if (typeof window !== "undefined" && window.localStorage) {
+    try {
+      window.localStorage.setItem(TIER_STORAGE_KEY, next);
+    } catch {
+      // Ignore storage quota/permission errors
+    }
+  }
+  return next;
+}
 
 // Load persistent cache from localStorage on startup
 function readStorageCache(): Record<string, LyricsPalette> {
@@ -48,7 +123,7 @@ export function getCachedPalette(coverKey: string): LyricsPalette | undefined {
 export function setCachedPalette(coverKey: string, palette: LyricsPalette): void {
   if (!coverKey || !palette) return;
 
-  if (MEMORY_CACHE.size >= MAX_MEMORY_ITEMS) {
+  if (!MEMORY_CACHE.has(coverKey) && MEMORY_CACHE.size >= MAX_MEMORY_ITEMS) {
     const firstKey = MEMORY_CACHE.keys().next().value;
     if (firstKey !== undefined) MEMORY_CACHE.delete(firstKey);
   }
@@ -70,7 +145,7 @@ export function setCachedPalette(coverKey: string, palette: LyricsPalette): void
 
 /**
  * Extracts a 32x32 pixel buffer from an image URL and produces an enforced LyricsPalette.
- * Runs non-blocking using ImageBitmap or OffscreenCanvas/HTMLCanvasElement (PRD §4.1).
+ * Runs non-blocking using ImageBitmap or shared 32x32 canvas (PRD §4.1, §8.8).
  */
 export async function extractPaletteFromImageUrl(
   imageUrl: string,
@@ -102,7 +177,8 @@ export async function extractPaletteFromImageUrl(
 }
 
 /**
- * Loads image downscaled directly to 32x32 pixels, never decoding at full size on DOM (PRD §4.1).
+ * Loads image downscaled directly to 32x32 pixels onto a reused canvas,
+ * never decoding at full size on the main thread when ImageBitmap resize is supported (PRD §4.1, §8.4, §8.8).
  */
 async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
   return new Promise((resolve) => {
@@ -121,34 +197,40 @@ async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
 
     img.onload = () => {
       clearTimeout(timer);
-      try {
-        const size = 32;
-        let pixels: Uint8ClampedArray | null = null;
-
-        if (typeof OffscreenCanvas !== "undefined") {
-          const offscreen = new OffscreenCanvas(size, size);
-          const ctx = offscreen.getContext("2d", { willReadFrequently: true });
-          if (ctx) {
-            ctx.drawImage(img, 0, 0, size, size);
-            pixels = ctx.getImageData(0, 0, size, size).data;
+      const drawAndRead = async () => {
+        try {
+          const ctx = getShared32x32Context();
+          if (!ctx) {
+            resolve(null);
+            return;
           }
-        }
 
-        if (!pixels && typeof document !== "undefined") {
-          const canvas = document.createElement("canvas");
-          canvas.width = size;
-          canvas.height = size;
-          const ctx = canvas.getContext("2d", { willReadFrequently: true });
-          if (ctx) {
-            ctx.drawImage(img, 0, 0, size, size);
-            pixels = ctx.getImageData(0, 0, size, size).data;
+          ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+          if (typeof createImageBitmap === "function") {
+            try {
+              const bitmap = await createImageBitmap(img, {
+                resizeWidth: CANVAS_SIZE,
+                resizeHeight: CANVAS_SIZE,
+                resizeQuality: "low",
+              });
+              ctx.drawImage(bitmap, 0, 0, CANVAS_SIZE, CANVAS_SIZE);
+              bitmap.close();
+              resolve(ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE).data);
+              return;
+            } catch {
+              // Fallback to direct drawImage below if resize options unsupported
+            }
           }
-        }
 
-        resolve(pixels);
-      } catch {
-        resolve(null);
-      }
+          ctx.drawImage(img, 0, 0, CANVAS_SIZE, CANVAS_SIZE);
+          resolve(ctx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE).data);
+        } catch {
+          resolve(null);
+        }
+      };
+
+      void drawAndRead();
     };
 
     img.onerror = () => {
@@ -165,7 +247,7 @@ async function load32x32Pixels(url: string): Promise<Uint8ClampedArray | null> {
  */
 export function scheduleNextTrackPrecompute(track: Track): void {
   if (!track) return;
-  const coverKey = track.id;
+  const coverKey = track.album ? `${track.album}-${track.artist}` : track.id;
   if (getCachedPalette(coverKey)) return;
 
   const runTask = () => {

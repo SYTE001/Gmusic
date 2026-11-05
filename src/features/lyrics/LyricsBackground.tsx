@@ -7,9 +7,12 @@ import { useLibraryStore } from "../../stores/libraryStore";
 import { nextIndex } from "../player/queue";
 import {
   createFallbackPalette,
+  detectInitialTier,
   extractPaletteFromImageUrl,
   getCachedPalette,
   scheduleNextTrackPrecompute,
+  stepDownTier,
+  type BackgroundTier,
   type LyricsPalette,
 } from "./palette";
 import "./lyricsBackground.css";
@@ -17,17 +20,21 @@ import "./lyricsBackground.css";
 const GRAIN_DATA_URL =
   "data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.8' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E";
 
+const RAPID_SKIP_DEBOUNCE_MS = 150;
+
 type LayerState = {
   palette: LyricsPalette;
   key: string;
 };
 
-type LyricsBackgroundProps = {
+export type LyricsBackgroundProps = {
   track: Track | null | undefined;
   isPlaying: boolean;
+  /** Controls Stage 1 <-> Stage 2 opacity fade while keeping the component mount-agnostic (PRD §1). */
+  visible?: boolean;
 };
 
-export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
+export function LyricsBackground({ track, isPlaying, visible = true }: LyricsBackgroundProps) {
   const artworkUrl = useArtworkUrl(track);
   const trackId = track?.id ?? "none";
   const coverKey = track?.album ? `${track.album}-${track.artist}` : trackId;
@@ -37,6 +44,9 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
     (state) => state.prefs.animatedLyricsBackground ?? true,
   );
   const reducedMotionSetting = useSettingsStore((state) => state.prefs.reducedMotion);
+
+  // Capability tier (`full` | `lite` | `static`, PRD §8.1)
+  const [tier, setTier] = useState<BackgroundTier>(() => detectInitialTier());
 
   // Initial palette (cached or fallback)
   const initialPalette = useMemo(() => {
@@ -54,7 +64,7 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
     () => typeof document !== "undefined" && document.hidden,
   );
   const [playbackPaused3s, setPlaybackPaused3s] = useState(!isPlaying);
-  const [lowPowerMode, setLowPowerMode] = useState(false);
+  const [lowBattery, setLowBattery] = useState(false);
   const [systemReducedMotion, setSystemReducedMotion] = useState(false);
 
   // Monitor prefers-reduced-motion
@@ -93,72 +103,94 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
     return () => clearTimeout(timer);
   }, [isPlaying]);
 
-  // Low power detection: Battery API + frame drops
+  // Low battery detection (PRD §5, §8.1)
   useEffect(() => {
     let unmounted = false;
-
-    // Check battery level if available
     type BatteryManager = {
       level: number;
       charging: boolean;
       addEventListener: (type: string, listener: () => void) => void;
       removeEventListener: (type: string, listener: () => void) => void;
     };
-    const nav = navigator as Navigator & { getBattery?: () => Promise<BatteryManager> };
+    const nav = typeof navigator !== "undefined"
+      ? (navigator as Navigator & { getBattery?: () => Promise<BatteryManager> })
+      : null;
 
-    if (typeof nav.getBattery === "function") {
-      void nav.getBattery().then((battery) => {
-        if (unmounted) return;
-        const checkBattery = () => {
-          if (battery.level <= 0.2 && !battery.charging) {
-            setLowPowerMode(true);
-          } else {
-            setLowPowerMode(false);
-          }
-        };
-        checkBattery();
-        battery.addEventListener("levelchange", checkBattery);
-        battery.addEventListener("chargingchange", checkBattery);
-      }).catch(() => {
-        // Battery API not supported or rejected
-      });
-    }
-
-    // Frame-drop monitor for low-end devices (hardwareConcurrency <= 4)
-    if (typeof navigator !== "undefined" && (navigator.hardwareConcurrency ?? 8) <= 4) {
-      let consecutiveSlowFrames = 0;
-      let lastTime = performance.now();
-      let rafId = 0;
-
-      const checkFrame = (now: number) => {
-        const delta = now - lastTime;
-        lastTime = now;
-        if (delta > 25) {
-          consecutiveSlowFrames++;
-          if (consecutiveSlowFrames >= 60) {
-            // Sustained slow frames for >1.5-2 seconds -> switch to static mode
-            setLowPowerMode(true);
-            return;
-          }
-        } else {
-          consecutiveSlowFrames = Math.max(0, consecutiveSlowFrames - 1);
-        }
-        rafId = requestAnimationFrame(checkFrame);
+    if (nav && typeof nav.getBattery === "function") {
+      let batteryRef: BatteryManager | null = null;
+      const checkBattery = () => {
+        if (!batteryRef || unmounted) return;
+        setLowBattery(batteryRef.level <= 0.2 && !batteryRef.charging);
       };
+      void nav
+        .getBattery()
+        .then((battery) => {
+          if (unmounted) return;
+          batteryRef = battery;
+          checkBattery();
+          battery.addEventListener("levelchange", checkBattery);
+          battery.addEventListener("chargingchange", checkBattery);
+        })
+        .catch(() => {
+          // Battery API unsupported or blocked
+        });
 
-      rafId = requestAnimationFrame(checkFrame);
       return () => {
         unmounted = true;
-        cancelAnimationFrame(rafId);
+        if (batteryRef) {
+          batteryRef.removeEventListener("levelchange", checkBattery);
+          batteryRef.removeEventListener("chargingchange", checkBattery);
+        }
       };
     }
-
     return () => {
       unmounted = true;
     };
   }, []);
 
-  // Load and apply new palette on artwork or track change with crossfade
+  // Effective tier and pause decision
+  const effectiveTier: BackgroundTier =
+    !animatedBgSetting || isMotionReduced || lowBattery ? "static" : tier;
+
+  const isPaused =
+    !visible ||
+    effectiveTier === "static" ||
+    tabHidden ||
+    playbackPaused3s;
+
+  // Frame-drop monitor: if rAF delta > 24ms sustained for ~2 seconds while animating,
+  // automatically step down one tier (`full` -> `lite` -> `static`) and remember it (PRD §5, §8.1).
+  useEffect(() => {
+    if (isPaused || typeof requestAnimationFrame === "undefined") {
+      return;
+    }
+
+    let slowElapsedMs = 0;
+    let lastTime = performance.now();
+    let rafId = 0;
+
+    const monitor = (now: number) => {
+      const delta = now - lastTime;
+      lastTime = now;
+      // Ignore huge tab-switch gaps (> 500ms); count genuine slow frames (> 24ms)
+      if (delta > 24 && delta < 500) {
+        slowElapsedMs += delta;
+        if (slowElapsedMs >= 2000) {
+          setTier((prev) => stepDownTier(prev));
+          return;
+        }
+      } else if (delta <= 24) {
+        slowElapsedMs = Math.max(0, slowElapsedMs - delta * 0.5);
+      }
+      rafId = requestAnimationFrame(monitor);
+    };
+
+    rafId = requestAnimationFrame(monitor);
+    return () => cancelAnimationFrame(rafId);
+  }, [isPaused, effectiveTier]);
+
+  // Load and apply new palette on artwork or track change with A/B crossfade
+  // Debounces uncached cover extraction by 150ms so rapid skipping stays instant (PRD §3.2, §8.3).
   useEffect(() => {
     let cancelled = false;
 
@@ -180,16 +212,43 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
       }
     };
 
-    if (artworkUrl) {
-      void extractPaletteFromImageUrl(artworkUrl, coverKey).then((palette) => {
-        applyPalette(palette);
-      });
-    } else {
-      applyPalette(createFallbackPalette(coverKey));
+    // Fast path: already in memory cache (e.g. same album or precomputed from queue)
+    const cached = getCachedPalette(coverKey);
+    if (cached) {
+      applyPalette(cached);
+      return () => {
+        cancelled = true;
+      };
     }
+
+    if (!artworkUrl) {
+      applyPalette(createFallbackPalette(coverKey));
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    // Debounce extraction by 150ms so rapid track skipping never blocks or wastes work (PRD §8.3)
+    const debounceTimer = setTimeout(() => {
+      const runExtraction = () => {
+        if (cancelled) return;
+        void extractPaletteFromImageUrl(artworkUrl, coverKey).then((palette) => {
+          applyPalette(palette);
+        });
+      };
+
+      if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+        (window as Window & { requestIdleCallback: (cb: () => void) => number }).requestIdleCallback(
+          runExtraction,
+        );
+      } else {
+        runExtraction();
+      }
+    }, RAPID_SKIP_DEBOUNCE_MS);
 
     return () => {
       cancelled = true;
+      clearTimeout(debounceTimer);
     };
   }, [artworkUrl, coverKey, activeLayer, layerA.key, layerB?.key]);
 
@@ -210,24 +269,18 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
     }
   }, [queueTrackIds, queueIndex, repeatMode, tracks]);
 
-  // Overall pause decision
-  const isPaused =
-    !animatedBgSetting ||
-    isMotionReduced ||
-    tabHidden ||
-    playbackPaused3s ||
-    lowPowerMode;
-
   return (
     <div
-      className={`lyrics-bg-container ${isPaused ? "lyrics-bg-paused" : ""}`}
+      className={`lyrics-bg-container lyrics-bg-tier-${effectiveTier} ${isPaused ? "lyrics-bg-paused" : ""}`}
+      style={{ opacity: visible ? 1 : 0 }}
+      data-tier={effectiveTier}
       aria-hidden="true"
     >
       {/* Layer A */}
       <LayerInstance
         state={layerA}
         active={activeLayer === "A"}
-        isStatic={isMotionReduced || !animatedBgSetting}
+        tier={effectiveTier}
       />
 
       {/* Layer B (only mounted when crossfading) */}
@@ -235,18 +288,20 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
         <LayerInstance
           state={layerB}
           active={activeLayer === "B"}
-          isStatic={isMotionReduced || !animatedBgSetting}
+          tier={effectiveTier}
         />
       )}
 
-      {/* Grain noise overlay at 3.5% opacity (PRD §3.1) */}
-      <div
-        className="pointer-events-none absolute inset-0 opacity-[0.035]"
-        style={{
-          backgroundImage: `url("${GRAIN_DATA_URL}")`,
-          backgroundRepeat: "repeat",
-        }}
-      />
+      {/* Grain noise overlay at 3.5% opacity — only on 'full' tier (PRD §3.1, §8.1) */}
+      {effectiveTier === "full" && (
+        <div
+          className="pointer-events-none absolute inset-0 opacity-[0.035]"
+          style={{
+            backgroundImage: `url("${GRAIN_DATA_URL}")`,
+            backgroundRepeat: "repeat",
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -254,41 +309,48 @@ export function LyricsBackground({ track, isPlaying }: LyricsBackgroundProps) {
 function LayerInstance({
   state,
   active,
-  isStatic,
+  tier,
 }: {
   state: LayerState;
   active: boolean;
-  isStatic: boolean;
+  tier: BackgroundTier;
 }) {
   const { palette } = state;
   const { presetConfig } = palette;
+  const isStatic = tier === "static";
+  const isLite = tier === "lite";
 
-  // Blob CSS custom properties
+  // Lite tier runs slower loops (PRD §8.1)
+  const durationSec = isLite ? Math.round(presetConfig.duration * 1.25) : presetConfig.duration;
+
+  // CSS custom properties fed by the palette (`--bg-base`, `--blob-1..4`, PRD §6.4)
   const layerStyle: CSSProperties = {
     opacity: active ? 1 : 0,
-    transition: "opacity 900ms ease-in-out",
+    transition: isStatic ? "none" : "opacity 900ms ease-in-out",
     backgroundColor: palette.baseColor,
-    willChange: "opacity",
-    // Type casting CSS variables for React
+    willChange: isStatic ? "auto" : "opacity",
+    ["--bg-base" as string]: palette.baseColor,
     ["--blob-1" as string]: palette.blobColors[0],
     ["--blob-2" as string]: palette.blobColors[1],
     ["--blob-3" as string]: palette.blobColors[2],
     ["--blob-4" as string]: palette.blobColors[3],
-    ["--blob-duration" as string]: `${presetConfig.duration}s`,
+    ["--accent-color" as string]: palette.accentColor,
+    ["--blob-duration" as string]: `${durationSec}s`,
   };
 
   const blobOpacity = presetConfig.blobOpacity;
-  const is3Blobs = presetConfig.blobCount === 3;
+  // Lite tier and calm preset use 3 blobs (PRD §4.3, §8.1)
+  const is3Blobs = presetConfig.blobCount === 3 || isLite;
 
   return (
     <div className="absolute inset-0 overflow-hidden" style={layerStyle}>
       {/* Base solid background */}
       <div
         className="absolute inset-0"
-        style={{ backgroundColor: palette.baseColor }}
+        style={{ backgroundColor: "var(--bg-base)" }}
       />
 
-      {/* Static blur container (PRD §2.3: filter: blur() applied once on container) */}
+      {/* Static blur container (PRD §2.3, §8.2: 50% scale upscaled via transform) */}
       <div className="lyrics-bg-blur-stage">
         <div
           className={`lyrics-blob lyrics-blob-1 ${isStatic ? "!animation-none" : ""}`}
@@ -310,7 +372,7 @@ function LayerInstance({
         )}
       </div>
 
-      {/* Scrim: vertical gradient overlay for guaranteed text legibility (PRD §3.1) */}
+      {/* Scrim: vertical gradient overlay for guaranteed full-screen legibility (PRD §1, §3.1) */}
       <div
         className="pointer-events-none absolute inset-0"
         style={{

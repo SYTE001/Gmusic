@@ -20,6 +20,8 @@ export type ColorCluster = {
 
 export type PresetName = "calm" | "dim" | "flow" | "balanced";
 
+export type BackgroundTier = "full" | "lite" | "static";
+
 export type PresetConfig = {
   name: PresetName;
   blobCount: number;

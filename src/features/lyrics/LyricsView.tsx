@@ -19,7 +19,6 @@ import { MatchPickerDialog } from "./MatchPickerDialog";
 import { LyricLineItem } from "./LyricLineItem";
 import { LyricQuickEditor } from "./LyricQuickEditor";
 import { LyricsOffsetControls } from "./LyricsOffsetControls";
-import { LyricsBackground } from "./LyricsBackground";
 
 // The AMLL renderer (and its stylesheet) is its own chunk, fetched only when
 // a timed lyrics document is actually shown.
@@ -435,8 +434,7 @@ export function LyricsView() {
   const wordStyleInactive = lyricsStyle === "word" && payloadCapability === "line";
 
   return (
-    <div className="group/lyrics relative flex h-full min-h-0 flex-col overflow-hidden rounded-2xl">
-      <LyricsBackground track={track} isPlaying={isPlaying} />
+    <div className="group/lyrics relative flex h-full min-h-0 flex-col">
       {/* Body — the top area stays completely clean */}
       {loading ? (
         <div className="relative z-10 grid flex-1 place-items-center text-sm text-text-muted">Loading…</div>

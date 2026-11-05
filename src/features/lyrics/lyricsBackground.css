@@ -1,28 +1,45 @@
 /*
- * Compositor-only animated lyrics background (PRD §2, §3, §5).
- * Only transforms and opacity are animated. Filter blur is applied once statically.
+ * Compositor-only full-screen animated lyrics background (PRD §1, §2, §3, §5, §8).
+ * - Only transform and opacity are animated.
+ * - Blur stage renders at 50% resolution and upscales via compositor transform (4x less GPU fill cost).
+ * - Removes will-change when paused or in static tier.
  */
 
 .lyrics-bg-container {
-  position: absolute;
+  position: fixed;
   inset: 0;
   overflow: hidden;
   pointer-events: none;
   contain: strict;
   z-index: 0;
-  border-radius: inherit;
+  transition: opacity 500ms ease-out;
 }
 
+/*
+ * 50% scale blur container upscaled 2.4x so edges never show (120% effective coverage)
+ * while cutting GPU blur pixel count by 4x (PRD §3.1, §8.2).
+ */
 .lyrics-bg-blur-stage {
   position: absolute;
-  inset: -15%;
-  width: 130%;
-  height: 130%;
-  filter: blur(72px);
-  transform: translate3d(0, 0, 0) scale(1.05);
-  transform-origin: center;
+  top: -10%;
+  left: -10%;
+  width: 50%;
+  height: 50%;
+  filter: blur(36px);
+  transform: translate3d(0, 0, 0) scale(2.4);
+  transform-origin: top left;
   pointer-events: none;
   backface-visibility: hidden;
+}
+
+/* Lite tier: blur kept well below 40px, slower speed, smaller travel (PRD §8.1, §8.2) */
+.lyrics-bg-tier-lite .lyrics-bg-blur-stage {
+  filter: blur(22px);
+}
+
+/* Static tier: single static pre-softened gradient frame, zero animation (PRD §8.1) */
+.lyrics-bg-tier-static .lyrics-bg-blur-stage {
+  filter: blur(20px);
 }
 
 .lyrics-blob {
@@ -34,39 +51,60 @@
   mix-blend-mode: normal;
 }
 
+/* Pre-softened multi-stop radial gradients reduce reliance on heavy GPU blur (PRD §8.2) */
 .lyrics-blob-1 {
-  width: 75%;
-  height: 75%;
-  top: 5%;
-  left: 10%;
-  background: radial-gradient(circle, var(--blob-1) 0%, transparent 68%);
+  width: 78%;
+  height: 78%;
+  top: 4%;
+  left: 8%;
+  background: radial-gradient(
+    circle,
+    var(--blob-1) 0%,
+    color-mix(in srgb, var(--blob-1) 55%, transparent) 38%,
+    transparent 72%
+  );
   animation: lyrics-blob-loop-1 calc(var(--blob-duration, 40s) * 1.0) ease-in-out infinite alternate;
 }
 
 .lyrics-blob-2 {
-  width: 82%;
-  height: 82%;
-  top: 20%;
-  right: 5%;
-  background: radial-gradient(circle, var(--blob-2) 0%, transparent 70%);
+  width: 84%;
+  height: 84%;
+  top: 18%;
+  right: 4%;
+  background: radial-gradient(
+    circle,
+    var(--blob-2) 0%,
+    color-mix(in srgb, var(--blob-2) 55%, transparent) 38%,
+    transparent 74%
+  );
   animation: lyrics-blob-loop-2 calc(var(--blob-duration, 40s) * 1.18) ease-in-out infinite alternate;
 }
 
 .lyrics-blob-3 {
-  width: 70%;
-  height: 70%;
-  bottom: 10%;
-  left: 15%;
-  background: radial-gradient(circle, var(--blob-3) 0%, transparent 68%);
+  width: 72%;
+  height: 72%;
+  bottom: 8%;
+  left: 14%;
+  background: radial-gradient(
+    circle,
+    var(--blob-3) 0%,
+    color-mix(in srgb, var(--blob-3) 55%, transparent) 38%,
+    transparent 72%
+  );
   animation: lyrics-blob-loop-3 calc(var(--blob-duration, 40s) * 0.88) ease-in-out infinite alternate;
 }
 
 .lyrics-blob-4 {
-  width: 78%;
-  height: 78%;
-  bottom: 5%;
-  right: 12%;
-  background: radial-gradient(circle, var(--blob-4) 0%, transparent 70%);
+  width: 80%;
+  height: 80%;
+  bottom: 4%;
+  right: 10%;
+  background: radial-gradient(
+    circle,
+    var(--blob-4) 0%,
+    color-mix(in srgb, var(--blob-4) 55%, transparent) 38%,
+    transparent 74%
+  );
   animation: lyrics-blob-loop-4 calc(var(--blob-duration, 40s) * 1.25) ease-in-out infinite alternate;
 }
 
@@ -118,14 +156,42 @@
   }
 }
 
-/* Paused state stops all animations without resetting position */
+/* Paused state stops all animations without resetting position and releases will-change (PRD §5, §8.7) */
 .lyrics-bg-paused .lyrics-blob {
   animation-play-state: paused !important;
+  will-change: auto !important;
 }
 
-/* Reduced motion disables keyframes completely */
+/* Static tier & reduced motion disable keyframes completely */
+.lyrics-bg-tier-static .lyrics-blob {
+  animation: none !important;
+  will-change: auto !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .lyrics-blob {
     animation: none !important;
+    will-change: auto !important;
   }
+}
+
+/*
+ * Full-screen Stage 2 legibility tokens (PRD §1, §4.2, §6.5):
+ * Ensures album title, artist, time labels, control icons, top bar, and lyrics
+ * stay sharp and readable (>= 4.5:1 primary, >= 3:1 secondary) over the dark adaptive background
+ * even when the rest of the app is in light theme.
+ */
+[data-stage="lyrics"] {
+  color-scheme: dark;
+  --text-primary: #ffffff;
+  --text-secondary: rgba(255, 255, 255, 0.76);
+  --text-muted: rgba(255, 255, 255, 0.62);
+  --surface: rgba(17, 17, 19, 0.78);
+  --surface-raised: rgba(24, 24, 28, 0.88);
+  --surface-hover: rgba(255, 255, 255, 0.14);
+  --border-subtle: rgba(255, 255, 255, 0.16);
+  --border-strong: rgba(255, 255, 255, 0.28);
+  --accent: #ffffff;
+  --accent-strong: #ffffff;
+  --accent-contrast: #09090b;
 }

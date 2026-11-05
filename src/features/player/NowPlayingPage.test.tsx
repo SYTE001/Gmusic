@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
@@ -70,9 +70,9 @@ describe("NowPlayingPage component", () => {
     expect(screen.getByRole("link", { name: /Pick a song/i })).toBeTruthy();
   });
 
-  it("mounts with solid neutral bg-app-bg on root container", () => {
-    render(
-      <MemoryRouter>
+  it("mounts with solid neutral bg-app-bg on root container in Stage 1 (album only)", () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
         <NowPlayingPage />
       </MemoryRouter>,
     );
@@ -80,7 +80,44 @@ describe("NowPlayingPage component", () => {
     const root = screen.getByRole("region", { name: "Now playing" });
     expect(root).toBeTruthy();
     expect(root.className).toContain("bg-app-bg");
-    expect(root.className).not.toContain("bg-transparent");
+    expect(root.getAttribute("data-stage")).toBe("album");
+    // Stage 1 has no adaptive background mounted
+    expect(container.querySelector(".lyrics-bg-container")).toBeNull();
+  });
+
+  it("mounts full-screen LyricsBackground in Stage 2 and fades out before unmounting on return to Stage 1", () => {
+    vi.useFakeTimers();
+
+    const { container } = render(
+      <MemoryRouter initialEntries={["/now-playing?lyrics=1"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const root = screen.getByRole("region", { name: "Now playing" });
+    expect(root.getAttribute("data-stage")).toBe("lyrics");
+    expect(root.getAttribute("data-theme")).toBe("dark");
+
+    const bg = container.querySelector(".lyrics-bg-container") as HTMLElement | null;
+    expect(bg).not.toBeNull();
+
+    // Toggle back to Stage 1 (Hide lyrics)
+    const hideBtn = screen.getByRole("button", { name: "Hide lyrics" });
+    fireEvent.click(hideBtn);
+
+    expect(root.getAttribute("data-stage")).toBe("album");
+    // Still mounted during 500ms fade-out with opacity 0
+    const bgFading = container.querySelector(".lyrics-bg-container") as HTMLElement | null;
+    expect(bgFading).not.toBeNull();
+    expect(bgFading?.style.opacity).toBe("0");
+
+    // Unmounts after 500ms fade-out completes
+    act(() => {
+      vi.advanceTimersByTime(520);
+    });
+    expect(container.querySelector(".lyrics-bg-container")).toBeNull();
+
+    vi.useRealTimers();
   });
 
   it("does not render any ambient canvas, sheen, or .gm-ambient elements", () => {

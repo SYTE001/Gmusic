@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useLibraryStore, useTrackById } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
@@ -7,6 +7,7 @@ import { Artwork } from "../../components/Artwork";
 import { SeekBar } from "../../components/SeekBar";
 import { TransportToggle } from "../../components/TransportToggle";
 import { LyricsView } from "../lyrics/LyricsView";
+import { LyricsBackground } from "../lyrics/LyricsBackground";
 import {
   CloseIcon,
   HeartIcon,
@@ -21,19 +22,56 @@ import {
 } from "../../components/Icons";
 
 /**
- * Immersive Now Playing (PRD §7.8): artwork-led, centered/stacked controls under the artwork,
- * and side-by-side synchronized lyrics view on a neutral theme background.
+ * Flip to `true` to adopt the adaptive background in Stage 1 (album-only view) as well (PRD §1).
+ */
+export const ENABLE_STAGE_1_BACKGROUND = false;
+
+const STAGE_FADE_MS = 500;
+
+/**
+ * Immersive Now Playing (PRD §7.8, Adaptive Lyrics Background PRD §1, §6.5):
+ * - Stage 1 (album only): plain dark background (`bg-app-bg`).
+ * - Stage 2 (album + lyrics side by side): full-screen adaptive background behind top bar,
+ *   album, controls, and lyrics, fading in/out over 500ms and unmounting when closed.
  */
 export function NowPlayingPage() {
   recordComponentRender("NowPlayingPage");
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const lyricsMode = searchParams.get("lyrics") === "1";
+  const showBackground = lyricsMode || ENABLE_STAGE_1_BACKGROUND;
+
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const track = useTrackById(currentTrackId);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
+
+  // Stage 1 <-> Stage 2 background fade-in (500ms) and fade-out before unmount (PRD §1, §5)
+  const [bgMounted, setBgMounted] = useState(showBackground);
+  const [bgVisible, setBgVisible] = useState(showBackground);
+
+  useEffect(() => {
+    if (showBackground) {
+      setBgMounted(true);
+      let raf2 = 0;
+      const raf1 = requestAnimationFrame(() => {
+        raf2 = requestAnimationFrame(() => {
+          setBgVisible(true);
+        });
+      });
+      return () => {
+        cancelAnimationFrame(raf1);
+        cancelAnimationFrame(raf2);
+      };
+    } else {
+      setBgVisible(false);
+      const timer = setTimeout(() => {
+        setBgMounted(false);
+      }, STAGE_FADE_MS);
+      return () => clearTimeout(timer);
+    }
+  }, [showBackground]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -63,7 +101,18 @@ export function NowPlayingPage() {
       className="fixed inset-0 z-10 flex flex-col overflow-hidden animate-fade-in select-none bg-app-bg"
       role="region"
       aria-label="Now playing"
+      data-stage={showBackground ? "lyrics" : "album"}
+      data-theme={bgMounted ? "dark" : undefined}
     >
+      {/* Full-screen adaptive background mounted once at player root during Stage 2 (PRD §1, §6.5) */}
+      {bgMounted && (
+        <LyricsBackground
+          track={track}
+          isPlaying={isPlaying}
+          visible={bgVisible}
+        />
+      )}
+
       {/* Top bar: close button on left, song title centered, lyrics toggle button on right */}
       <div className="relative z-10 flex items-center px-4 py-3 md:px-6 shrink-0">
         <button
@@ -204,7 +253,7 @@ export function NowPlayingPage() {
           </div>
         </div>
 
-        {/* Lyrics column */}
+        {/* Lyrics column — sits directly on the full-screen background (no separate card, PRD §1) */}
         {lyricsMode && (
           <div className="min-h-0 flex-1 pb-2">
             <LyricsView />
