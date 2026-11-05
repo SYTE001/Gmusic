@@ -12,6 +12,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   repeatMode: "off",
   reducedMotion: "system",
   artworkTint: true,
+  ambientRainDrops: false,
   lyricsStyle: "line",
   lyricFontSize: "md",
   lyricAlignment: "center",

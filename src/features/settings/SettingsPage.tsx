@@ -162,6 +162,13 @@ export function SettingsPage() {
         <Row label="Artwork background tint" hint="Tint Now Playing with a soft color from the current cover.">
           <Toggle checked={prefs.artworkTint} onChange={(value) => update({ artworkTint: value })} label="Artwork tint" />
         </Row>
+        <Row label="Ambient Rain Drops" hint="Show subtle animated water droplets in the Now Playing background.">
+          <Toggle
+            checked={prefs.ambientRainDrops}
+            onChange={(value) => update({ ambientRainDrops: value })}
+            label="Ambient Rain Drops"
+          />
+        </Row>
         <Row label="Reduced motion" hint="Follows your system setting by default.">
           <Select
             size="sm"

@@ -3,8 +3,10 @@ import { MemoryRouter } from "react-router-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
 import { MiniPlayer } from "../../components/MiniPlayer";
+import { SettingsPage } from "../settings/SettingsPage";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
+import { DEFAULT_PREFERENCES, useSettingsStore } from "../../stores/settingsStore";
 import {
   setCachedPalette,
   clearPaletteCache,
@@ -68,6 +70,7 @@ describe("NowPlayingPage component", () => {
       queueTrackIds: ["track-1"],
       queueIndex: 0,
     });
+    useSettingsStore.setState({ prefs: DEFAULT_PREFERENCES, loaded: true });
   });
 
   it("renders empty state when no track is playing", () => {
@@ -368,5 +371,76 @@ describe("NowPlayingPage component", () => {
     mockNavigate.mockClear();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(mockNavigate).toHaveBeenCalledWith(-1);
+  });
+
+  it("renders lightweight AmbientRainDrops only when enabled in Now Playing mode, unmounts when disabled or in Lyrics mode, and respects reduced motion", () => {
+    const { container } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    // Default state is OFF: zero rain elements or canvas
+    expect(screen.queryByTestId("ambient-rain-drops")).toBeNull();
+    expect(container.querySelectorAll("[data-raindrop]").length).toBe(0);
+    expect(container.querySelectorAll("canvas").length).toBe(0);
+
+    // Turn ON -> immediately renders 10 lightweight droplets (between 6 and 12)
+    act(() => {
+      useSettingsStore.getState().update({ ambientRainDrops: true });
+    });
+
+    const layer = screen.getByTestId("ambient-rain-drops");
+    expect(layer).toBeTruthy();
+    expect(layer.className).toContain("pointer-events-none");
+    expect(layer.getAttribute("data-reduced-motion")).toBe("false");
+    const droplets = container.querySelectorAll("[data-raindrop]");
+    expect(droplets.length).toBeGreaterThanOrEqual(6);
+    expect(droplets.length).toBeLessThanOrEqual(12);
+    expect(container.querySelectorAll("canvas").length).toBe(0);
+
+    // Respects reduced motion: disables continuous animations
+    act(() => {
+      useSettingsStore.getState().update({ reducedMotion: "on" });
+    });
+    expect(screen.getByTestId("ambient-rain-drops").getAttribute("data-reduced-motion")).toBe("true");
+    expect((droplets[0] as HTMLElement).style.animation).toBe("none");
+
+    // Switching to Fullscreen Lyrics unmounts the rain droplets
+    fireEvent.click(screen.getByRole("button", { name: "Show lyrics" }));
+    expect(screen.queryByTestId("ambient-rain-drops")).toBeNull();
+
+    // Return to Now Playing -> droplets reappear while setting is ON
+    fireEvent.click(screen.getByRole("button", { name: "Hide lyrics" }));
+    expect(screen.getByTestId("ambient-rain-drops")).toBeTruthy();
+
+    // Turn OFF -> immediately removes all droplet elements
+    act(() => {
+      useSettingsStore.getState().update({ ambientRainDrops: false });
+    });
+    expect(screen.queryByTestId("ambient-rain-drops")).toBeNull();
+    expect(container.querySelectorAll("[data-raindrop]").length).toBe(0);
+  });
+
+  it("toggles Ambient Rain Drops from the Appearance section in SettingsPage", () => {
+    render(
+      <MemoryRouter>
+        <SettingsPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText("Ambient Rain Drops")).toBeTruthy();
+    expect(screen.getByText("Show subtle animated water droplets in the Now Playing background.")).toBeTruthy();
+
+    const toggle = screen.getByRole("switch", { name: "Ambient Rain Drops" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+
+    fireEvent.click(toggle);
+    expect(useSettingsStore.getState().prefs.ambientRainDrops).toBe(true);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(toggle);
+    expect(useSettingsStore.getState().prefs.ambientRainDrops).toBe(false);
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
   });
 });

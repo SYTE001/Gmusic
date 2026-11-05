@@ -351,3 +351,46 @@ input[type="range"].app-range::-moz-range-thumb {
   background: var(--surface-raised);
   flex: none;
 }
+
+
+/* Lightweight optional rain droplets (10 tiny particles, 2-5px, 15-30% opacity) */
+@keyframes gm-raindrop-float {
+  0% {
+    transform: translate3d(0, -14px, 0);
+    opacity: 0;
+  }
+  20% {
+    opacity: var(--drop-opacity, 0.22);
+  }
+  80% {
+    opacity: var(--drop-opacity, 0.22);
+  }
+  100% {
+    transform: translate3d(var(--drop-drift-x, 3px), var(--drop-travel-y, 44px), 0);
+    opacity: 0;
+  }
+}
+
+.gm-raindrop {
+  position: absolute;
+  border-radius: 9999px;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at 35% 30%,
+    var(--text-primary) 0%,
+    var(--text-secondary) 72%,
+    transparent 100%
+  );
+  opacity: var(--drop-opacity, 0.22);
+  animation: gm-raindrop-float var(--drop-duration, 11s) ease-in-out var(--drop-delay, 0s) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="off"]) .gm-raindrop {
+    animation: none !important;
+  }
+}
+
+html[data-motion="on"] .gm-raindrop {
+  animation: none !important;
+}

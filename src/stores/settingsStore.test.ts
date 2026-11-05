@@ -44,6 +44,13 @@ describe("settings theme application", () => {
   it("falls back to defaults when no preferences are stored", async () => {
     await useSettingsStore.getState().init();
     expect(useSettingsStore.getState().prefs).toEqual(DEFAULT_PREFERENCES);
+    expect(useSettingsStore.getState().prefs.ambientRainDrops).toBe(false);
     expect(useSettingsStore.getState().loaded).toBe(true);
+  });
+
+  it("persists and reloads the ambientRainDrops preference", async () => {
+    await repository.putPreferences({ ...DEFAULT_PREFERENCES, ambientRainDrops: true });
+    await useSettingsStore.getState().init();
+    expect(useSettingsStore.getState().prefs.ambientRainDrops).toBe(true);
   });
 });

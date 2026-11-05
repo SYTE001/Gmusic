@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useLibraryStore, useTrackById } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
+import { useSettingsStore } from "../../stores/settingsStore";
 import { toast } from "../../stores/toastStore";
 import { recordComponentRender } from "../../utils/perf";
 import { Artwork } from "../../components/Artwork";
@@ -12,6 +13,7 @@ import { TransportToggle } from "../../components/TransportToggle";
 import { useTrackActionsContext } from "../library/useTrackActions";
 import { LyricsView } from "../lyrics/LyricsView";
 import { useAdaptiveLyricsPalette } from "../lyrics/useAdaptiveLyricsPalette";
+import { AmbientRainDrops } from "./AmbientRainDrops";
 import {
   ChevronDownIcon,
   ChevronUpIcon,
@@ -78,6 +80,7 @@ export function NowPlayingPage() {
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
   const shuffleEnabled = usePlaybackStore((state) => state.shuffleEnabled);
   const repeatMode = usePlaybackStore((state) => state.repeatMode);
+  const ambientRainDrops = useSettingsStore((state) => state.prefs.ambientRainDrops);
   const trackActionsContext = useTrackActionsContext();
 
   const palette = useAdaptiveLyricsPalette(track, showBackground);
@@ -180,6 +183,7 @@ export function NowPlayingPage() {
       data-cover-category={showBackground ? palette.category : undefined}
       style={rootStyle}
     >
+      {ambientRainDrops && !lyricsMode && <AmbientRainDrops />}
       {lyricsMode ? (
         /* Mode 2: Fullscreen Lyrics */
         <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col animate-fade-in">
