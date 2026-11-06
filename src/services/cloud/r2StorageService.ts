@@ -101,7 +101,8 @@ async function postJson(path: string, body: unknown): Promise<unknown> {
     if (error instanceof DOMException && error.name === "AbortError") {
       throw new CloudStorageError("cancelled", "The operation was cancelled.");
     }
-    throw new CloudStorageError("network", "Cloud storage could not be reached. Check your connection and try again.");
+    const errorMsg = error instanceof Error ? `: ${error.message}` : "";
+    throw new CloudStorageError("network", `Cloud storage could not be reached${errorMsg}.`);
   }
 
   if (response.status === 401 || response.status === 403) {

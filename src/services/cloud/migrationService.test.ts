@@ -849,4 +849,142 @@ describe("partial upload recovery and permissions", () => {
     await runMigration([track], progress);
     expect(storage.uploads).toBe(0);
   });
+
+  describe("upload diagnostics, format coverage, and reliability", () => {
+    it("captures detailed error diagnostics on PUT failure and does not claim offline when online", async () => {
+      const track = makeTrack({ id: "fail-diag", fileName: "tune.mp3" });
+      await repository.putTracks([track]);
+      await repository.putAudioBlob(track.id, new Blob([new Uint8Array(500)], { type: "audio/mpeg" }));
+
+      vi.stubGlobal("fetch", async () => {
+        throw new TypeError("Failed to fetch");
+      });
+
+      const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.failed).toBe(1);
+      expect(progress.items[0]!.error).toContain("Upload PUT failed (TypeError: Failed to fetch)");
+      expect(progress.items[0]!.error).not.toContain("offline");
+
+      const diag = infoSpy.mock.calls.find((c) => c[0] === "[UploadDiagnostics]");
+      expect(diag).toBeTruthy();
+      expect(diag?.[1]).toMatchObject({
+        trackId: "fail-diag",
+        title: track.title,
+        extension: "mp3",
+        mimeType: "audio/mpeg",
+        requestStage: "put",
+        errorName: "TypeError",
+        errorMessage: "Failed to fetch",
+        isVerificationFailure: false,
+      });
+
+      infoSpy.mockRestore();
+    });
+
+    it("uploads a small MP3 file successfully", async () => {
+      const track = makeTrack({ id: "small-mp3", fileName: "small.mp3", fileSize: 512 });
+      await repository.putTracks([track]);
+      await repository.putAudioBlob(track.id, new Blob([new Uint8Array(512)], { type: "audio/mpeg" }));
+
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.succeeded).toBe(1);
+      expect(storage.audioMimeByTrack.get(track.id)).toBe("audio/mpeg");
+      expect((await repository.getTrack(track.id))?.cloudStatus).toBe("ready");
+    });
+
+    it("uploads a large audio file (e.g. 50MB) with correct size and MIME type", async () => {
+      const largeSize = 52428800; // 50 MB
+      const track = makeTrack({ id: "large-wav", fileName: "recording.wav", fileSize: largeSize });
+      await repository.putTracks([track]);
+      await repository.putAudioBlob(track.id, new Blob([new Uint8Array(100)], { type: "audio/wav" }));
+      // Override blob size for testing large file
+      Object.defineProperty((await repository.getAudioBlob(track.id))!, "size", { value: largeSize });
+      vi.spyOn(repository, "getAudioBlob").mockResolvedValue(new Blob([new Uint8Array(10)], { type: "audio/wav" }));
+      const largeBlob = { size: largeSize, type: "audio/wav" } as unknown as Blob;
+      vi.spyOn(repository, "getAudioBlob").mockResolvedValue(largeBlob);
+
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.succeeded).toBe(1);
+      expect(storage.audioMimeByTrack.get(track.id)).toBe("audio/wav");
+      expect(storage.completeMimeByObject.get(`users/u-1/tracks/${track.id}/audio.wav`)).toBe("audio/wav");
+      vi.restoreAllMocks();
+    });
+
+    it("uploads across different supported audio extensions (.mp3, .m4a, .flac, .wav, .ogg, .opus)", async () => {
+      const extensions = [
+        { ext: "mp3", mime: "audio/mpeg" },
+        { ext: "m4a", mime: "audio/mp4" },
+        { ext: "flac", mime: "audio/flac" },
+        { ext: "wav", mime: "audio/wav" },
+        { ext: "ogg", mime: "audio/ogg" },
+        { ext: "opus", mime: "audio/opus" },
+      ];
+
+      const tracks: Track[] = [];
+      for (const { ext, mime } of extensions) {
+        const id = `ext-${ext}`;
+        const track = makeTrack({ id, fileName: `song.${ext}`, mimeType: mime });
+        tracks.push(track);
+        await repository.putTracks([track]);
+        await repository.putAudioBlob(track.id, new Blob([new Uint8Array(256)], { type: mime }));
+      }
+
+      const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+      await runMigration(tracks, progress);
+
+      expect(progress.succeeded).toBe(extensions.length);
+      for (const { ext, mime } of extensions) {
+        const id = `ext-${ext}`;
+        expect(storage.audioMimeByTrack.get(id)).toBe(mime);
+        expect((await repository.getTrack(id))?.cloudStatus).toBe("ready");
+      }
+    });
+
+    it("does not blindly retry permanent 4xx failures from R2", async () => {
+      const track = makeTrack({ id: "perm-403", fileName: "denied.mp3" });
+      await repository.putTracks([track]);
+      await repository.putAudioBlob(track.id, new Blob([new Uint8Array(200)], { type: "audio/mpeg" }));
+
+      vi.stubGlobal("fetch", async () => {
+        return new Response("<Error><Code>SignatureDoesNotMatch</Code></Error>", { status: 403 });
+      });
+
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(progress.failed).toBe(1);
+      // Permanent 403 must not burn multiple retry attempts
+      expect(storage.uploads).toBe(1);
+      expect(progress.items[0]!.error).toContain("403");
+      expect(progress.items[0]!.error).toContain("SignatureDoesNotMatch");
+    });
+
+    it("retries transient PUT failures with a fresh presigned URL and intent", async () => {
+      const track = makeTrack({ id: "retry-transient", fileName: "transient.mp3" });
+      await repository.putTracks([track]);
+      await repository.putAudioBlob(track.id, new Blob([new Uint8Array(300)], { type: "audio/mpeg" }));
+
+      let attempt = 0;
+      vi.stubGlobal("fetch", async () => {
+        attempt += 1;
+        if (attempt === 1) throw new TypeError("Network timeout");
+        return new Response("", { status: 200 });
+      });
+
+      const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+      await runMigration([track], progress);
+
+      expect(attempt).toBe(2);
+      expect(storage.uploads).toBe(2);
+      expect(progress.succeeded).toBe(1);
+      expect((await repository.getTrack(track.id))?.cloudStatus).toBe("ready");
+    });
+  });
 });

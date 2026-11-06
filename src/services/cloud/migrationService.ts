@@ -70,6 +70,26 @@ export function initialMigrationProgress(): MigrationProgress {
   };
 }
 
+export type UploadDiagnostics = {
+  trackId: string;
+  title: string;
+  extension: string;
+  mimeType: string;
+  fileSize: number;
+  attempt: number;
+  requestStage: "request-upload-url" | "put" | "verification" | "metadata-upsert";
+  httpStatus: number | null;
+  errorName: string;
+  errorMessage: string;
+  isVerificationFailure: boolean;
+};
+
+export function logUploadDiagnostics(diag: UploadDiagnostics): void {
+  if (typeof import.meta !== "undefined" && import.meta.env?.DEV) {
+    console.info("[UploadDiagnostics]", diag);
+  }
+}
+
 function describeFailure(error: unknown): string {
   if (error instanceof CloudStorageError) return error.message;
   if (error instanceof Error) return error.message;
@@ -246,18 +266,58 @@ async function uploadOne(
   mimeType: string,
   kind: "audio" | "artwork",
 ): Promise<string> {
+  const extension = (kind === "audio" ? track.fileName : "artwork")
+    .match(/\.([^.]+)$/)?.[1]
+    ?.toLowerCase() ?? "";
+
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= UPLOAD_ATTEMPTS; attempt += 1) {
     // A fresh intent and URL per attempt. `requestUploadUrl` also re-checks
     // size and MIME against the Worker's allow-list, so a retry can never
     // reuse a URL whose terms no longer match the file.
-    const { objectKey, uploadUrl, uploadIntent, requiredHeaders } = await requestUploadUrl({
-      trackId: track.id,
-      fileName: kind === "audio" ? track.fileName : "artwork",
-      mimeType,
-      sizeBytes: file.size,
-      kind,
-    });
+    let uploadInfo: {
+      objectKey: string;
+      uploadUrl: string;
+      uploadIntent?: string;
+      requiredHeaders: Record<string, string>;
+    };
+    try {
+      uploadInfo = await requestUploadUrl({
+        trackId: track.id,
+        fileName: kind === "audio" ? track.fileName : "artwork",
+        mimeType,
+        sizeBytes: file.size,
+        kind,
+      });
+    } catch (error) {
+      lastError = error;
+      const errorName = error instanceof Error ? error.name : "UnknownError";
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const httpStatus = error instanceof CloudStorageError ? error.status : null;
+      logUploadDiagnostics({
+        trackId: track.id,
+        title: track.title,
+        extension,
+        mimeType,
+        fileSize: file.size,
+        attempt,
+        requestStage: "request-upload-url",
+        httpStatus,
+        errorName,
+        errorMessage,
+        isVerificationFailure: false,
+      });
+      // Permanent 4xx failures from Worker (e.g. 400 bad MIME or 413 too large)
+      // should not be retried blindly.
+      if (httpStatus && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 408 && httpStatus !== 429) {
+        throw error;
+      }
+      if (attempt < UPLOAD_ATTEMPTS) continue;
+      throw error;
+    }
+
+    const { objectKey, uploadUrl, uploadIntent, requiredHeaders } = uploadInfo;
+    const requiredContentType = requiredHeaders["content-type"] ?? mimeType;
 
     let response: Response;
     try {
@@ -266,38 +326,102 @@ async function uploadOne(
         body: file,
         // The same MIME type that presigned the URL also labels the bytes on
         // the wire and is verified by the Worker afterwards.
-        headers: { ...requiredHeaders, "content-type": mimeType },
+        headers: { ...requiredHeaders, "content-type": requiredContentType },
       });
     } catch (error) {
       lastError = error;
+      const errorName = error instanceof Error ? error.name : "UnknownError";
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logUploadDiagnostics({
+        trackId: track.id,
+        title: track.title,
+        extension,
+        mimeType: requiredContentType,
+        fileSize: file.size,
+        attempt,
+        requestStage: "put",
+        httpStatus: null,
+        errorName,
+        errorMessage,
+        isVerificationFailure: false,
+      });
+
       // Transient network failure: retry once with a fresh URL, then report.
       if (attempt < UPLOAD_ATTEMPTS) continue;
-      throw new CloudStorageError("network", "The file could not be uploaded. Check your connection and try again.");
+
+      const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
+      const reasonMsg = isOffline
+        ? "You are currently offline. Check your connection and try again."
+        : `Upload PUT failed (${errorName}: ${errorMessage}).`;
+      throw new CloudStorageError("network", reasonMsg);
     }
-    if (response.ok) {
+
+    if (!response.ok) {
+      const status = response.status;
+      let responseBody = "";
       try {
-        const verified = await completeUpload({
-          objectKey,
-          uploadIntent,
-          trackId: track.id,
-          sizeBytes: file.size,
-          mimeType,
-        });
-        return verified.objectKey;
-      } catch (error) {
-        // The bytes landed but the upload was rejected (wrong size, wrong
-        // metadata, or the verify call could not be served). Remove the
-        // unclaimed object so R2 never holds audio with no metadata pointing
-        // at it. A failure here is best-effort: the /complete step keeps
-        // rejecting it, so it can never be marked uploaded by mistake.
-        await deleteCloudObject(objectKey).catch(() => undefined);
-        throw error;
+        responseBody = await response.text();
+      } catch {
+        // Body reading is best-effort
       }
+      const detail = responseBody ? `HTTP ${status}: ${responseBody.slice(0, 150)}` : `HTTP ${status}`;
+      logUploadDiagnostics({
+        trackId: track.id,
+        title: track.title,
+        extension,
+        mimeType: requiredContentType,
+        fileSize: file.size,
+        attempt,
+        requestStage: "put",
+        httpStatus: status,
+        errorName: "HttpError",
+        errorMessage: detail,
+        isVerificationFailure: false,
+      });
+
+      // Do not retry permanent 4xx validation failures blindly (Phase 4).
+      if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        throw new CloudStorageError("server", `The upload was rejected (${detail}).`, status);
+      }
+      lastError = new CloudStorageError("server", `Upload failed (${detail}). Retrying…`, status);
+      continue;
     }
-    if (response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429) {
-      throw new CloudStorageError("server", `The upload was rejected (${response.status}).`);
+
+    try {
+      const verified = await completeUpload({
+        objectKey,
+        uploadIntent,
+        trackId: track.id,
+        sizeBytes: file.size,
+        mimeType: requiredContentType,
+      });
+      return verified.objectKey;
+    } catch (error) {
+      const errorName = error instanceof Error ? error.name : "UnknownError";
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const httpStatus = error instanceof CloudStorageError ? error.status : null;
+      logUploadDiagnostics({
+        trackId: track.id,
+        title: track.title,
+        extension,
+        mimeType: requiredContentType,
+        fileSize: file.size,
+        attempt,
+        requestStage: "verification",
+        httpStatus,
+        errorName,
+        errorMessage,
+        isVerificationFailure: true,
+      });
+
+      // The bytes landed but the upload was rejected (wrong size, wrong
+      // metadata, or the verify call could not be served). Remove the
+      // unclaimed object so R2 never holds audio with no metadata pointing
+      // at it. A failure here is best-effort: the /complete step keeps
+      // rejecting it, so it can never be marked uploaded by mistake.
+      await deleteCloudObject(objectKey).catch(() => undefined);
+      throw error;
     }
-    lastError = new CloudStorageError("server", `Upload failed (${response.status}). Retrying…`);
   }
   throw lastError instanceof Error
     ? lastError
@@ -378,10 +502,10 @@ export async function runMigration(
       return;
     }
 
+    const mimeType = resolveAudioMimeType(track.fileName, file.type);
     try {
       // The upload MIME type follows the file name, not the blob's own
       // metadata, so a mislabeled `.m4a` is never sent as `audio/mpeg`.
-      const mimeType = resolveAudioMimeType(track.fileName, file.type);
       await repository.updateTrack(track.id, { cloudStatus: "uploading" });
 
       // Retry after a partial failure: the object may already be in R2 with
@@ -440,6 +564,21 @@ export async function runMigration(
       item.error = null;
     } catch (error) {
       if (error instanceof CloudStorageError && error.kind === "cancelled") return;
+      if (!(error instanceof CloudStorageError)) {
+        logUploadDiagnostics({
+          trackId: track.id,
+          title: track.title,
+          extension: track.fileName.match(/\.([^.]+)$/)?.[1]?.toLowerCase() ?? "",
+          mimeType,
+          fileSize: file.size,
+          attempt: 1,
+          requestStage: "metadata-upsert",
+          httpStatus: null,
+          errorName: error instanceof Error ? error.name : "UnknownError",
+          errorMessage: error instanceof Error ? error.message : String(error),
+          isVerificationFailure: false,
+        });
+      }
       item.status = "failed";
       item.error = describeFailure(error);
       // Local audio is deliberately untouched on failure. Only the status is
