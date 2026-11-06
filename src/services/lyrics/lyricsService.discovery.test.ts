@@ -13,6 +13,24 @@ vi.mock("./lrcmuxClient", async (importOriginal) => {
   };
 });
 
+vi.mock("./lrclibClient", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./lrclibClient")>();
+  return {
+    ...original,
+    lrclibGet: vi.fn().mockResolvedValue(null),
+    lrclibSearch: vi.fn().mockResolvedValue([]),
+  };
+});
+
+vi.mock("./lyricsdbClient", async (importOriginal) => {
+  const original = await importOriginal<typeof import("./lyricsdbClient")>();
+  return {
+    ...original,
+    lyricsDbGet: vi.fn().mockResolvedValue(null),
+    lyricsDbSearch: vi.fn().mockResolvedValue([]),
+  };
+});
+
 // Typed access to the mocks declared by vi.mock above.
 const { lrcmuxGet, lrcmuxSearch } = await import("./lrcmuxClient");
 const getMock = vi.mocked(lrcmuxGet);

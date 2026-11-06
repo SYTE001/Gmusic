@@ -122,7 +122,7 @@ export type LyricLine = {
 export type LyricCapability = "word" | "line" | "plain" | "instrumental" | "none";
 
 export type LyricOrigin = {
-  kind: "lrcmux" | "lrclib" | "manual";
+  kind: "lrcmux" | "lrclib" | "lyricsdb" | "manual";
   /** Record id, when the lyrics came from the API. */
   recordId: number | string | null;
   fetchedAt: number;

@@ -1,0 +1,22 @@
+{
+  "name": "lyrics-lrclib-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Isolated Cloudflare Worker proxy for LRCLIB lyrics discovery.",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250410.0",
+    "typescript": "~5.8.3",
+    "vitest": "^3.2.0",
+    "wrangler": "^3.114.17"
+  }
+}

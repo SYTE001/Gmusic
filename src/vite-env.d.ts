@@ -14,6 +14,14 @@ interface ImportMetaEnv {
    * Origin of the Cloudflare Worker that issues presigned R2 URLs.
    */
   readonly VITE_WORKER_URL: string;
+  /**
+   * Origin of the dedicated Cloudflare Worker proxying LRCLIB.
+   */
+  readonly VITE_LRCLIB_WORKER_URL?: string;
+  /**
+   * Origin of the dedicated Cloudflare Worker proxying LyricsDB.
+   */
+  readonly VITE_LYRICSDB_WORKER_URL?: string;
 }
 
 interface ImportMeta {

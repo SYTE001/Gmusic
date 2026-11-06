@@ -1,0 +1,12 @@
+# Isolated Cloudflare Worker — LyricsDB Proxy for Gmusic
+name = "lyrics-lyricsdb-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-06"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_ORIGIN = "https://gmusic-tawny.vercel.app"
+LYRICSDB_BASE_URL = "https://lyricsdb.kollod.dev/api"
+REQUEST_TIMEOUT_MS = "10000"
+CACHE_TTL_SEARCH_SECONDS = "3600"
+CACHE_TTL_LYRICS_SECONDS = "86400"

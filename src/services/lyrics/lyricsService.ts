@@ -1,10 +1,11 @@
-import type { LyricLine, LyricWord, Track, TrackLyrics } from "../../types";
+import type { LyricLine, LyricOrigin, LyricWord, Track, TrackLyrics } from "../../types";
 import { DB_SCHEMA_VERSION } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
-import { CAPABILITY_RANK, detectLyricsCapability, type LyricCapabilityLevel } from "./capability";
-import { describeLrcmuxError, lrcmuxGet, lrcmuxSearch, type LrcmuxQuery, type LrcmuxRecord } from "./lrcmuxClient";
-import type { LrclibRecord } from "./lrclibClient";
-import { decideMatch, rankCandidates, type RankedCandidate } from "./matching";
+import { CAPABILITY_RANK, detectLyricsCapability, recordCapability, type LyricCapabilityLevel } from "./capability";
+import { describeLrcmuxError, LrcmuxError, lrcmuxGet, lrcmuxSearch, type LrcmuxQuery } from "./lrcmuxClient";
+import { describeLrclibError, LrclibError, lrclibGet, lrclibSearch, type LrclibQuery } from "./lrclibClient";
+import { describeLyricsDbError, LyricsDbError, lyricsDbGet, lyricsDbSearch, type LyricsDbQuery } from "./lyricsdbClient";
+import { artistSimilarity, decideMatch, type LyricMatchRecord, rankCandidates, type RankedCandidate, similarity } from "./matching";
 import { parseLyricsfile } from "./lyricsfile";
 import { normalizeTrackMetadata } from "../metadata/normalization";
 
@@ -262,20 +263,38 @@ export type LyricsResolution =
  */
 export function buildLyricsFromRecord(
   trackId: string,
-  record: LrcmuxRecord | LrclibRecord,
+  record: LyricMatchRecord,
   previousOffsetMs: number = 0,
 ): TrackLyrics {
-  const origin = {
-    kind: "lrcmux" as const,
-    recordId: typeof record.id === "number" ? record.id : null,
+  let providerKind: "lrcmux" | "lrclib" | "lyricsdb" = "lrcmux";
+  if ("provider" in record && record.provider) {
+    providerKind = record.provider;
+  } else if ("source" in record && typeof record.source === "string" && record.source.includes("lyricsdb")) {
+    providerKind = "lyricsdb";
+  } else if ("source" in record && typeof record.source === "string" && record.source.includes("lrclib")) {
+    providerKind = "lrclib";
+  } else if (typeof record.id === "number") {
+    providerKind = "lrclib";
+  }
+
+  const origin: LyricOrigin = {
+    kind: providerKind,
+    recordId: record.id != null ? (typeof record.id === "number" ? record.id : String(record.id)) : null,
     fetchedAt: Date.now(),
     matchedTitle: record.trackName ?? undefined,
     matchedArtist: record.artistName ?? undefined,
     matchedAlbum: record.albumName ?? undefined,
-    capability: "plain" as const,
+    capability: "plain",
   };
 
-  const sourceLabel = "source" in record && record.source ? `lrcmux (${record.source})` : "lrcmux";
+  const sourceLabel =
+    providerKind === "lyricsdb"
+      ? ("source" in record && record.source ? record.source : "lyricsdb")
+      : providerKind === "lrclib"
+        ? "lrclib"
+        : "source" in record && record.source
+          ? `lrcmux (${record.source})`
+          : "lrcmux";
 
   if (record.instrumental) {
     return {
@@ -291,7 +310,7 @@ export function buildLyricsFromRecord(
     };
   }
 
-  // Pre-parsed structured lines (direct from lrcmux native /get endpoint)
+  // Pre-parsed structured lines (direct from lrcmux native /get endpoint or LyricsDB)
   if ("lines" in record && Array.isArray(record.lines) && record.lines.length > 0) {
     const wordTimed = hasWordTimestamps(record.lines);
     const hasTime = record.lines.some((l) => l.timeMs !== null);
@@ -366,7 +385,7 @@ export function buildLyricsFromRecord(
 }
 
 /** Persists an accepted record and its cache meta. */
-export async function attachLrcmuxRecord(track: Track, record: LrcmuxRecord | LrclibRecord): Promise<TrackLyrics> {
+export async function attachLrcmuxRecord(track: Track, record: LyricMatchRecord): Promise<TrackLyrics> {
   const existing = await repository.getLyrics(track.id);
   const lyrics = buildLyricsFromRecord(track.id, record, existing?.offsetMs ?? 0);
   await repository.putLyrics(lyrics);
@@ -374,13 +393,14 @@ export async function attachLrcmuxRecord(track: Track, record: LrcmuxRecord | Lr
     trackId: track.id,
     status: "accepted",
     checkedAt: Date.now(),
-    recordId: typeof record.id === "number" ? record.id : null,
+    recordId: record.id != null ? (typeof record.id === "number" ? record.id : null) : null,
     schemaVersion: DB_SCHEMA_VERSION,
   });
   return lyrics;
 }
 
 export const attachLrclibRecord = attachLrcmuxRecord;
+export const attachLyricsDbRecord = attachLrcmuxRecord;
 
 /**
  * Full discovery flow for one track (task §6):
@@ -417,7 +437,7 @@ function roundDurationForApi(durationMs: number): number {
  */
 function considerRecord(
   track: Track,
-  record: LrcmuxRecord | LrclibRecord,
+  record: LyricMatchRecord,
   cached: TrackLyrics | null,
   minCapabilityRank: number,
 ): { lyrics: TrackLyrics; capability: LyricCapabilityLevel } | null {
@@ -429,7 +449,7 @@ function considerRecord(
   return { lyrics, capability };
 }
 
-async function persistAttached(track: Track, lyrics: TrackLyrics, record: LrcmuxRecord | LrclibRecord): Promise<TrackLyrics> {
+async function persistAttached(track: Track, lyrics: TrackLyrics, record: LyricMatchRecord): Promise<TrackLyrics> {
   await repository.putLyrics(lyrics);
   await repository.putLyricsCacheMeta({
     trackId: track.id,
@@ -458,6 +478,257 @@ async function upgradeBackoffActive(trackId: string): Promise<boolean> {
   return meta?.status === "accepted" && Date.now() - meta.checkedAt < LYRICS_UPGRADE_RETRY_MS;
 }
 
+export type LyricsProvider = "lrcmux" | "lrclib" | "lyricsdb";
+
+let defaultProviders: LyricsProvider[] = ["lrcmux", "lrclib", "lyricsdb"];
+
+function describeLyricsError(error: unknown): string {
+  if (error instanceof LrcmuxError) return describeLrcmuxError(error);
+  if (error instanceof LrclibError) return describeLrclibError(error);
+  if (error instanceof LyricsDbError) return describeLyricsDbError(error);
+  return describeLrcmuxError(error);
+}
+
+function deduplicateRecords(records: LyricMatchRecord[]): LyricMatchRecord[] {
+  const result: LyricMatchRecord[] = [];
+  for (const record of records) {
+    const existingIndex = result.findIndex((existing) => {
+      if (existing.id === record.id && existing.provider === record.provider) return true;
+      const titleMatch = similarity(record.trackName ?? "", existing.trackName ?? "") >= 0.9;
+      const artistMatch =
+        !record.artistName || !existing.artistName
+          ? true
+          : artistSimilarity(record.artistName, existing.artistName) >= 0.8;
+      const durationDelta =
+        record.duration != null && existing.duration != null
+          ? Math.abs(record.duration - existing.duration)
+          : 0;
+      return titleMatch && artistMatch && durationDelta <= 5;
+    });
+
+    if (existingIndex === -1) {
+      result.push(record);
+    } else {
+      // If multiple providers return the same song, choose the highest-quality valid result
+      const existing = result[existingIndex];
+      const existingCap = CAPABILITY_RANK[recordCapability(existing)];
+      const newCap = CAPABILITY_RANK[recordCapability(record)];
+      if (newCap > existingCap) {
+        result[existingIndex] = record;
+      }
+    }
+  }
+  return result;
+}
+
+async function fetchFromLrcmux(
+  canonicalTrack: Track,
+  normalized: ReturnType<typeof normalizeTrackMetadata>,
+  signal: AbortSignal | undefined,
+): Promise<{ records: LyricMatchRecord[]; exactRecord: LyricMatchRecord | null }> {
+  const collected: LyricMatchRecord[] = [];
+  let exactRecord: LyricMatchRecord | null = null;
+  let lastError: unknown = null;
+  const seenQueries = new Set<string>();
+  const markQueryKey = (q: LrcmuxQuery) =>
+    `${q.trackName ?? ""}|${q.artistName ?? ""}|${q.albumName ?? ""}|${q.q ?? ""}`;
+
+  // Stage A — Exact identity
+  const queryA: LrcmuxQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+    duration: canonicalTrack.durationMs != null ? roundDurationForApi(canonicalTrack.durationMs) : undefined,
+  };
+
+  try {
+    const exact = await lrcmuxGet(queryA, signal);
+    if (exact) {
+      exactRecord = { ...exact, provider: "lrcmux" };
+      collected.push(exactRecord);
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastError = error;
+  }
+
+  if (exactRecord) {
+    const cap = recordCapability(exactRecord);
+    if (cap === "word" || cap === "line") {
+      return { records: collected, exactRecord };
+    }
+  }
+
+  // Stage B — Structured discovery
+  const queryB: LrcmuxQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+  };
+  seenQueries.add(markQueryKey(queryB));
+
+  try {
+    const resultsB = await lrcmuxSearch(queryB, signal);
+    if (resultsB && resultsB.length > 0) {
+      for (const r of resultsB) {
+        collected.push({ ...r, provider: "lrcmux" });
+      }
+      return { records: collected, exactRecord };
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastError = error;
+  }
+
+  // Stage C — Alternative queries
+  for (const alt of normalized.alternateQueries) {
+    if (signal?.aborted) throw new DOMException("AbortError", "AbortError");
+    const altQuery: LrcmuxQuery = {
+      trackName: alt.trackName || undefined,
+      artistName: alt.artistName || undefined,
+      q: alt.q || undefined,
+    };
+    const key = markQueryKey(altQuery);
+    if (seenQueries.has(key)) continue;
+    seenQueries.add(key);
+
+    try {
+      const altResults = await lrcmuxSearch(altQuery, signal);
+      if (altResults && altResults.length > 0) {
+        for (const r of altResults) {
+          collected.push({ ...r, provider: "lrcmux" });
+        }
+        return { records: collected, exactRecord };
+      }
+    } catch (error) {
+      if (isAborted(error)) throw error;
+      lastError = error;
+    }
+  }
+
+  if (collected.length === 0 && lastError) {
+    throw lastError;
+  }
+
+  return { records: collected, exactRecord };
+}
+
+async function fetchFromLrclib(
+  canonicalTrack: Track,
+  normalized: ReturnType<typeof normalizeTrackMetadata>,
+  signal: AbortSignal | undefined,
+): Promise<{ records: LyricMatchRecord[]; exactRecord: LyricMatchRecord | null }> {
+  const collected: LyricMatchRecord[] = [];
+  let exactRecord: LyricMatchRecord | null = null;
+  let lastError: unknown = null;
+
+  // Stage A — Exact identity
+  const queryA: LrclibQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+    duration: canonicalTrack.durationMs != null ? roundDurationForApi(canonicalTrack.durationMs) : undefined,
+  };
+
+  try {
+    const exact = await lrclibGet(queryA, signal);
+    if (exact) {
+      exactRecord = { ...exact, provider: "lrclib" };
+      collected.push(exactRecord);
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastError = error;
+  }
+
+  if (exactRecord) {
+    const cap = recordCapability(exactRecord);
+    if (cap === "word" || cap === "line") {
+      return { records: collected, exactRecord };
+    }
+  }
+
+  // Stage B — Structured search
+  const queryB: LrclibQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+  };
+
+  try {
+    const resultsB = await lrclibSearch(queryB, signal);
+    if (resultsB && resultsB.length > 0) {
+      for (const r of resultsB) {
+        collected.push({ ...r, provider: "lrclib" });
+      }
+      return { records: collected, exactRecord };
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastError = error;
+  }
+
+  if (collected.length === 0 && lastError) {
+    throw lastError;
+  }
+
+  return { records: collected, exactRecord };
+}
+
+async function fetchFromLyricsDb(
+  canonicalTrack: Track,
+  normalized: ReturnType<typeof normalizeTrackMetadata>,
+  signal: AbortSignal | undefined,
+): Promise<{ records: LyricMatchRecord[]; exactRecord: LyricMatchRecord | null }> {
+  const collected: LyricMatchRecord[] = [];
+  let exactRecord: LyricMatchRecord | null = null;
+  let lastError: unknown = null;
+
+  const query: LyricsDbQuery = {
+    trackName: normalized.title || undefined,
+    artistName: normalized.artist || undefined,
+    albumName: normalized.album || undefined,
+    duration: canonicalTrack.durationMs != null ? roundDurationForApi(canonicalTrack.durationMs) : undefined,
+  };
+
+  try {
+    const exact = await lyricsDbGet(query, signal);
+    if (exact) {
+      exactRecord = exact;
+      collected.push(exact);
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastError = error;
+  }
+
+  if (exactRecord) {
+    const cap = recordCapability(exactRecord);
+    if (cap === "word" || cap === "line") {
+      return { records: collected, exactRecord };
+    }
+  }
+
+  try {
+    const results = await lyricsDbSearch(query, signal);
+    if (results && results.length > 0) {
+      for (const r of results) {
+        collected.push(r);
+      }
+      return { records: collected, exactRecord };
+    }
+  } catch (error) {
+    if (isAborted(error)) throw error;
+    lastError = error;
+  }
+
+  if (collected.length === 0 && lastError) {
+    throw lastError;
+  }
+
+  return { records: collected, exactRecord };
+}
+
 export type ResolutionPhase = "identifying" | "searching" | "validating";
 
 export type ResolveLyricsOptions = {
@@ -465,7 +736,10 @@ export type ResolveLyricsOptions = {
   signal?: AbortSignal;
   onProgress?: (phase: ResolutionPhase) => void;
   libraryTracks?: Track[];
+  providers?: LyricsProvider[];
 };
+
+const SEARCH_WINDOW_MS = 3000;
 
 async function resolveLyrics(
   track: Track,
@@ -492,98 +766,90 @@ async function resolveLyrics(
 
   options.onProgress?.("searching");
 
-  let plainFallback: { lyrics: TrackLyrics; record: LrcmuxRecord | LrclibRecord } | null = null;
-  const allCollectedRecords: LrcmuxRecord[] = [];
-  const seenQueries = new Set<string>();
-  const markQueryKey = (q: LrcmuxQuery) =>
-    `${q.trackName ?? ""}|${q.artistName ?? ""}|${q.albumName ?? ""}|${q.q ?? ""}`;
+  const activeProviders = options.providers ?? defaultProviders;
+  const allCollectedRecords: LyricMatchRecord[] = [];
+  const exactRecords: LyricMatchRecord[] = [];
+  const providerErrors: unknown[] = [];
+  let foundWordSyncAutoAccept = false;
 
-  // Stage A — Exact identity (PRD §4)
-  // Query /get with normalized title and artist
-  const queryA: LrcmuxQuery = {
-    trackName: normalized.title || undefined,
-    artistName: normalized.artist || undefined,
-    albumName: normalized.album || undefined,
-    duration: track.durationMs != null ? roundDurationForApi(track.durationMs) : undefined,
-  };
-
-  let exactRecord: LrcmuxRecord | null = null;
-  try {
-    exactRecord = await lrcmuxGet(queryA, options.signal);
-  } catch (error) {
-    if (isAborted(error)) throw error;
-  }
-
-  if (exactRecord) {
-    const consideration = considerRecord(canonicalTrack, exactRecord, cached, minCapabilityRank);
-    if (consideration) {
-      options.onProgress?.("validating");
-      if (consideration.capability === "plain") {
-        plainFallback = { lyrics: consideration.lyrics, record: exactRecord };
-      } else {
-        return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, exactRecord) };
-      }
-    }
-  }
-
-  // Stage B — Structured discovery (PRD §4)
-  // Query /search with normalized track name and artist name
-  const queryB: LrcmuxQuery = {
-    trackName: normalized.title || undefined,
-    artistName: normalized.artist || undefined,
-    albumName: normalized.album || undefined,
-  };
-  seenQueries.add(markQueryKey(queryB));
-
-  let lastSearchError: unknown = null;
-  try {
-    const resultsB = await lrcmuxSearch(queryB, options.signal);
-    if (resultsB && resultsB.length > 0) {
-      allCollectedRecords.push(...resultsB);
-      const candidatesB = rankCandidates(canonicalTrack, resultsB);
-      for (const candidate of candidatesB) {
-        const consideration = considerRecord(canonicalTrack, candidate.record, cached, minCapabilityRank);
-        if (!consideration) continue;
-        if (consideration.capability === "plain") continue;
-        options.onProgress?.("validating");
-        return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, candidate.record) };
-      }
-    }
-  } catch (error) {
-    if (isAborted(error)) throw error;
-    lastSearchError = error;
-  }
-
-  // Stage C — Alternative query generation (PRD §4)
-  // Swapped order, cleaned title, original title, primary artist, and free query
-  for (const alt of normalized.alternateQueries) {
-    if (options.signal?.aborted) throw new DOMException("AbortError", "AbortError");
-    const altQuery: LrcmuxQuery = {
-      trackName: alt.trackName || undefined,
-      artistName: alt.artistName || undefined,
-      q: alt.q || undefined,
-    };
-    const key = markQueryKey(altQuery);
-    if (seenQueries.has(key)) continue;
-    seenQueries.add(key);
-
+  const providerTasks = activeProviders.map(async (p) => {
     try {
-      const altResults = await lrcmuxSearch(altQuery, options.signal);
-      if (altResults && altResults.length > 0) {
-        allCollectedRecords.push(...altResults);
-        const altCandidates = rankCandidates(canonicalTrack, altResults);
-        for (const candidate of altCandidates) {
-          const consideration = considerRecord(canonicalTrack, candidate.record, cached, minCapabilityRank);
-          if (!consideration) continue;
-          if (consideration.capability === "plain") continue;
-          options.onProgress?.("validating");
-          return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, candidate.record) };
+      let result: { records: LyricMatchRecord[]; exactRecord: LyricMatchRecord | null };
+      if (p === "lrcmux") {
+        result = await fetchFromLrcmux(canonicalTrack, normalized, options.signal);
+      } else if (p === "lrclib") {
+        result = await fetchFromLrclib(canonicalTrack, normalized, options.signal);
+      } else {
+        result = await fetchFromLyricsDb(canonicalTrack, normalized, options.signal);
+      }
+      if (result.exactRecord) {
+        exactRecords.push(result.exactRecord);
+      }
+      allCollectedRecords.push(...result.records);
+
+      for (const r of result.records) {
+        const consideration = considerRecord(canonicalTrack, r, cached, minCapabilityRank);
+        if (consideration && consideration.capability === "word") {
+          foundWordSyncAutoAccept = true;
         }
       }
-    } catch (error) {
-      if (isAborted(error)) throw error;
-      lastSearchError = error;
+    } catch (err) {
+      if (!isAborted(err)) {
+        providerErrors.push(err);
+      }
     }
+  });
+
+  // Bounded 3-second search window: resolves early if all providers settle OR word-sync is found
+  await Promise.race([
+    Promise.allSettled(providerTasks),
+    new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const interval = setInterval(() => {
+        if (foundWordSyncAutoAccept) {
+          clearInterval(interval);
+          clearTimeout(timer);
+          resolve();
+        }
+      }, 25);
+      timer = setTimeout(() => {
+        clearInterval(interval);
+        resolve();
+      }, SEARCH_WINDOW_MS);
+    }),
+  ]);
+
+  let plainFallback: { lyrics: TrackLyrics; record: LyricMatchRecord } | null = null;
+
+  // 1. Evaluate exact records first (PRD Stage A)
+  const evaluatedExact = exactRecords
+    .map((record) => {
+      const consideration = considerRecord(canonicalTrack, record, cached, minCapabilityRank);
+      return consideration ? { record, ...consideration } : null;
+    })
+    .filter(Boolean) as { record: LyricMatchRecord; lyrics: TrackLyrics; capability: LyricCapabilityLevel }[];
+
+  evaluatedExact.sort((a, b) => CAPABILITY_RANK[b.capability] - CAPABILITY_RANK[a.capability]);
+
+  if (evaluatedExact.length > 0) {
+    const bestExact = evaluatedExact[0];
+    if (bestExact.capability === "word" || bestExact.capability === "line") {
+      options.onProgress?.("validating");
+      return { outcome: "attached", lyrics: await persistAttached(track, bestExact.lyrics, bestExact.record) };
+    }
+    plainFallback = { lyrics: bestExact.lyrics, record: bestExact.record };
+  }
+
+  // 2. Evaluate search candidates: auto-accept if synchronized
+  const deduplicated = deduplicateRecords(allCollectedRecords);
+  const ranked = rankCandidates(canonicalTrack, deduplicated);
+
+  for (const candidate of ranked) {
+    const consideration = considerRecord(canonicalTrack, candidate.record, cached, minCapabilityRank);
+    if (!consideration) continue;
+    if (consideration.capability === "plain") continue;
+    options.onProgress?.("validating");
+    return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, candidate.record) };
   }
 
   // Fallbacks & results evaluation
@@ -596,16 +862,11 @@ async function resolveLyrics(
     return { outcome: "cached", lyrics: cached };
   }
 
-  // Deduplicate collected candidates
-  const recordMap = new Map<string | number, LrcmuxRecord>();
-  for (const r of allCollectedRecords) {
-    recordMap.set(r.id, r);
-  }
-  const finalCandidates = rankCandidates(canonicalTrack, Array.from(recordMap.values()));
+  const finalCandidates = ranked;
 
   if (finalCandidates.length === 0) {
-    if (lastSearchError && allCollectedRecords.length === 0) {
-      return { outcome: "error", message: describeLrcmuxError(lastSearchError) };
+    if (providerErrors.length > 0 && allCollectedRecords.length === 0) {
+      return { outcome: "error", message: describeLyricsError(providerErrors[0]) };
     }
     await repository.putLyricsCacheMeta({
       trackId: track.id,
@@ -643,6 +904,9 @@ export async function resolveLyricsForTrack(
   const cachedIsManual = cached?.origin?.kind === "manual";
 
   if (cached && !force) {
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      return { outcome: "cached", lyrics: cached };
+    }
     // Manual lyrics and already-best-quality caches never touch the network.
     if (cachedIsManual || cachedCapability === "word" || cachedCapability === "instrumental") {
       return { outcome: "cached", lyrics: cached };
@@ -710,3 +974,13 @@ export async function resetLyricsCacheMeta(trackId: string): Promise<void> {
     schemaVersion: DB_SCHEMA_VERSION,
   });
 }
+
+/** Test hook for configuring default providers in test suites. */
+export const __testHooks = {
+  setDefaultProviders(providers: LyricsProvider[]): void {
+    defaultProviders = providers;
+  },
+  getDefaultProviders(): LyricsProvider[] {
+    return [...defaultProviders];
+  },
+};

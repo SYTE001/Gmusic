@@ -4,8 +4,11 @@ import { extractPrimaryArtist, extractVersionQualifiers } from "../metadata/norm
 import { CAPABILITY_RANK, recordCapability, type LyricCapabilityLevel } from "./capability";
 import type { LrclibRecord } from "./lrclibClient";
 import type { LrcmuxRecord } from "./lrcmuxClient";
+import type { LyricsDbRecord } from "./lyricsdbClient";
 
-export type LyricMatchRecord = LrcmuxRecord | LrclibRecord;
+export type LyricMatchRecord = (LrcmuxRecord | LrclibRecord | LyricsDbRecord) & {
+  provider?: "lrcmux" | "lrclib" | "lyricsdb";
+};
 
 /**
  * Pure matching logic (PRD §5): score candidates against the local track

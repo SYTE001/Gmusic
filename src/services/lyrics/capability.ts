@@ -1,6 +1,7 @@
 import type { LyricCapability, LyricLine } from "../../types";
 import type { LrcmuxRecord } from "./lrcmuxClient";
 import type { LrclibRecord } from "./lrclibClient";
+import type { LyricsDbRecord } from "./lyricsdbClient";
 import { parseLyricsfile } from "./lyricsfile";
 
 /**
@@ -63,7 +64,7 @@ const LINE_TAG = /\[\d{1,3}:\d{1,2}(?:[.:,]\d{1,3})?\]/;
  * rather than its flags. Used for candidate ranking; the resolver still
  * re-verifies the built document before attaching.
  */
-export function recordCapability(record: LrcmuxRecord | LrclibRecord): LyricCapabilityLevel {
+export function recordCapability(record: LrcmuxRecord | LrclibRecord | LyricsDbRecord): LyricCapabilityLevel {
   if (record.instrumental) return "instrumental";
   if ("lines" in record && Array.isArray(record.lines) && record.lines.length > 0) {
     return detectCapability(record.lines);

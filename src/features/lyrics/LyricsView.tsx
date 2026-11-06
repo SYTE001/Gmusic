@@ -420,9 +420,9 @@ export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
   const showPickerTrigger = discoveryTrackId === track.id && discoveryStatus === "needs-selection" && candidates.length > 0;
   const isInstrumental = lyrics?.origin?.capability === "instrumental";
   const sourceBadge = lyrics?.origin
-    ? lyrics.origin.kind === "lrclib" || lyrics.origin.kind === "lrcmux"
-      ? "lrcmux"
-      : "Manual import"
+    ? lyrics.origin.kind === "manual"
+      ? "Manual import"
+      : lyrics.origin.kind
     : null;
   const capabilityBadge =
     payloadCapability === "word"

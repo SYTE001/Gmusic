@@ -1,0 +1,12 @@
+# Isolated Cloudflare Worker — LRCLIB Proxy for Gmusic
+name = "lyrics-lrclib-worker"
+main = "src/index.ts"
+compatibility_date = "2024-11-06"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_ORIGIN = "https://gmusic-tawny.vercel.app"
+LRCLIB_BASE_URL = "https://lrclib.net/api"
+REQUEST_TIMEOUT_MS = "10000"
+CACHE_TTL_EXACT_SECONDS = "86400"
+CACHE_TTL_SEARCH_SECONDS = "900"

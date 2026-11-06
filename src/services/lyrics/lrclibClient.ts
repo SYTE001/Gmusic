@@ -12,7 +12,18 @@ import { APP_VERSION } from "../../types";
  * - Only metadata strings are sent; audio never leaves the device.
  */
 
+export const LRCLIB_DEFAULT_WORKER_URL = "https://lyrics-lrclib-worker.bayualif828.workers.dev";
 export const LRCLIB_BASE_URL = "https://lrclib.net/api";
+
+let customBaseUrl: string | null = null;
+
+export function getLrclibBaseUrl(): string {
+  return (
+    (typeof import.meta !== "undefined" && import.meta.env?.VITE_LRCLIB_WORKER_URL) ||
+    customBaseUrl ||
+    LRCLIB_DEFAULT_WORKER_URL
+  );
+}
 
 export type LrclibRecord = {
   id: number;
@@ -26,6 +37,7 @@ export type LrclibRecord = {
   plainLyrics: string | null;
   syncedLyrics: string | null;
   lyricsfile: string | null;
+  provider?: "lrclib";
 };
 
 export type LrclibQuery = {
@@ -130,7 +142,9 @@ export function cancelQueuedJobs(): void {
 // -- HTTP core ----------------------------------------------------------------
 
 function buildUrl(path: string, params: Record<string, string | number | undefined>): string {
-  const url = new URL(`${LRCLIB_BASE_URL}${path}`);
+  const base = getLrclibBaseUrl().replace(/\/$/, "");
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${base}${normalizedPath}`);
   for (const [key, value] of Object.entries(params)) {
     if (value === undefined || value === "" || (typeof value === "number" && !Number.isFinite(value))) continue;
     url.searchParams.set(key, String(value));
@@ -251,7 +265,7 @@ export async function lrclibGet(query: LrclibQuery, signal?: AbortSignal): Promi
   }, signal);
   if (data === null) return null;
   if (!isValidRecord(data)) throw new LrclibError("malformed", "LRCLIB /get returned an unexpected shape.");
-  return data;
+  return { ...data, provider: "lrclib" };
 }
 
 /** Free-text / field search. Returns ranked-by-server candidates (unvalidated). */
@@ -260,10 +274,11 @@ export async function lrclibSearch(query: LrclibQuery, signal?: AbortSignal): Pr
     q: query.trackName ? `${query.trackName} ${query.artistName ?? ""}`.trim() : undefined,
     track_name: query.trackName,
     artist_name: query.artistName,
+    album_name: query.albumName,
   }, signal);
   if (data === null) return [];
   if (!Array.isArray(data)) throw new LrclibError("malformed", "LRCLIB /search returned an unexpected shape.");
-  return data.filter(isValidRecord);
+  return data.filter(isValidRecord).map((r) => ({ ...r, provider: "lrclib" as const }));
 }
 
 /** Injectable transport so tests can stub the network without touching global fetch. */
@@ -281,5 +296,8 @@ export const __testHooks = {
     if (timers.retryDelaysMs !== undefined) retryDelaysMs = timers.retryDelaysMs;
     if (timers.requestTimeoutMs !== undefined) requestTimeoutMs = timers.requestTimeoutMs;
     if (timers.rateLimitWaitCapMs !== undefined) rateLimitWaitCapMs = timers.rateLimitWaitCapMs;
+  },
+  setBaseUrl(url: string | null): void {
+    customBaseUrl = url;
   },
 };

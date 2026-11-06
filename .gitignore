@@ -21,11 +21,16 @@ node_modules
 # Build output
 dist
 
-# Cloudflare Worker project (separate package; see worker/)
+# Cloudflare Worker projects (separate packages)
 worker/node_modules
 worker/dist
 worker/.wrangler
 worker/.dev.vars
+lyrics-*worker/.wrangler
+lyrics-*worker/.dev.vars
+lyrics-*worker/dist
+lyrics-*worker/node_modules
+.wrangler
 
 # Logs and editor clutter
 *.log
