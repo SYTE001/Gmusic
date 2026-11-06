@@ -339,6 +339,8 @@ describe("Lyrics Search Metadata Mapping Regression Tests", () => {
         },
       ],
       updatedAt: 1,
+      skippedLines: 0,
+      sourceName: "lrcmux",
       origin: { kind: "lrcmux", recordId: 101, fetchedAt: 1, capability: "word" },
     };
     await repository.putLyrics(existingWordSyncLyrics);
@@ -363,6 +365,8 @@ describe("Lyrics Search Metadata Mapping Regression Tests", () => {
       offsetMs: 0,
       lines: [{ timeMs: 1000, text: "Line synchronized line" }],
       updatedAt: 1,
+      skippedLines: 0,
+      sourceName: "lrcmux",
       origin: { kind: "lrcmux", recordId: 102, fetchedAt: 1, capability: "line" },
     };
     await repository.putLyrics(existingLineLyrics);
@@ -392,6 +396,7 @@ describe("Lyrics Search Metadata Mapping Regression Tests", () => {
 
     // Forced search
     const result = await resolveLyricsForTrack(track, { force: true });
+    expect(result.outcome).toBe("cached");
     // Quality floor prevents downgrading line sync to plain: keeps existing cached lyrics
     const stored = await repository.getLyrics(track.id);
     expect(stored?.lines[0].timeMs).toBe(1000);
