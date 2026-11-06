@@ -466,7 +466,28 @@ async function persistAttached(
     recordId: typeof record.id === "number" ? record.id : null,
     schemaVersion: DB_SCHEMA_VERSION,
   });
+  notifyLyricsResolved(track.id, lyrics);
   return lyrics;
+}
+
+export type LyricsResolvedListener = (trackId: string, lyrics: TrackLyrics) => void;
+const lyricsResolvedListeners = new Set<LyricsResolvedListener>();
+
+export function onLyricsResolved(listener: LyricsResolvedListener): () => void {
+  lyricsResolvedListeners.add(listener);
+  return () => {
+    lyricsResolvedListeners.delete(listener);
+  };
+}
+
+function notifyLyricsResolved(trackId: string, lyrics: TrackLyrics): void {
+  for (const listener of lyricsResolvedListeners) {
+    try {
+      listener(trackId, lyrics);
+    } catch {
+      // listener error non-fatal
+    }
+  }
 }
 
 /** Fresh accepted marker used as the upgrade backoff; never touches lyrics. */
@@ -676,6 +697,36 @@ async function fetchFromLrclib(
     lastError = error;
   }
 
+  // Stage C — Alternative queries (e.g. Primary artist without collaboration or swapped title/artist)
+  for (const alt of normalized.alternateQueries) {
+    if (signal?.aborted) throw new DOMException("AbortError", "AbortError");
+    const altQuery: LrclibQuery = {
+      trackName: alt.trackName || undefined,
+      artistName: alt.artistName || undefined,
+    };
+    try {
+      const altExact = await lrclibGet(altQuery, signal);
+      if (altExact) {
+        exactRecord = { ...altExact, provider: "lrclib" };
+        collected.push(exactRecord);
+        const cap = recordCapability(exactRecord);
+        if (cap === "word" || cap === "line") {
+          return { records: collected, exactRecord };
+        }
+      }
+      const altResults = await lrclibSearch(altQuery, signal);
+      if (altResults && altResults.length > 0) {
+        for (const r of altResults) {
+          collected.push({ ...r, provider: "lrclib" });
+        }
+        return { records: collected, exactRecord };
+      }
+    } catch (error) {
+      if (isAborted(error)) throw error;
+      lastError = error;
+    }
+  }
+
   if (collected.length === 0 && lastError) {
     throw lastError;
   }
@@ -867,13 +918,14 @@ async function resolveLyrics(
   // Concurrent execution: resolves as soon as:
   // 1. All providers settle, OR
   // 2. An auto-acceptable word-sync match is found (top quality capability), OR
-  // 3. The 12-15s total search budget expires.
+  // 3. The caller signal aborts (UI navigating), OR
+  // 4. The total search budget expires (12-15s).
   await Promise.race([
     Promise.allSettled(providerTasks),
     new Promise<void>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
       const interval = setInterval(() => {
-        if (foundWordSyncAutoAccept) {
+        if (foundWordSyncAutoAccept || options.signal?.aborted) {
           clearInterval(interval);
           clearTimeout(timer);
           resolve();
@@ -889,7 +941,7 @@ async function resolveLyrics(
 
   // Safe background processing of late provider results without track mismatch
   void Promise.allSettled(providerTasks).then(async () => {
-    if (!timedOut) return;
+    if (!timedOut && !options.signal?.aborted) return;
     try {
       const lateDeduplicated = deduplicateRecords(allCollectedRecords);
       const lateRanked = rankCandidates(canonicalTrack, lateDeduplicated);
@@ -1046,75 +1098,94 @@ async function resolveLyrics(
   return { outcome: "needs-selection", candidates: finalCandidates };
 }
 
+const inFlightResolutions = new Map<string, Promise<LyricsResolution>>();
+
 export async function resolveLyricsForTrack(
   track: Track,
   options: ResolveLyricsOptions = {},
 ): Promise<LyricsResolution> {
   const { force = false } = options;
 
-  // 1. Local lyrics are the starting point.
-  const cached = (await repository.getLyrics(track.id)) ?? null;
-  const cachedCapability = cached ? detectLyricsCapability(cached) : null;
-  // Explicit manual origin marks user-imported lyrics — the API must never
-  // silently replace them. Records without any origin are legacy API caches:
-  // their capability is inferred from the payload and they remain upgradable.
-  const cachedIsManual = cached?.origin?.kind === "manual";
+  if (!force) {
+    const pending = inFlightResolutions.get(track.id);
+    if (pending) {
+      return pending;
+    }
+  }
 
-  if (cached && !force) {
-    if (typeof navigator !== "undefined" && navigator.onLine === false) {
-      return { outcome: "cached", lyrics: cached };
-    }
-    // Manual lyrics and already-best-quality caches never touch the network.
-    if (cachedIsManual || cachedCapability === "word" || cachedCapability === "instrumental") {
-      return { outcome: "cached", lyrics: cached };
-    }
-    if (cachedCapability === "line" || cachedCapability === "plain") {
-      // Quality-upgrade lookup, bounded by a daily backoff so replaying a
-      // track does not re-query the API every time.
-      if (await upgradeBackoffActive(track.id)) {
+  const runResolution = async (): Promise<LyricsResolution> => {
+    // 1. Local lyrics are the starting point.
+    const cached = (await repository.getLyrics(track.id)) ?? null;
+    const cachedCapability = cached ? detectLyricsCapability(cached) : null;
+    // Explicit manual origin marks user-imported lyrics — the API must never
+    // silently replace them. Records without any origin are legacy API caches:
+    // their capability is inferred from the payload and they remain upgradable.
+    const cachedIsManual = cached?.origin?.kind === "manual";
+
+    if (cached && !force) {
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
         return { outcome: "cached", lyrics: cached };
       }
-      const upgraded = await resolveLyrics(track, options, {
-        cached,
-        minCapabilityRank: CAPABILITY_RANK[cachedCapability] + 1,
-        keepOnMiss: true,
-      });
-      if (upgraded.outcome === "attached") return upgraded;
-      // Nothing better exists (or the attempt failed): keep the cache, and
-      // back off so replaying the track does not re-query.
-      await markUpgradeChecked(track.id);
-      return { outcome: "cached", lyrics: cached };
+      // Manual lyrics and already-best-quality caches never touch the network.
+      if (cachedIsManual || cachedCapability === "word" || cachedCapability === "instrumental") {
+        return { outcome: "cached", lyrics: cached };
+      }
+      if (cachedCapability === "line" || cachedCapability === "plain") {
+        // Quality-upgrade lookup, bounded by a daily backoff so replaying a
+        // track does not re-query the API every time.
+        if (await upgradeBackoffActive(track.id)) {
+          return { outcome: "cached", lyrics: cached };
+        }
+        const upgraded = await resolveLyrics(track, options, {
+          cached,
+          minCapabilityRank: CAPABILITY_RANK[cachedCapability] + 1,
+          keepOnMiss: true,
+        });
+        if (upgraded.outcome === "attached") return upgraded;
+        // Nothing better exists (or the attempt failed): keep the cache, and
+        // back off so replaying the track does not re-query.
+        await markUpgradeChecked(track.id);
+        return { outcome: "cached", lyrics: cached };
+      }
+      // "none": the cached document has no usable content — fall through to a
+      // full discovery below.
     }
-    // "none": the cached document has no usable content — fall through to a
-    // full discovery below.
-  }
 
-  // 2. Negative cache: skip recently failed lookups instead of hammering the
-  //    API. Only meaningful when there are no (usable) lyrics to protect.
-  if (!force) {
-    const meta = await repository.getLyricsCacheMeta(track.id);
-    if (meta) {
-      if (meta.status === "accepted" && !cached) {
-        // Accepted marker without lyrics (e.g. cleared separately) — fall through.
-      } else if (meta.status === "not-found") {
-        if (Date.now() - meta.checkedAt < LYRICS_NOT_FOUND_TTL_MS) return { outcome: "skipped-recently" };
-      } else if (meta.status === "needs-selection") {
-        return { outcome: "skipped-recently" };
+    // 2. Negative cache: skip recently failed lookups instead of hammering the
+    //    API. Only meaningful when there are no (usable) lyrics to protect.
+    if (!force) {
+      const meta = await repository.getLyricsCacheMeta(track.id);
+      if (meta) {
+        if (meta.status === "accepted" && !cached) {
+          // Accepted marker without lyrics (e.g. cleared separately) — fall through.
+        } else if (meta.status === "not-found") {
+          if (Date.now() - meta.checkedAt < LYRICS_NOT_FOUND_TTL_MS) return { outcome: "skipped-recently" };
+        } else if (meta.status === "needs-selection") {
+          return { outcome: "skipped-recently" };
+        }
       }
     }
-  }
 
-  if (typeof navigator !== "undefined" && navigator.onLine === false) {
-    return { outcome: "offline" };
-  }
+    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+      return { outcome: "offline" };
+    }
 
-  // 3. Full discovery. Force refreshes must reach at least the quality the
-  //    user already has; a fresh (cache-less) track accepts any usable result.
-  return resolveLyrics(track, options, {
-    cached,
-    minCapabilityRank: cached ? CAPABILITY_RANK[cachedCapability!] : CAPABILITY_RANK.plain,
-    keepOnMiss: Boolean(cached),
-  });
+    // 3. Full discovery. Force refreshes must reach at least the quality the
+    //    user already has; a fresh (cache-less) track accepts any usable result.
+    return resolveLyrics(track, options, {
+      cached,
+      minCapabilityRank: cached ? CAPABILITY_RANK[cachedCapability!] : CAPABILITY_RANK.plain,
+      keepOnMiss: Boolean(cached),
+    });
+  };
+
+  const promise = runResolution();
+  inFlightResolutions.set(track.id, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlightResolutions.delete(track.id);
+  }
 }
 
 function isAborted(error: unknown): boolean {

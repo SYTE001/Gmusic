@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { Track } from "../types";
 import {
   attachLrclibRecord,
+  onLyricsResolved,
   resetLyricsCacheMeta,
   resolveLyricsForTrack,
 } from "../services/lyrics/lyricsService";
@@ -181,6 +182,19 @@ export const useLyricsStore = create<LyricsState>((set, get) => {
       });
     },
   };
+});
+
+// Reactively update store whenever background task resolves and attaches lyrics
+onLyricsResolved((trackId) => {
+  const current = useLyricsStore.getState();
+  if (current.trackId === trackId) {
+    useLyricsStore.setState({
+      status: "ready",
+      phase: "ready",
+      lyricsVersion: current.lyricsVersion + 1,
+      fromCache: false,
+    });
+  }
 });
 
 /**
