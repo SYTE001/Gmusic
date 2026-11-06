@@ -396,4 +396,112 @@ describe("Playback error classification, Broken track detection & Dynamic Island
     expect(useDynamicIslandStore.getState().stage).toBe("idle");
     expect(useDynamicIslandStore.getState().queue).toHaveLength(0);
   });
+
+  it("surfaces specific 'Grant access to this audio file.' notification on permission-required without marking track broken", async () => {
+    const track = createMockTrack("perm-track", { accessMode: "handle", availability: "permission-required" });
+    let brokenMarked = false;
+    let availabilityMarked: string | null = null;
+
+    bindPlaybackHelpers({
+      getTrackForPlayback: async () => track,
+      resolveSource: async () => ({
+        ok: false as const,
+        reason: "permission-required" as const,
+        detail: "Grant access to this audio file.",
+        originalError: "PermissionState: prompt",
+      }),
+      markTrackBroken: async () => {
+        brokenMarked = true;
+      },
+      markTrackAvailability: async (_id, avail) => {
+        availabilityMarked = avail;
+      },
+    });
+
+    await usePlaybackStore.getState().startTrack(track.id, { autoplay: true });
+
+    expect(brokenMarked).toBe(false);
+    expect(availabilityMarked).toBe("permission-required");
+    const notif = useDynamicIslandStore.getState().current;
+    expect(notif?.title).toBe("Grant access to this audio file.");
+    expect(notif?.category).toBe("permission");
+  });
+
+  it("requests handle permission within the Play gesture for handle-backed tracks and plays when granted", async () => {
+    const track = createMockTrack("handle-recover", { accessMode: "handle", availability: "permission-required" });
+    let permissionState: "prompt" | "granted" = "prompt";
+    const requestPermission = vi.fn(async () => {
+      permissionState = "granted";
+      return "granted" as const;
+    });
+    vi.spyOn(repository, "getHandle").mockResolvedValue({
+      queryPermission: async () => permissionState,
+      requestPermission,
+      getFile: async () => new File([new Uint8Array(8)], "song.mp3", { type: "audio/mpeg" }),
+    } as unknown as FileSystemFileHandle);
+
+    let availabilityMarked: string | null = null;
+    bindPlaybackHelpers({
+      getTrackForPlayback: async () => track,
+      resolveSource: async () => ({
+        ok: permissionState === "granted",
+        url: "blob:recovered",
+        release: () => {},
+      } as never),
+      markTrackAvailability: async (_id, avail) => {
+        availabilityMarked = avail;
+      },
+      notifyTrackStarted: async () => {},
+    });
+
+    usePlaybackStore.getState().setEngineForTests({
+      element: null,
+      setSource: () => {},
+      play: async () => {},
+      pause: () => {},
+      currentTimeSec: 0,
+      seekSec: () => {},
+      durationSec: 180,
+      setVolume: () => {},
+      setMuted: () => {},
+      dispose: () => {},
+    });
+
+    await usePlaybackStore.getState().startTrack(track.id, { autoplay: true });
+
+    expect(requestPermission).toHaveBeenCalledTimes(1);
+    expect(availabilityMarked).toBe("available");
+    expect(usePlaybackStore.getState().isPlaying).toBe(true);
+    vi.restoreAllMocks();
+  });
+
+  it("surfaces 'Could not retrieve the cloud audio.' when cloud source fails without marking track broken", async () => {
+    const track = createMockTrack("cloud-err", {
+      accessMode: "cloud",
+      objectKey: "users/u-1/tracks/cloud-err/audio.mp3",
+      cloudStatus: "ready",
+    });
+    let brokenMarked = false;
+
+    bindPlaybackHelpers({
+      getTrackForPlayback: async () => track,
+      resolveSource: async () => ({
+        ok: false as const,
+        reason: "missing" as const,
+        detail: "Could not retrieve the cloud audio.",
+        originalError: "Error: network failed",
+      }),
+      markTrackBroken: async () => {
+        brokenMarked = true;
+      },
+      markTrackAvailability: async () => {},
+    });
+
+    await usePlaybackStore.getState().startTrack(track.id, { autoplay: true });
+
+    expect(brokenMarked).toBe(false);
+    const notif = useDynamicIslandStore.getState().current;
+    expect(notif?.title).toBe("Could not retrieve the cloud audio.");
+    expect(notif?.category).toBe("network");
+  });
 });

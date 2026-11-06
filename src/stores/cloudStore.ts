@@ -324,9 +324,19 @@ export const useCloudStore = create<CloudState>((set, get) => ({
       const fresh = await repository.listTracks();
       useLibraryStore.setState({ tracks: fresh });
       const failed = progress.items.filter((item) => item.status === "failed").length;
+      const needsAccess = progress.items.filter((item) => item.status === "needs-access").length;
+      const missing = progress.items.filter((item) => item.status === "missing").length;
       const succeeded = progress.items.filter((item) => item.status === "done").length;
-      if (failed > 0) toast("error", `${succeeded} uploaded, ${failed} failed. Your local files are untouched.`);
-      else toast("success", `${succeeded} tracks verified in cloud storage. Local copies are kept.`);
+      if (failed > 0) {
+        toast("error", `${succeeded} uploaded, ${failed} failed. Your local files are untouched.`);
+      } else if (needsAccess > 0 || missing > 0) {
+        toast(
+          "info",
+          `${succeeded} uploaded. ${needsAccess > 0 ? `${needsAccess} need file access` : ""}${needsAccess > 0 && missing > 0 ? ", " : ""}${missing > 0 ? `${missing} missing locally` : ""}.`,
+        );
+      } else {
+        toast("success", `${succeeded} tracks verified in cloud storage. Local copies are kept.`);
+      }
     } finally {
       set({ busy: false });
     }
@@ -366,9 +376,18 @@ export const useCloudStore = create<CloudState>((set, get) => ({
       const fresh = await repository.listTracks();
       useLibraryStore.setState({ tracks: fresh });
       const failedCount = progress.items.filter((item) => item.status === "failed").length;
+      const needsAccessCount = progress.items.filter((item) => item.status === "needs-access").length;
+      const missingCount = progress.items.filter((item) => item.status === "missing").length;
       const succeededCount = progress.items.filter((item) => item.status === "done").length;
-      if (failedCount > 0) toast("error", `“${targets[0]?.title}” could not be uploaded. Nothing was removed locally.`);
-      else toast("success", succeededCount === 1 ? `“${targets[0]?.title}” is stored in the cloud.` : `${succeededCount} tracks stored in the cloud.`);
+      if (failedCount > 0) {
+        toast("error", `“${targets[0]?.title}” could not be uploaded. Nothing was removed locally.`);
+      } else if (needsAccessCount > 0) {
+        toast("error", "Grant access to this audio file.");
+      } else if (missingCount > 0) {
+        toast("error", "Audio file not found. Locate or re-import it.");
+      } else {
+        toast("success", succeededCount === 1 ? `“${targets[0]?.title}” is stored in the cloud.` : `${succeededCount} tracks stored in the cloud.`);
+      }
     } finally {
       set({ busy: false });
     }

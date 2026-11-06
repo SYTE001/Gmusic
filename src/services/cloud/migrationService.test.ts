@@ -784,11 +784,61 @@ describe("partial upload recovery and permissions", () => {
     vi.spyOn(repository, "getHandle").mockResolvedValue(handle as unknown as FileSystemFileHandle);
     const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
     expect(progress.items[0]!.status).toBe("needs-access");
-    progress.items[0]!.status = "pending";
     await runMigration([track], progress);
     expect(requestPermission).toHaveBeenCalled();
     expect(progress.items[0]!.status).toBe("needs-access");
     expect(storage.uploads).toBe(0);
+    vi.restoreAllMocks();
+  });
+
+  it("recovers and uploads all 8 handle-backed tracks when permission is granted during migration", async () => {
+    const tracks: Track[] = [];
+    const handles = new Map<string, FileSystemFileHandle>();
+    for (let i = 1; i <= 8; i += 1) {
+      const id = `handle-track-${i}`;
+      const track = makeTrack({
+        id,
+        title: `Imported Handle Track ${i}`,
+        accessMode: "handle",
+        availability: "permission-required",
+      });
+      tracks.push(track);
+      let perm: "prompt" | "granted" = "prompt";
+      handles.set(id, {
+        kind: "file",
+        name: `song-${i}.mp3`,
+        queryPermission: async () => perm,
+        requestPermission: async () => {
+          perm = "granted";
+          return "granted";
+        },
+        getFile: async () => new File([new Uint8Array(64)], `song-${i}.mp3`, { type: "audio/mpeg" }),
+      } as unknown as FileSystemFileHandle);
+    }
+    await repository.putTracks(tracks);
+    vi.spyOn(repository, "getHandle").mockImplementation(async (id: string) => handles.get(id));
+
+    const plan = await planMigration(tracks);
+    // Before user gesture, all 8 handle-backed tracks need permission.
+    expect(plan.needsAccess).toHaveLength(8);
+
+    const progress = { ...initialMigrationProgress(), items: plan.items };
+    await runMigration(tracks, progress);
+
+    expect(progress.state).toBe("complete");
+    expect(progress.succeeded).toBe(8);
+    expect(progress.failed).toBe(0);
+    expect(progress.skipped).toBe(0);
+    expect(storage.uploads).toBe(8);
+    expect(library.upserted).toHaveLength(8);
+
+    for (const track of tracks) {
+      const stored = await repository.getTrack(track.id);
+      expect(stored?.id).toBe(track.id);
+      expect(stored?.cloudStatus).toBe("ready");
+      expect(stored?.availability).toBe("available");
+      expect(stored?.objectKey).toBe(`users/u-1/tracks/${track.id}/audio.mp3`);
+    }
     vi.restoreAllMocks();
   });
 

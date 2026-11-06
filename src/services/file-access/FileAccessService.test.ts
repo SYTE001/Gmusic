@@ -2,7 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Track } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
 import {
+  diagnoseTrackSource,
   hasSessionFile,
+  regainHandleAccess,
   revalidateAccess,
   rememberSessionFile,
   relinkTrackWithFile,
@@ -375,5 +377,41 @@ describe("unavailable source detection", () => {
     expect(stored.broken).toBeNull();
     const updates = await revalidateAccess([stored]);
     expect(updates.get(track.id)).toBe("available");
+  });
+
+  it("collects non-sensitive track source diagnostics without file paths or tokens", async () => {
+    const track = makeTrack({
+      id: "diag-1",
+      accessMode: "handle",
+      availability: "permission-required",
+      objectKey: "users/u-1/tracks/diag-1/audio.mp3",
+    });
+    vi.spyOn(repository, "getHandle").mockResolvedValue(stubHandle("prompt", async () => new File([new Uint8Array(4)], "song.mp3")));
+
+    const diag = await diagnoseTrackSource(track, "permission-required: PermissionState: prompt");
+    expect(diag).toEqual({
+      trackId: "diag-1",
+      accessMode: "handle",
+      availability: "permission-required",
+      handleExists: true,
+      handlePermission: "prompt",
+      indexedDbAudioExists: false,
+      sessionFileExists: false,
+      cloudObjectKey: "users/u-1/tracks/diag-1/audio.mp3",
+      failureReason: "permission-required: PermissionState: prompt",
+    });
+  });
+
+  it("regainHandleAccess requests permission only when not already granted", async () => {
+    const track = makeTrack({ id: "regain-1", accessMode: "handle" });
+    const requestPermission = vi.fn(async () => "granted" as const);
+    vi.spyOn(repository, "getHandle").mockResolvedValue({
+      queryPermission: async () => "prompt" as const,
+      requestPermission,
+      getFile: async () => new File([new Uint8Array(4)], "song.mp3"),
+    } as unknown as FileSystemFileHandle);
+
+    expect(await regainHandleAccess(track)).toBe("granted");
+    expect(requestPermission).toHaveBeenCalledTimes(1);
   });
 });

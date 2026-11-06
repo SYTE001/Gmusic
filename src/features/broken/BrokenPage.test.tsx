@@ -178,4 +178,55 @@ describe("BrokenPage UI component", () => {
 
     expect(removeTracksSpy).toHaveBeenCalledWith(["b4"]);
   });
+
+  it("separates Broken/corrupted, Missing local files, Permission required, and Cloud unavailable without marking permission tracks as broken", async () => {
+    const corrupted = createBrokenTrack("c1", "corrupted");
+    const missing: Track = {
+      ...createBrokenTrack("m1", "missing"),
+      title: "Missing Song m1",
+      availability: "missing",
+      broken: null,
+    };
+    const permRequired: Track = {
+      ...createBrokenTrack("p1"),
+      title: "Permission Song p1",
+      accessMode: "handle",
+      availability: "permission-required",
+      broken: null,
+    };
+    const cloudOffline: Track = {
+      ...createBrokenTrack("cl1"),
+      title: "Cloud Song cl1",
+      accessMode: "cloud",
+      availability: "offline",
+      objectKey: "users/u-1/tracks/cl1/audio.mp3",
+      broken: null,
+    };
+
+    const grantSpy = vi.fn(async () => true);
+    useLibraryStore.setState({
+      tracks: [corrupted, missing, permRequired, cloudOffline],
+      grantFileAccess: grantSpy,
+    });
+
+    render(
+      <MemoryRouter>
+        <BrokenPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole("region", { name: "Broken / corrupted" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Missing local files" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Permission required" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Cloud unavailable" })).toBeTruthy();
+
+    expect(screen.getByText("Permission Song p1")).toBeTruthy();
+    expect(screen.getByText("Grant access to this audio file.")).toBeTruthy();
+
+    const grantBtn = screen.getByRole("button", { name: "Grant access" });
+    await act(async () => {
+      fireEvent.click(grantBtn);
+    });
+    expect(grantSpy).toHaveBeenCalledWith("p1");
+  });
 });

@@ -130,11 +130,16 @@ export async function resolveLocalAudioForTrack(
     let permission = await queryHandlePermission(handle);
     // Only valid inside a user gesture (the migration is started by a click).
     if (permission !== "granted" && options.promptForPermission) permission = await requestHandlePermission(handle);
-    if (permission !== "granted") return null;
-    try {
-      return await handle.getFile();
-    } catch {
-      return null;
+    if (permission === "granted") {
+      try {
+        const file = await handle.getFile();
+        if (track.availability !== "available") {
+          await repository.updateTrack(track.id, { availability: "available" }).catch(() => undefined);
+        }
+        return file;
+      } catch {
+        // Fall through to check stored copy or session file
+      }
     }
   }
   const blob = await repository.getAudioBlob(track.id);
@@ -313,8 +318,35 @@ export async function runMigration(
   const concurrency = Math.max(1, Math.min(8, options.concurrency ?? DEFAULT_MIGRATION_CONCURRENCY));
   cancelRequested = false;
 
-  const queue = progress.items.filter((item) => item.status === "pending");
+  const queue = progress.items.filter(
+    (item) => item.status === "pending" || item.status === "needs-access",
+  );
   const remaining = [...queue];
+
+  // Pre-request handle permissions upfront while the user gesture is active,
+  // before any slow network upload can consume transient activation.
+  for (const item of remaining) {
+    if (cancelRequested) break;
+    const track = allTracks.find((candidate) => candidate.id === item.trackId);
+    if (!track) continue;
+    const handle = await repository.getHandle(track.id);
+    if (handle) {
+      const current = await queryHandlePermission(handle);
+      if (current !== "granted") {
+        const granted = await requestHandlePermission(handle);
+        if (granted === "granted") {
+          item.status = "pending";
+          item.error = null;
+          if (track.availability !== "available") {
+            await repository.updateTrack(track.id, { availability: "available" }).catch(() => undefined);
+          }
+        }
+      } else if (item.status === "needs-access") {
+        item.status = "pending";
+        item.error = null;
+      }
+    }
+  }
 
   const emit = () => {
     recompute(progress);
@@ -387,6 +419,7 @@ export async function runMigration(
       // LOCAL record. Neither deletes the other's data.
       const updated: Track = {
         ...track,
+        availability: "available",
         objectKey,
         artworkObjectKey: artworkKey,
         storageProvider: "r2",
@@ -395,6 +428,7 @@ export async function runMigration(
       };
       await upsertCloudTracks([updated]);
       await repository.updateTrack(track.id, {
+        availability: "available",
         objectKey,
         artworkObjectKey: artworkKey,
         storageProvider: "r2",
@@ -440,10 +474,10 @@ export async function runMigration(
   return progress;
 }
 
-/** Requeues only the failed items of a finished run for another attempt. */
+/** Requeues failed and access-blocked items of a finished run for another attempt. */
 export function retryFailedItems(progress: MigrationProgress): MigrationProgress {
   for (const item of progress.items) {
-    if (item.status === "failed") {
+    if (item.status === "failed" || item.status === "needs-access") {
       item.status = "pending";
       item.error = null;
     }

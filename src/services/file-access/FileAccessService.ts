@@ -19,11 +19,51 @@ import { perfMark, perfMeasure, recordObjectUrlCreated, recordObjectUrlRevoked }
  * network round trips it does not need.
  */
 
-export type ResolveFailureReason = "permission-required" | "missing" | "unsupported" | "offline";
+export type ResolveFailureReason = "permission-required" | "missing" | "unsupported" | "offline" | "cloud-unavailable";
 
 export type ResolvedSource =
   | { ok: true; url: string; release: () => void }
-  | { ok: false; reason: ResolveFailureReason; detail: string };
+  | { ok: false; reason: ResolveFailureReason; detail: string; originalError?: string };
+
+export type TrackSourceDiagnostics = {
+  trackId: string;
+  accessMode: Track["accessMode"];
+  availability: Track["availability"];
+  handleExists: boolean;
+  handlePermission: "granted" | "prompt" | "denied" | "none";
+  indexedDbAudioExists: boolean;
+  sessionFileExists: boolean;
+  cloudObjectKey: string | null;
+  failureReason: string | null;
+};
+
+/**
+ * Inspects and logs non-sensitive diagnostic state for a track's audio sources
+ * during development/debugging (no file paths or auth tokens).
+ */
+export async function diagnoseTrackSource(
+  track: Track,
+  failureReason: string | null = null,
+): Promise<TrackSourceDiagnostics> {
+  const handle = await repository.getHandle(track.id).catch(() => undefined);
+  const handlePermission = handle ? await queryHandlePermission(handle) : "none";
+  const blob = await repository.getAudioBlob(track.id).catch(() => undefined);
+  const diagnostics: TrackSourceDiagnostics = {
+    trackId: track.id,
+    accessMode: track.accessMode,
+    availability: track.availability,
+    handleExists: Boolean(handle),
+    handlePermission,
+    indexedDbAudioExists: Boolean(blob),
+    sessionFileExists: sessionFiles.has(track.id),
+    cloudObjectKey: track.objectKey ?? null,
+    failureReason,
+  };
+  if (typeof import.meta !== "undefined" && import.meta.env?.DEV) {
+    console.info("[FileAccessDiagnostics]", diagnostics);
+  }
+  return diagnostics;
+}
 
 /** Session-scoped File objects for imports that could not be persisted. */
 const sessionFiles = new Map<string, File>();
@@ -229,13 +269,15 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
   //    below, after the permission-free sources had their chance.
   const handle = await repository.getHandle(track.id);
   let ungrantedPermission: "prompt" | "denied" | null = null;
+  let handleReadError: string | null = null;
   if (handle) {
     const permission = await queryHandlePermission(handle);
     if (permission === "granted") {
       try {
         const file = await handle.getFile();
         return activateBlobSource(track.id, file);
-      } catch {
+      } catch (error) {
+        handleReadError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
         // The handle is stale. Keep going: a stored copy or the cloud copy
         // may still be playable.
       }
@@ -264,13 +306,17 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
   //    local-first recovery path — one click re-grants the real file — and
   //    stays preferable to silently streaming the cloud copy.
   if (handle && ungrantedPermission) {
+    const detail =
+      ungrantedPermission === "denied"
+        ? "Grant access to this audio file. File access was denied — grant access again or re-link the file."
+        : "Grant access to this audio file.";
+    const originalError = `PermissionState: ${ungrantedPermission}`;
+    void diagnoseTrackSource(track, `permission-required: ${originalError}`);
     return {
       ok: false,
       reason: "permission-required",
-      detail:
-        ungrantedPermission === "denied"
-          ? "File access was denied. Grant access again or re-link the file."
-          : "This app needs permission to read the file again after reopening.",
+      detail,
+      originalError,
     };
   }
 
@@ -278,11 +324,15 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
   //    persisted Track field.
   if (track.objectKey) {
     if (deviceIsOffline()) {
+      const detail =
+        "This song is stored in the cloud and is not cached on this device. Reconnect to the internet to play it.";
+      const originalError = "Navigator offline (no cached local copy)";
+      void diagnoseTrackSource(track, `offline: ${originalError}`);
       return {
         ok: false,
         reason: "offline",
-        detail:
-          "This song is stored in the cloud and is not cached on this device. Reconnect to the internet to play it.",
+        detail,
+        originalError,
       };
     }
     // Releasing here keeps the single-URL invariant (rules §12): when playback
@@ -293,21 +343,27 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
     try {
       const url = await getPlayUrl(track.objectKey);
       return { ok: true, url, release: () => undefined };
-    } catch {
+    } catch (error) {
+      const detail = "Could not retrieve the cloud audio.";
+      const originalError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+      void diagnoseTrackSource(track, `cloud-unavailable: ${originalError}`);
       return {
         ok: false,
         reason: "missing",
-        detail:
-          "The cloud copy of this song could not be reached. Check your connection and try again.",
+        detail,
+        originalError,
       };
     }
   }
 
+  const detail = "Audio file not found. Locate or re-import it.";
+  const originalError = handleReadError ?? "No local handle, IndexedDB audio blob, or session file available.";
+  void diagnoseTrackSource(track, `missing: ${originalError}`);
   return {
     ok: false,
     reason: "missing",
-    detail:
-      "The audio file is not available in this session. Re-import or locate the file to play this track.",
+    detail,
+    originalError,
   };
 }
 
@@ -390,6 +446,8 @@ export async function hasLocalCopy(trackId: string): Promise<boolean> {
 export async function regainHandleAccess(track: Track): Promise<"granted" | "denied" | "no-handle"> {
   const handle = await repository.getHandle(track.id);
   if (!handle) return "no-handle";
+  const current = await queryHandlePermission(handle);
+  if (current === "granted") return "granted";
   const permission = await requestHandlePermission(handle);
   return permission === "granted" ? "granted" : "denied";
 }

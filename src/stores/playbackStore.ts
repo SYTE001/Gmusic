@@ -24,6 +24,7 @@ import {
 } from "../services/audio/engine";
 import {
   clearPreloadedTrackSource,
+  diagnoseTrackSource,
   preloadTrackSource,
   regainHandleAccess,
   releaseActiveTrackSource,
@@ -234,22 +235,22 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
 function describeFailureForTrack(failure: MediaFailure, track: Track | undefined): PlaybackErrorInfo {
   if (failure.code === 4) {
     return {
-      title: track ? `Can't play "${track.title}"` : "Unsupported audio",
-      detail: `${describeMediaError(failure.code)} You can keep the track in your library, but this browser cannot decode it.`,
+      title: track ? `Can't play "${track.title}"` : "This browser cannot play this audio format.",
+      detail: `This browser cannot play this audio format. ${describeMediaError(failure.code)} You can keep the track in your library, but this browser cannot decode it.`,
       action: "none",
     };
   }
   if (failure.code === 3) {
     return {
       title: track ? `Couldn't decode "${track.title}"` : "Decoding failed",
-      detail: describeMediaError(failure.code),
+      detail: `Audio decoding failed. The file may be corrupted. ${describeMediaError(failure.code)}`,
       action: "relink",
     };
   }
   if (failure.code === 2 && track?.objectKey) {
     return {
-      title: track ? `Couldn't load "${track.title}" from the cloud` : "Network error",
-      detail: "The playback link may have expired or the connection dropped. Try again — a fresh link is fetched automatically.",
+      title: track ? `Couldn't load "${track.title}" from the cloud` : "Could not retrieve the cloud audio.",
+      detail: "Could not retrieve the cloud audio. The playback link may have expired or the connection dropped. Try again — a fresh link is fetched automatically.",
       action: "retry",
     };
   }
@@ -410,26 +411,34 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
     // A permission re-request must happen inside the user gesture that
     // triggered this start (Chromium requires activation for the prompt).
-    if (requestPermission) {
+    const shouldRequestPermission =
+      requestPermission ??
+      (autoplay && !isRapidSkip && (track.accessMode === "handle" || track.availability === "permission-required"));
+    if (shouldRequestPermission) {
       const regained = await regainHandleAccess(track);
       if (token !== loadToken) return;
-      if (regained === "denied") {
+      if (regained === "granted") {
+        void playbackHelpers.markTrackAvailability(track.id, "available");
+      } else if (regained === "denied" && requestPermission) {
         set({
           status: "error",
           isPlaying: false,
           error: {
-            title: `Access not granted for "${track.title}"`,
+            title: "Grant access to this audio file.",
             detail: "The browser did not grant file access. Press play to try again, or re-link the file from its ⋯ menu.",
             action: "grant-permission",
           },
         });
         useDynamicIslandStore.getState().showNotification({
-          title: "Access required",
+          title: "Grant access to this audio file.",
           description: "The browser did not grant file access. Tap to grant access.",
           song: `${track.title} — ${track.artist || "Unknown Artist"}`,
           trackId: track.id,
+          category: "permission",
+          errorCode: "NotAllowedError",
         });
         void playbackHelpers.markTrackAvailability(track.id, "permission-required");
+        void diagnoseTrackSource(track, "permission-required: File access was denied during permission request");
         return;
       }
     }
@@ -445,23 +454,58 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     if (!resolved.ok) {
       pendingSeekMs = null; // don't leak this resume seek onto a later track
       clearPreloadedTrackSource();
+      void diagnoseTrackSource(track, `${resolved.reason}: ${resolved.originalError ?? resolved.detail}`);
+      const isCloudFailure = (resolved.reason === "missing" && Boolean(track.objectKey)) || resolved.reason === "cloud-unavailable";
       const action =
         resolved.reason === "permission-required"
           ? "grant-permission"
-          : resolved.reason === "missing"
-            ? "relink"
-            : "none";
-      if (resolved.reason === "permission-required" || resolved.reason === "missing") {
-        void playbackHelpers.markTrackAvailability(track.id, resolved.reason);
+          : isCloudFailure
+            ? "retry"
+            : resolved.reason === "missing"
+              ? "relink"
+              : "none";
+      if (resolved.reason === "permission-required") {
+        void playbackHelpers.markTrackAvailability(track.id, "permission-required");
+      } else if (resolved.reason === "missing" && !track.objectKey) {
+        void playbackHelpers.markTrackAvailability(track.id, "missing");
       } else if (resolved.reason === "offline") {
         void playbackHelpers.markTrackAvailability(track.id, "offline");
       }
       set({
         status: "error",
         isPlaying: false,
-        error: { title: `Can't play "${track.title}"`, detail: resolved.detail, action },
+        error: {
+          title:
+            resolved.reason === "permission-required"
+              ? "Grant access to this audio file."
+              : isCloudFailure
+                ? "Could not retrieve the cloud audio."
+                : `Can't play "${track.title}"`,
+          detail: resolved.detail,
+          action,
+        },
       });
-      if (resolved.reason === "missing" && !track.objectKey) {
+      if (resolved.reason === "permission-required") {
+        // Temporary permission loss is recoverable — never mark as permanently broken.
+        useDynamicIslandStore.getState().showNotification({
+          title: "Grant access to this audio file.",
+          description: resolved.detail || "Grant access to this audio file.",
+          song: `${track.title} — ${track.artist || "Unknown Artist"}`,
+          trackId: track.id,
+          category: "permission",
+          errorCode: resolved.originalError ?? "PermissionRequired",
+        });
+      } else if (isCloudFailure) {
+        // Cloud retrieval failure is transient/network — never mark local track as broken.
+        useDynamicIslandStore.getState().showNotification({
+          title: "Could not retrieve the cloud audio.",
+          description: resolved.detail || "Could not retrieve the cloud audio.",
+          song: `${track.title} — ${track.artist || "Unknown Artist"}`,
+          trackId: track.id,
+          category: "network",
+          errorCode: resolved.originalError ?? "CloudFetchError",
+        });
+      } else if (resolved.reason === "missing" && !track.objectKey) {
         // Permanent local source failure
         const missingSummary = summarizePlaybackError("Audio file not found: " + (resolved.detail || "The audio file could not be found or opened."));
         void playbackHelpers.markTrackBroken(track.id, {
@@ -480,11 +524,18 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
           errorCode: "NotFoundError",
         });
       } else {
+        const notifTitle =
+          resolved.reason === "offline"
+            ? "Playback offline"
+            : resolved.reason === "unsupported"
+              ? "This browser cannot play this audio format."
+              : "Playback failed";
         useDynamicIslandStore.getState().showNotification({
-          title: resolved.reason === "offline" ? "Playback offline" : "Playback failed",
+          title: notifTitle,
           description: resolved.detail,
           song: `${track.title} — ${track.artist || "Unknown Artist"}`,
           trackId: track.id,
+          category: resolved.reason === "offline" ? "network" : resolved.reason === "unsupported" ? "unsupported" : undefined,
         });
       }
       return;
@@ -806,6 +857,9 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       return;
     }
     const track = playbackHelpers.currentTrack();
+    if (track) {
+      void diagnoseTrackSource(track, `MediaError(${failure.code}): ${failure.message}`);
+    }
     loadToken += 1; // invalidate any in-flight loads
     const errorInfo = describeFailureForTrack(failure, track);
     set({
