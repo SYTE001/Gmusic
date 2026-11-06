@@ -125,7 +125,7 @@ export function isSuspectChannelOrNoise(artist: string | undefined | null): bool
   const norm = normalizeForSearch(artist);
   if (!norm) return true;
   if (KNOWN_PROMOTER_CHANNELS.has(norm)) return true;
-  if (/^(?:lyrics?|official\s+audio|audio|topic|channel|vevo|records)$/i.test(norm)) {
+  if (/^(?:lyrics?|official\s+audio|audio|topic|channel|vevo|records|unknown(?:\s+artist)?|various(?:\s+artists)?)$/i.test(norm)) {
     return true;
   }
   return false;
@@ -144,10 +144,18 @@ export function extractVersionQualifiers(title: string): Set<string> {
   return qualifiers;
 }
 
+export const ARTIST_COLLABORATION_REGEX =
+  /\s+(?:feat|ft|featuring)\.?\s+|\s+&\s+|\s*,\s*|\s+x\s+|\s+with\s+|\s+vs\.?\s+|\s+(?:dan|and)\s+/i;
+
+export function hasArtistCollaboration(text: string): boolean {
+  if (!text) return false;
+  return ARTIST_COLLABORATION_REGEX.test(text);
+}
+
 export function extractPrimaryArtist(artist: string): string {
   if (!artist) return "";
   const primary = artist.replace(/\s*-\s*topic\b/i, "").trim();
-  const split = primary.split(/\s+(?:feat|ft|featuring)\.?\s+|\s+&\s+|\s*,\s*|\s+x\s+|\s+with\s+|\s+vs\.?\s+/i);
+  const split = primary.split(/\s+(?:feat|ft|featuring)\.?\s+|\s+&\s+|\s*,\s*|\s+x\s+|\s+with\s+|\s+vs\.?\s+|\s+(?:dan|and)\s+/i);
   if (split.length > 0 && split[0].trim().length > 0) {
     return split[0].trim();
   }
@@ -290,20 +298,53 @@ export function extractArtistAndTitle(
     const norm1 = normalizeForSearch(part1Clean);
 
     // 1. Check known artists
-    if (known.has(norm0) && !known.has(norm1)) {
+    const primaryNorm0 = normalizeForSearch(extractPrimaryArtist(part0Clean));
+    const primaryNorm1 = normalizeForSearch(extractPrimaryArtist(part1Clean));
+
+    const is0Known = (known.has(norm0) || known.has(primaryNorm0)) && norm0.length > 0;
+    const is1Known = (known.has(norm1) || known.has(primaryNorm1)) && norm1.length > 0;
+
+    if (is0Known && !is1Known) {
       return { artist: part0Clean, title: part1Clean, confidence: 0.95, isFlipped: false };
     }
-    if (known.has(norm1) && !known.has(norm0)) {
+    if (is1Known && !is0Known) {
       return { artist: part1Clean, title: part0Clean, confidence: 0.95, isFlipped: true };
     }
 
-    // 2. Check if embedded tags match
+    // 2. Check embedded / custom tags
+    // 2a. Check if embedded / custom title tag matches
+    if (context?.tags?.title) {
+      const tagTitleNorm = normalizeForSearch(cleanNoiseFromText(context.tags.title).cleaned);
+      if (tagTitleNorm && tagTitleNorm !== "unknown track") {
+        if (norm0 === tagTitleNorm) {
+          return { artist: part1Clean, title: part0Clean, confidence: 0.95, isFlipped: true };
+        }
+        if (norm1 === tagTitleNorm) {
+          return { artist: part0Clean, title: part1Clean, confidence: 0.95, isFlipped: false };
+        }
+      }
+    }
+
+    // 2b. Check if embedded artist tag matches
     if (context?.tags?.artist && !isSuspectChannelOrNoise(context.tags.artist)) {
       const tagArtist = normalizeForSearch(context.tags.artist);
-      if (norm0 === tagArtist) {
+      const primaryTagArtist = normalizeForSearch(extractPrimaryArtist(context.tags.artist));
+
+      const match0 =
+        norm0 === tagArtist ||
+        norm0 === primaryTagArtist ||
+        primaryNorm0 === tagArtist ||
+        primaryNorm0 === primaryTagArtist;
+      const match1 =
+        norm1 === tagArtist ||
+        norm1 === primaryTagArtist ||
+        primaryNorm1 === tagArtist ||
+        primaryNorm1 === primaryTagArtist;
+
+      if (match0 && !match1) {
         return { artist: part0Clean, title: part1Clean, confidence: 0.9, isFlipped: false };
       }
-      if (norm1 === tagArtist) {
+      if (match1 && !match0) {
         return { artist: part1Clean, title: part0Clean, confidence: 0.9, isFlipped: true };
       }
     }
@@ -319,7 +360,19 @@ export function extractArtistAndTitle(
       return { artist: part0Clean, title: part1Clean, confidence: 0.85, isFlipped: false };
     }
 
-    // 4. Default: Standard "Artist - Title"
+    // 4. Multiple artists / collaboration indicators:
+    // "Ellie Goulding dan Juice WRLD" or "Ellie Goulding, Juice WRLD" has collaboration markers;
+    // single song titles rarely contain unparenthesized collaboration conjunctions.
+    const hasCollab0 = hasArtistCollaboration(part0Clean);
+    const hasCollab1 = hasArtistCollaboration(part1Clean);
+    if (hasCollab1 && !hasCollab0) {
+      return { artist: part1Clean, title: part0Clean, confidence: 0.85, isFlipped: true };
+    }
+    if (hasCollab0 && !hasCollab1) {
+      return { artist: part0Clean, title: part1Clean, confidence: 0.85, isFlipped: false };
+    }
+
+    // 5. Default: Standard "Artist - Title"
     return { artist: part0Clean, title: part1Clean, confidence: 0.75, isFlipped: false };
   }
 
@@ -401,6 +454,46 @@ export function normalizeTrackMetadata(
       detectedTitle = extracted.title;
       isFlipped = extracted.isFlipped;
     }
+  } else {
+    // Both artist and title are present without delimiter in title.
+    // Check if detectedTitle and detectedArtist are reversed:
+    // e.g. Title is "Ellie Goulding dan Juice WRLD" and Artist is "Hate Me"
+    const titleNorm = normalizeForSearch(detectedTitle);
+    const artistNorm = normalizeForSearch(detectedArtist);
+    const primaryTitle = normalizeForSearch(extractPrimaryArtist(detectedTitle));
+    const primaryArtistNorm = normalizeForSearch(extractPrimaryArtist(detectedArtist));
+
+    const titleIsKnownArtist = (knownArtists.has(titleNorm) || knownArtists.has(primaryTitle)) && titleNorm.length > 0;
+    const artistIsKnownArtist = (knownArtists.has(artistNorm) || knownArtists.has(primaryArtistNorm)) && artistNorm.length > 0;
+
+    const titleHasCollab = hasArtistCollaboration(detectedTitle) && extractVersionQualifiers(detectedTitle).size === 0;
+    const artistHasCollab = hasArtistCollaboration(detectedArtist);
+
+    let fileSuggestsFlipped = false;
+    if (DELIMITER_REGEX.test(rawFileName)) {
+      const fileExtracted = extractArtistAndTitle(rawFileName, { knownArtists });
+      if (fileExtracted.artist && fileExtracted.title) {
+        const fileArtistNorm = normalizeForSearch(fileExtracted.artist);
+        const fileTitleNorm = normalizeForSearch(fileExtracted.title);
+        if (
+          (fileArtistNorm === titleNorm || fileArtistNorm.includes(titleNorm) || titleNorm.includes(fileArtistNorm)) &&
+          (fileTitleNorm === artistNorm || fileTitleNorm.includes(artistNorm) || artistNorm.includes(fileTitleNorm))
+        ) {
+          fileSuggestsFlipped = true;
+        }
+      }
+    }
+
+    if (
+      fileSuggestsFlipped ||
+      (titleIsKnownArtist && !artistIsKnownArtist) ||
+      (titleHasCollab && !artistHasCollab)
+    ) {
+      const temp = detectedArtist;
+      detectedArtist = detectedTitle;
+      detectedTitle = temp;
+      isFlipped = true;
+    }
   }
 
   // 2. Clean noise from title and artist
@@ -435,15 +528,6 @@ export function normalizeTrackMetadata(
   // 3. Generate alternative search queries (prioritized, deduplicated)
   const alternateQueries: Array<{ trackName: string; artistName: string; q?: string; reason: string }> = [];
 
-  // If ordering might be reversed:
-  if (canonicalArtist && canonicalTitle) {
-    alternateQueries.push({
-      trackName: canonicalArtist,
-      artistName: canonicalTitle,
-      reason: isFlipped ? "Original unswapped ordering" : "Alternative title/artist ordering (swapped)",
-    });
-  }
-
   // Cleaned title + normalized artist:
   if (baseTitleWithoutBrackets && baseTitleWithoutBrackets !== canonicalTitle) {
     alternateQueries.push({
@@ -470,7 +554,7 @@ export function normalizeTrackMetadata(
   }
 
   // Original title + normalized artist:
-  if (rawTitle && rawTitle !== canonicalTitle) {
+  if (rawTitle && rawTitle !== canonicalTitle && rawTitle !== baseTitleWithoutBrackets) {
     alternateQueries.push({
       trackName: rawTitle,
       artistName: canonicalArtist,
@@ -485,6 +569,15 @@ export function normalizeTrackMetadata(
       artistName: canonicalArtist,
       q: `${canonicalArtist} ${canonicalTitle}`.trim(),
       reason: "Combined query string",
+    });
+  }
+
+  // Swapped order as last fallback:
+  if (canonicalArtist && canonicalTitle) {
+    alternateQueries.push({
+      trackName: canonicalArtist,
+      artistName: canonicalTitle,
+      reason: isFlipped ? "Original unswapped ordering" : "Alternative title/artist ordering (swapped)",
     });
   }
 
