@@ -8,6 +8,7 @@ import { describeLyricsDbError, LyricsDbError, lyricsDbGet, lyricsDbSearch, type
 import { artistSimilarity, decideMatch, type LyricMatchRecord, rankCandidates, type RankedCandidate, similarity } from "./matching";
 import { parseLyricsfile } from "./lyricsfile";
 import { normalizeTrackMetadata } from "../metadata/normalization";
+import { recordSearchDiagnostic, type ProviderDiagnostic } from "./lyricsDiagnostics";
 
 /**
  * LyricsService — parses .lrc / .txt lyrics, applies per-track offsets, and
@@ -244,7 +245,8 @@ export async function readLyricFileText(file: File): Promise<string> {
 // ---------------------------------------------------------------------------
 
 /** Re-check "not found" tracks weekly; accepted/ambiguous states never auto-retry. */
-export const LYRICS_NOT_FOUND_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Negative-cache duration for tracks genuine not-found upstream (1 hour). */
+export const LYRICS_NOT_FOUND_TTL_MS = 60 * 60 * 1000;
 
 export type LyricsResolution =
   | { outcome: "cached"; lyrics: TrackLyrics }
@@ -449,7 +451,13 @@ function considerRecord(
   return { lyrics, capability };
 }
 
-async function persistAttached(track: Track, lyrics: TrackLyrics, record: LyricMatchRecord): Promise<TrackLyrics> {
+async function persistAttached(
+  track: Track,
+  lyrics: TrackLyrics,
+  record: LyricMatchRecord,
+  onProgress?: (phase: ResolutionPhase) => void,
+): Promise<TrackLyrics> {
+  onProgress?.("saving");
   await repository.putLyrics(lyrics);
   await repository.putLyricsCacheMeta({
     trackId: track.id,
@@ -729,7 +737,14 @@ async function fetchFromLyricsDb(
   return { records: collected, exactRecord };
 }
 
-export type ResolutionPhase = "identifying" | "searching" | "validating";
+export type ResolutionPhase =
+  | "identifying"
+  | "searching"
+  | "searching-lrcmux"
+  | "searching-lrclib"
+  | "searching-lyricsdb"
+  | "validating"
+  | "saving";
 
 export type ResolveLyricsOptions = {
   force?: boolean;
@@ -739,7 +754,9 @@ export type ResolveLyricsOptions = {
   providers?: LyricsProvider[];
 };
 
-const SEARCH_WINDOW_MS = 3000;
+/** Initial total search budget: up to 14 seconds (12-15s per requirement). */
+export const TOTAL_SEARCH_BUDGET_MS = 14_000;
+let totalSearchBudgetMs = TOTAL_SEARCH_BUDGET_MS;
 
 async function resolveLyrics(
   track: Track,
@@ -753,6 +770,7 @@ async function resolveLyrics(
   },
 ): Promise<LyricsResolution> {
   const { cached, minCapabilityRank, keepOnMiss } = context;
+  const startTime = Date.now();
 
   // 0. Metadata Normalization Layer (PRD §1, §3)
   options.onProgress?.("identifying");
@@ -770,9 +788,12 @@ async function resolveLyrics(
   const allCollectedRecords: LyricMatchRecord[] = [];
   const exactRecords: LyricMatchRecord[] = [];
   const providerErrors: unknown[] = [];
+  const providerDiagnostics: Partial<Record<LyricsProvider, ProviderDiagnostic>> = {};
   let foundWordSyncAutoAccept = false;
 
   const providerTasks = activeProviders.map(async (p) => {
+    const pStart = Date.now();
+    options.onProgress?.(`searching-${p}` as ResolutionPhase);
     try {
       let result: { records: LyricMatchRecord[]; exactRecord: LyricMatchRecord | null };
       if (p === "lrcmux") {
@@ -787,20 +808,66 @@ async function resolveLyrics(
       }
       allCollectedRecords.push(...result.records);
 
+      let usableCount = 0;
+      let highestScore = 0;
+      let lastRejection: string | undefined;
+
       for (const r of result.records) {
+        const decision = decideMatch(canonicalTrack, r);
+        if (decision.quality.score > highestScore) {
+          highestScore = decision.quality.score;
+        }
+        if (!decision.autoAccept && decision.quality.rejectReason) {
+          lastRejection = decision.quality.rejectReason;
+        }
         const consideration = considerRecord(canonicalTrack, r, cached, minCapabilityRank);
-        if (consideration && consideration.capability === "word") {
-          foundWordSyncAutoAccept = true;
+        if (consideration) {
+          usableCount += 1;
+          if (consideration.capability === "word") {
+            foundWordSyncAutoAccept = true;
+          }
         }
       }
+
+      providerDiagnostics[p] = {
+        provider: p,
+        startedAt: pStart,
+        durationMs: Date.now() - pStart,
+        status: 200,
+        recordsReturned: result.records.length,
+        usableLyricsPayloads: usableCount,
+        bestScore: highestScore > 0 ? highestScore : null,
+        rejectionReason: lastRejection ?? null,
+      };
     } catch (err) {
+      const pDur = Date.now() - pStart;
+      let errStatus: number | string = 500;
+      if (err instanceof LrcmuxError || err instanceof LrclibError || err instanceof LyricsDbError) {
+        errStatus = err.status ?? err.kind;
+      }
+      providerDiagnostics[p] = {
+        provider: p,
+        startedAt: pStart,
+        durationMs: pDur,
+        status: errStatus,
+        recordsReturned: 0,
+        usableLyricsPayloads: 0,
+        bestScore: null,
+        rejectionReason: null,
+        error: String((err as Error)?.message || err),
+      };
       if (!isAborted(err)) {
         providerErrors.push(err);
       }
     }
   });
 
-  // Bounded 3-second search window: resolves early if all providers settle OR word-sync is found
+  let timedOut = false;
+
+  // Concurrent execution: resolves as soon as:
+  // 1. All providers settle, OR
+  // 2. An auto-acceptable word-sync match is found (top quality capability), OR
+  // 3. The 12-15s total search budget expires.
   await Promise.race([
     Promise.allSettled(providerTasks),
     new Promise<void>((resolve) => {
@@ -811,13 +878,34 @@ async function resolveLyrics(
           clearTimeout(timer);
           resolve();
         }
-      }, 25);
+      }, 50);
       timer = setTimeout(() => {
         clearInterval(interval);
+        timedOut = true;
         resolve();
-      }, SEARCH_WINDOW_MS);
+      }, totalSearchBudgetMs);
     }),
   ]);
+
+  // Safe background processing of late provider results without track mismatch
+  void Promise.allSettled(providerTasks).then(async () => {
+    if (!timedOut) return;
+    try {
+      const lateDeduplicated = deduplicateRecords(allCollectedRecords);
+      const lateRanked = rankCandidates(canonicalTrack, lateDeduplicated);
+      for (const candidate of lateRanked) {
+        const currentLyrics = (await repository.getLyrics(track.id)) ?? null;
+        const currentCap = currentLyrics ? detectLyricsCapability(currentLyrics) : "none";
+        const consideration = considerRecord(canonicalTrack, candidate.record, currentLyrics, CAPABILITY_RANK[currentCap] + 1);
+        if (consideration && consideration.capability !== "plain" && decideMatch(canonicalTrack, candidate.record).autoAccept) {
+          await persistAttached(track, consideration.lyrics, candidate.record);
+          break;
+        }
+      }
+    } catch {
+      // background late persistence non-fatal
+    }
+  });
 
   let plainFallback: { lyrics: TrackLyrics; record: LyricMatchRecord } | null = null;
 
@@ -835,7 +923,19 @@ async function resolveLyrics(
     const bestExact = evaluatedExact[0];
     if (bestExact.capability === "word" || bestExact.capability === "line") {
       options.onProgress?.("validating");
-      return { outcome: "attached", lyrics: await persistAttached(track, bestExact.lyrics, bestExact.record) };
+      const lyrics = await persistAttached(track, bestExact.lyrics, bestExact.record, options.onProgress);
+      recordSearchDiagnostic({
+        trackId: track.id,
+        title: canonicalTrack.title,
+        artist: canonicalTrack.artist,
+        album: canonicalTrack.album,
+        durationSeconds: canonicalTrack.durationMs ? Math.round(canonicalTrack.durationMs / 1000) : undefined,
+        totalDurationMs: Date.now() - startTime,
+        providers: providerDiagnostics,
+        finalSelectedProvider: bestExact.record.provider ?? "lrcmux",
+        finalCapability: bestExact.capability,
+      });
+      return { outcome: "attached", lyrics };
     }
     plainFallback = { lyrics: bestExact.lyrics, record: bestExact.record };
   }
@@ -849,22 +949,68 @@ async function resolveLyrics(
     if (!consideration) continue;
     if (consideration.capability === "plain") continue;
     options.onProgress?.("validating");
-    return { outcome: "attached", lyrics: await persistAttached(track, consideration.lyrics, candidate.record) };
+    const lyrics = await persistAttached(track, consideration.lyrics, candidate.record, options.onProgress);
+    recordSearchDiagnostic({
+      trackId: track.id,
+      title: canonicalTrack.title,
+      artist: canonicalTrack.artist,
+      album: canonicalTrack.album,
+      durationSeconds: canonicalTrack.durationMs ? Math.round(canonicalTrack.durationMs / 1000) : undefined,
+      totalDurationMs: Date.now() - startTime,
+      providers: providerDiagnostics,
+      finalSelectedProvider: candidate.record.provider ?? "lrcmux",
+      finalCapability: consideration.capability,
+    });
+    return { outcome: "attached", lyrics };
   }
 
   // Fallbacks & results evaluation
   if (plainFallback) {
     options.onProgress?.("validating");
-    return { outcome: "attached", lyrics: await persistAttached(track, plainFallback.lyrics, plainFallback.record) };
+    const lyrics = await persistAttached(track, plainFallback.lyrics, plainFallback.record, options.onProgress);
+    recordSearchDiagnostic({
+      trackId: track.id,
+      title: canonicalTrack.title,
+      artist: canonicalTrack.artist,
+      album: canonicalTrack.album,
+      durationSeconds: canonicalTrack.durationMs ? Math.round(canonicalTrack.durationMs / 1000) : undefined,
+      totalDurationMs: Date.now() - startTime,
+      providers: providerDiagnostics,
+      finalSelectedProvider: plainFallback.record.provider ?? "lrcmux",
+      finalCapability: recordCapability(plainFallback.record),
+    });
+    return { outcome: "attached", lyrics };
   }
 
   if (keepOnMiss && cached) {
+    recordSearchDiagnostic({
+      trackId: track.id,
+      title: canonicalTrack.title,
+      artist: canonicalTrack.artist,
+      album: canonicalTrack.album,
+      durationSeconds: canonicalTrack.durationMs ? Math.round(canonicalTrack.durationMs / 1000) : undefined,
+      totalDurationMs: Date.now() - startTime,
+      providers: providerDiagnostics,
+      finalSelectedProvider: "cached",
+      finalCapability: detectLyricsCapability(cached),
+    });
     return { outcome: "cached", lyrics: cached };
   }
 
   const finalCandidates = ranked;
 
   if (finalCandidates.length === 0) {
+    recordSearchDiagnostic({
+      trackId: track.id,
+      title: canonicalTrack.title,
+      artist: canonicalTrack.artist,
+      album: canonicalTrack.album,
+      durationSeconds: canonicalTrack.durationMs ? Math.round(canonicalTrack.durationMs / 1000) : undefined,
+      totalDurationMs: Date.now() - startTime,
+      providers: providerDiagnostics,
+      finalSelectedProvider: "none",
+      finalCapability: "none",
+    });
     if (providerErrors.length > 0 && allCollectedRecords.length === 0) {
       return { outcome: "error", message: describeLyricsError(providerErrors[0]) };
     }
@@ -879,6 +1025,17 @@ async function resolveLyrics(
   }
 
   // Ambiguous or plain-only best match: offer in chooser
+  recordSearchDiagnostic({
+    trackId: track.id,
+    title: canonicalTrack.title,
+    artist: canonicalTrack.artist,
+    album: canonicalTrack.album,
+    durationSeconds: canonicalTrack.durationMs ? Math.round(canonicalTrack.durationMs / 1000) : undefined,
+    totalDurationMs: Date.now() - startTime,
+    providers: providerDiagnostics,
+    finalSelectedProvider: "none",
+    finalCapability: "none",
+  });
   await repository.putLyricsCacheMeta({
     trackId: track.id,
     status: "needs-selection",
@@ -982,5 +1139,11 @@ export const __testHooks = {
   },
   getDefaultProviders(): LyricsProvider[] {
     return [...defaultProviders];
+  },
+  setTotalSearchBudgetMs(budgetMs: number): void {
+    totalSearchBudgetMs = budgetMs;
+  },
+  getTotalSearchBudgetMs(): number {
+    return totalSearchBudgetMs;
   },
 };

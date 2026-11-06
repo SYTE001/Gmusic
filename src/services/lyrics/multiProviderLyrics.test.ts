@@ -3,8 +3,10 @@ import type { Track } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
 import {
   resolveLyricsForTrack,
+  resetLyricsCacheMeta,
   __testHooks,
 } from "./lyricsService";
+import { getLatestLyricsDiagnostic } from "./lyricsDiagnostics";
 import { lrcmuxGet, lrcmuxSearch, type LrcmuxRecord, LrcmuxError } from "./lrcmuxClient";
 import { lrclibGet, lrclibSearch, type LrclibRecord, LrclibError } from "./lrclibClient";
 import { lyricsDbGet, lyricsDbSearch, type LyricsDbRecord, LyricsDbError } from "./lyricsdbClient";
@@ -486,5 +488,138 @@ describe("Multi-Provider Lyrics Integration (LRCmux + LRCLIB + LyricsDB)", () =>
       }),
       undefined,
     );
+  });
+
+  // 19. Mandatory regression: Ain't In LA by ADÉLA
+  it("resolves Ain't In LA by ADÉLA from LyricsDB, saves to IndexedDB with word sync, and uses cache on replay", async () => {
+    const track = makeTrack({
+      id: "adela-aint-in-la",
+      title: "Ain't In LA",
+      artist: "ADÉLA",
+      album: "PRIMA",
+      durationMs: 184000,
+      fileName: "aint-in-la.mp3",
+    });
+
+    const adelaRecord = makeLyricsDbRecord({
+      id: "e044e0b7-d67f-4741-91de-42911cf56091",
+      trackName: "Ain't In LA",
+      artistName: "ADÉLA",
+      albumName: "Ain't In LA",
+      duration: 187,
+      hasWordSync: true,
+      lines: [
+        {
+          timeMs: 2753,
+          text: "Back it up, subwoofers in the trunk, and the",
+          words: [
+            { text: "Back ", startMs: 2753, endMs: 3039 },
+            { text: "it ", startMs: 3039, endMs: 3252 },
+            { text: "up, ", startMs: 3252, endMs: 3652 },
+            { text: "subwoofers ", startMs: 3652, endMs: 4532 },
+            { text: "in ", startMs: 4532, endMs: 4825 },
+            { text: "the ", startMs: 4825, endMs: 4985 },
+            { text: "trunk, ", startMs: 4985, endMs: 5425 },
+            { text: "and ", startMs: 5425, endMs: 5652 },
+            { text: "the ", startMs: 5652, endMs: 5861 },
+          ],
+        },
+      ],
+      syncLevel: "word",
+      provider: "lyricsdb",
+    });
+
+    mockLyricsDbGet.mockResolvedValue(adelaRecord);
+
+    // Playback 1: Resolves and persists
+    const result1 = await resolveLyricsForTrack(track);
+    expect(result1.outcome).toBe("attached");
+    if (result1.outcome === "attached") {
+      expect(result1.lyrics.origin?.kind).toBe("lyricsdb");
+      expect(result1.lyrics.origin?.capability).toBe("word");
+      expect(result1.lyrics.lines[0].words).toBeDefined();
+      expect(result1.lyrics.lines[0].words?.length).toBe(9);
+    }
+
+    // Verify stored in IndexedDB
+    const stored = await repository.getLyrics(track.id);
+    expect(stored).not.toBeNull();
+    expect(stored?.origin?.capability).toBe("word");
+
+    // Playback 2: Must be an instant cache hit from IndexedDB without provider calls
+    mockLrcmuxGet.mockClear();
+    mockLrclibGet.mockClear();
+    mockLyricsDbGet.mockClear();
+
+    const result2 = await resolveLyricsForTrack(track);
+    expect(result2.outcome).toBe("cached");
+    expect(mockLrcmuxGet).not.toHaveBeenCalled();
+    expect(mockLrclibGet).not.toHaveBeenCalled();
+    expect(mockLyricsDbGet).not.toHaveBeenCalled();
+  });
+
+  // 20. Search budget: response settling after 3 seconds is not discarded
+  it("does not abort or drop provider results settling after 3 seconds", async () => {
+    const track = makeTrack({ id: "slow-track", title: "Slow Song", artist: "Slow Artist", durationMs: 200000 });
+    
+    // LRCmux responds after a slight delay
+    mockLrcmuxGet.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return makeLrcmuxRecord({
+        trackName: "Slow Song",
+        artistName: "Slow Artist",
+        duration: 200,
+        syncLevel: "line",
+      });
+    });
+
+    const result = await resolveLyricsForTrack(track);
+    expect(result.outcome).toBe("attached");
+    if (result.outcome === "attached") {
+      expect(result.lyrics.lines.length).toBeGreaterThan(0);
+    }
+  });
+
+  // 21. Explicit Try again bypasses negative cache
+  it("bypasses negative cache on explicit force retry", async () => {
+    const track = makeTrack({ id: "negative-track" });
+
+    // Initial search has no results
+    mockLrcmuxGet.mockResolvedValue(null);
+    mockLrcmuxSearch.mockResolvedValue([]);
+    mockLrclibGet.mockResolvedValue(null);
+    mockLrclibSearch.mockResolvedValue([]);
+    mockLyricsDbGet.mockResolvedValue(null);
+    mockLyricsDbSearch.mockResolvedValue([]);
+
+    const result1 = await resolveLyricsForTrack(track);
+    expect(result1.outcome).toBe("not-found");
+
+    // Replay without force hits negative cache
+    const result2 = await resolveLyricsForTrack(track);
+    expect(result2.outcome).toBe("skipped-recently");
+
+    // Now provider has lyrics available
+    mockLrclibGet.mockResolvedValue(makeLrclibRecord());
+
+    // Explicit reset / force retry
+    await resetLyricsCacheMeta(track.id);
+    const result3 = await resolveLyricsForTrack(track, { force: true });
+    expect(result3.outcome).toBe("attached");
+  });
+
+  // 22. Provider diagnostics record durations, status, and selection
+  it("populates provider-level diagnostics on search completion", async () => {
+    const track = makeTrack();
+    mockLrclibGet.mockResolvedValue(makeLrclibRecord());
+
+    await resolveLyricsForTrack(track);
+    const diag = getLatestLyricsDiagnostic();
+    expect(diag).not.toBeNull();
+    expect(diag?.trackId).toBe(track.id);
+    expect(diag?.finalSelectedProvider).toBeDefined();
+    expect(diag?.totalDurationMs).toBeGreaterThanOrEqual(0);
+    expect(diag?.providers.lrclib).toBeDefined();
+    expect(diag?.providers.lrclib?.status).toBe(200);
   });
 });

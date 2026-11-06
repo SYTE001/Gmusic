@@ -407,10 +407,16 @@ export async function lyricsDbFetchLyrics(trackId: string, format = "json", sign
 
 /** Structured discovery search: searches tracks and builds normalized LyricsDbRecords. */
 export async function lyricsDbSearch(query: LyricsDbQuery, signal?: AbortSignal): Promise<LyricsDbRecord[]> {
-  const searchTerms = [query.trackName, query.artistName].filter(Boolean).join(" ").trim() || query.q?.trim();
-  if (!searchTerms) return [];
+  const primaryTerm = query.trackName?.trim() || query.q?.trim() || query.artistName?.trim();
+  if (!primaryTerm) return [];
 
-  const tracks = await lyricsDbSearchTracks(searchTerms, 10, signal);
+  let tracks = await lyricsDbSearchTracks(primaryTerm, 10, signal);
+  if (tracks.length === 0 && query.artistName && query.trackName) {
+    const combined = `${query.trackName} ${query.artistName}`.trim();
+    if (combined !== primaryTerm) {
+      tracks = await lyricsDbSearchTracks(combined, 10, signal);
+    }
+  }
   if (tracks.length === 0) return [];
 
   // Filter to tracks with lyrics
@@ -453,27 +459,48 @@ export async function lyricsDbSearch(query: LyricsDbQuery, signal?: AbortSignal)
 
 /** Exact lookup via search and matching. Returns null on miss. */
 export async function lyricsDbGet(query: LyricsDbQuery, signal?: AbortSignal): Promise<LyricsDbRecord | null> {
-  if (!query.trackName && !query.q) return null;
-  const searchTerms = [query.trackName, query.artistName].filter(Boolean).join(" ").trim() || query.q?.trim();
-  if (!searchTerms) return null;
+  const primaryTerm = query.trackName?.trim() || query.q?.trim();
+  if (!primaryTerm) return null;
 
-  const tracks = await lyricsDbSearchTracks(searchTerms, 5, signal);
+  let tracks = await lyricsDbSearchTracks(primaryTerm, 10, signal);
+  if (tracks.length === 0 && query.artistName) {
+    const combined = `${query.trackName ?? ""} ${query.artistName}`.trim();
+    if (combined !== primaryTerm) {
+      tracks = await lyricsDbSearchTracks(combined, 10, signal);
+    }
+  }
   if (tracks.length === 0) return null;
 
-  // Find the track closest in duration and title
+  // Find the track closest in artist and duration
   const targetDuration = query.duration;
   let bestTrack: LyricsDbTrack | null = null;
-  let bestDelta = Infinity;
+  let bestScore = -Infinity;
 
   for (const track of tracks) {
     if (track.hasLyrics === false) continue;
-    if (targetDuration != null && track.durationMs != null) {
-      const delta = Math.abs(track.durationMs / 1000 - targetDuration);
-      if (delta < bestDelta) {
-        bestDelta = delta;
-        bestTrack = track;
+
+    const artistStr = Array.isArray(track.artists) ? track.artists.join(", ") : "";
+    let artistMatch = 1.0;
+    if (query.artistName && artistStr) {
+      const qArt = query.artistName.toLowerCase().trim();
+      const tArt = artistStr.toLowerCase().trim();
+      if (tArt.includes(qArt) || qArt.includes(tArt)) {
+        artistMatch = 1.0;
+      } else {
+        artistMatch = 0.5;
       }
-    } else if (!bestTrack) {
+    }
+
+    const durationDelta =
+      targetDuration != null && track.durationMs != null
+        ? Math.abs(track.durationMs / 1000 - targetDuration)
+        : 0;
+
+    if (targetDuration != null && durationDelta > 60) continue;
+
+    const score = artistMatch * 100 - durationDelta;
+    if (score > bestScore) {
+      bestScore = score;
       bestTrack = track;
     }
   }

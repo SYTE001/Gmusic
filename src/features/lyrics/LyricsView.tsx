@@ -463,9 +463,17 @@ export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
               {checking
                 ? discoveryPhase === "identifying"
                   ? "Identifying track…"
-                  : discoveryPhase === "validating"
-                    ? "Validating lyrics…"
-                    : "Searching lyrics…"
+                  : discoveryPhase === "searching-lrcmux"
+                    ? "Searching LRCmux…"
+                    : discoveryPhase === "searching-lrclib"
+                      ? "Searching LRCLIB…"
+                      : discoveryPhase === "searching-lyricsdb"
+                        ? "Searching LyricsDB…"
+                        : discoveryPhase === "validating"
+                          ? "Validating lyrics…"
+                          : discoveryPhase === "saving"
+                            ? "Saving lyrics…"
+                            : "Searching lyrics…"
                 : discoveryTrackId === track.id && discoveryStatus === "error"
                   ? "Couldn’t load lyrics"
                   : discoveryTrackId === track.id && discoveryStatus === "offline"
@@ -476,7 +484,7 @@ export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
             </p>
             <p className="mt-1 max-w-sm text-xs text-text-secondary">
               Import an <code>.lrc</code> file with timestamps for synced lyrics, or a <code>.txt</code> for plain text.
-              Online, matching lyrics from lrcmux are found automatically.
+              Online, matching lyrics from LRCmux, LRCLIB and LyricsDB are found automatically.
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-center gap-2">
