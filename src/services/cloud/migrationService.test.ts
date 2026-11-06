@@ -85,6 +85,7 @@ vi.mock("../cloud/r2StorageService", () => ({
     return { objectKey, size: sizeBytes, etag: "etag", contentType: mimeType };
   },
   /** Records rejected-object cleanup attempts. */
+  getPlayUrl: async (objectKey: string) => `https://r2/play/${objectKey}`,
   deleteCloudObject: async (objectKey: string) => {
     storage.cleanedUpObjects.push(objectKey);
     return [objectKey];
@@ -118,6 +119,7 @@ import {
   retryFailedItems,
   runMigration,
 } from "./migrationService";
+import { resolveLocalAudioForTrack } from "./migrationService";
 import { forgetSessionFile, rememberSessionFile } from "../file-access/FileAccessService";
 
 function makeTrack(overrides: Partial<Track> = {}): Track {
@@ -294,7 +296,7 @@ describe("migration run", () => {
     // The local audio copy survives the failure verbatim.
     expect(await repository.getAudioBlob(tracks[1]!.id)).toBeTruthy();
     const stored = await repository.getTrack(tracks[1]!.id);
-    expect(stored?.cloudStatus).toBeUndefined(); // never marked uploaded
+    expect(stored?.cloudStatus).not.toBe("ready"); // never marked uploaded
   });
 
   it("re-failing verification leaves the track failed and local data intact", async () => {
@@ -364,7 +366,7 @@ describe("migration run", () => {
     expect(storage.cleanedUpObjects).toEqual([`users/u-1/tracks/${tracks[0]!.id}/audio.mp3`]);
     // And nothing local was marked uploaded.
     const stored = await repository.getTrack(tracks[0]!.id);
-    expect(stored?.cloudStatus ?? "local").toBe("local");
+    expect(stored?.cloudStatus).not.toBe("ready");
   });
 
   it("cancels between files, leaving pending items and all local data intact", async () => {
@@ -396,7 +398,7 @@ describe("migration run", () => {
     const pendingIds = new Set(progress.items.filter((item) => item.status === "pending").map((item) => item.trackId));
     for (const trackId of pendingIds) {
       const stored = await repository.getTrack(trackId);
-      expect(stored?.cloudStatus ?? "local").toBe("local");
+      expect(stored?.cloudStatus).not.toBe("ready");
     }
   });
 
@@ -595,7 +597,8 @@ describe("database failure after a successful storage upload", () => {
     // "done" — the UI may offer a retry without claiming success.
     expect(library.upserted).toHaveLength(0);
     expect(await repository.getTrack(tracks[0]!.id)).toBeTruthy();
-    expect((await repository.getTrack(tracks[0]!.id))?.cloudStatus).toBeUndefined();
+    // The verified failure is recorded so the UI never shows "ready".
+    expect((await repository.getTrack(tracks[0]!.id))?.cloudStatus).toBe("failed");
     expect(await repository.getAudioBlob(tracks[0]!.id)).toBeTruthy();
   });
 
@@ -692,5 +695,108 @@ describe("format coverage and re-import safety", () => {
     for (const track of tracks) {
       expect(library.upserted.filter((t) => t.id === track.id)).toHaveLength(1);
     }
+  });
+});
+
+describe("partial upload recovery and permissions", () => {
+  beforeEach(async () => {
+    await repository.clearAllData();
+    storage.failingTrackIds.clear();
+    storage.verificationFailsFor.clear();
+    storage.uploads = 0;
+    storage.cleanedUpObjects = [];
+    library.upserted = [];
+    library.failNextUpsert = false;
+    vi.stubGlobal("fetch", async () => new Response("", { status: 200 }));
+  });
+
+  it("keeps the verified object key after a database failure and does not re-upload on retry", async () => {
+    const tracks = await storedTracks(1);
+    const id = tracks[0]!.id;
+    library.failNextUpsert = true;
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    await runMigration(tracks, progress);
+    expect(progress.failed).toBe(1);
+    expect(storage.uploads).toBe(1);
+    const afterFailure = await repository.getTrack(id);
+    expect(afterFailure?.objectKey).toBe(`users/u-1/tracks/${id}/audio.mp3`);
+    expect(afterFailure?.cloudStatus).toBe("failed");
+
+    // The object exists in R2 with the right byte length: retry only writes metadata.
+    const remoteSize = (await resolveLocalAudioForTrack(tracks[0]!))!.size;
+    vi.stubGlobal("fetch", async () =>
+      new Response("", { status: 206, headers: { "content-range": `bytes 0-0/${remoteSize}` } }),
+    );
+    const retryTracks = [(await repository.getTrack(id))!];
+    retryFailedItems(progress);
+    await runMigration(retryTracks, progress);
+    expect(progress.state).toBe("complete");
+    expect(progress.succeeded).toBe(1);
+    expect(storage.uploads).toBe(1);
+    expect((await repository.getTrack(id))?.cloudStatus).toBe("ready");
+  });
+
+  it("uploads again when the remembered object is missing or has the wrong size", async () => {
+    const tracks = await storedTracks(1);
+    const id = tracks[0]!.id;
+    await repository.updateTrack(id, { objectKey: `users/u-1/tracks/${id}/audio.mp3`, cloudStatus: "failed" });
+    vi.stubGlobal("fetch", async (url: unknown) =>
+      String(url).includes("/play/") ? new Response("", { status: 404 }) : new Response("", { status: 200 }),
+    );
+    const retryTracks = [(await repository.getTrack(id))!];
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(retryTracks)).items };
+    await runMigration(retryTracks, progress);
+    expect(storage.uploads).toBe(1);
+    expect(progress.succeeded).toBe(1);
+  });
+
+  it("uploads a newly imported stored-copy track that has no cloud fields yet", async () => {
+    const tracks = await storedTracks(1);
+    const progress = { ...initialMigrationProgress(), items: (await planMigration(tracks)).items };
+    expect(progress.items[0]!.status).toBe("pending");
+    await runMigration(tracks, progress);
+    expect(progress.succeeded).toBe(1);
+    expect(library.upserted[0]!.cloudStatus).toBe("ready");
+    expect(await repository.getAudioBlob(tracks[0]!.id)).toBeTruthy();
+  });
+
+  it("uploads a session-only file while its File reference is alive", async () => {
+    const track = makeTrack({ id: "session-up", accessMode: "session-only" });
+    rememberSessionFile(track.id, new File([new Uint8Array(10)], "song.mp3", { type: "audio/mpeg" }));
+    await repository.putTrackWithFiles(track, {});
+    const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+    await runMigration([track], progress);
+    expect(progress.succeeded).toBe(1);
+    expect(storage.uploads).toBe(1);
+    forgetSessionFile(track.id);
+  });
+
+  it("asks for file permission when needed and reports needs-access when denied", async () => {
+    const track = makeTrack({ id: "perm-1", accessMode: "handle" });
+    const requestPermission = vi.fn(async () => "denied");
+    const handle = {
+      kind: "file",
+      name: "song.mp3",
+      queryPermission: async () => "prompt",
+      requestPermission,
+      getFile: async () => new File([new Uint8Array(10)], "song.mp3", { type: "audio/mpeg" }),
+    };
+    vi.spyOn(repository, "getHandle").mockResolvedValue(handle as unknown as FileSystemFileHandle);
+    const progress = { ...initialMigrationProgress(), items: (await planMigration([track])).items };
+    expect(progress.items[0]!.status).toBe("needs-access");
+    progress.items[0]!.status = "pending";
+    await runMigration([track], progress);
+    expect(requestPermission).toHaveBeenCalled();
+    expect(progress.items[0]!.status).toBe("needs-access");
+    expect(storage.uploads).toBe(0);
+    vi.restoreAllMocks();
+  });
+
+  it("does not upload a track that is already cloud verified", async () => {
+    const track = makeTrack({ id: "done-1", cloudStatus: "ready", objectKey: "users/u-1/tracks/done-1/audio.mp3" });
+    const plan = await planMigration([track]);
+    const progress = { ...initialMigrationProgress(), items: plan.items };
+    await runMigration([track], progress);
+    expect(storage.uploads).toBe(0);
   });
 });

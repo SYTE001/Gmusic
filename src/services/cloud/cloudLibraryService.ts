@@ -34,6 +34,7 @@ export type CloudTrackRow = {
   last_synced_at: string | null;
   description?: string;
   updated_at?: string | null;
+  // Rows read from Postgres can't be null for these (NOT NULL columns); written rows never are.
 };
 
 export type CloudPlaylistRow = {
@@ -192,7 +193,18 @@ async function denyOnAuthError(error: unknown, context: string): Promise<never> 
 }
 
 function toIso(value: number | null | undefined): string | null {
-  return typeof value === "number" && Number.isFinite(value) ? new Date(value).toISOString() : null;
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  // Values beyond the Date range are invalid and would make toISOString throw.
+  return Number.isNaN(new Date(value).getTime()) ? null : new Date(value).toISOString();
+}
+
+/**
+ * For columns declared NOT NULL in Postgres. An explicit NULL bypasses the
+ * column DEFAULT, so a missing local timestamp must become a real ISO value
+ * here rather than being sent as null.
+ */
+function toIsoRequired(value: number | null | undefined): string {
+  return toIso(value) ?? new Date().toISOString();
 }
 
 function fromIso(value: string | null | undefined): number | null {
@@ -221,10 +233,12 @@ export function trackToRow(track: Track, userId = ""): CloudTrackRow {
     is_liked: track.isLiked,
     play_count: track.playCount,
     last_played_at: toIso(track.lastPlayedAt),
-    added_at: toIso(track.addedAt),
-    last_synced_at: toIso(track.lastSyncedAt),
+    // added_at keeps its meaning (when the track entered the library); only a
+    // missing value falls back. last_synced_at is re-stamped at upsert time.
+    added_at: toIsoRequired(track.addedAt),
+    last_synced_at: toIsoRequired(track.lastSyncedAt),
     description: sanitizeTextForDatabase(track.description ?? ""),
-    updated_at: toIso(track.updatedAt),
+    updated_at: toIsoRequired(track.updatedAt),
   };
 }
 
@@ -266,8 +280,8 @@ export function playlistToRow(playlist: Playlist, userId = ""): CloudPlaylistRow
     user_id: userId,
     name: playlist.name,
     description: playlist.description,
-    created_at: toIso(playlist.createdAt),
-    updated_at: toIso(playlist.updatedAt),
+    created_at: toIsoRequired(playlist.createdAt),
+    updated_at: toIsoRequired(playlist.updatedAt),
     track_ids: playlist.trackIds,
   };
 }
@@ -293,7 +307,7 @@ export function lyricsToRow(lyrics: TrackLyrics, userId = ""): CloudLyricsRow {
     skipped_lines: lyrics.skippedLines,
     source_name: lyrics.sourceName,
     origin: lyrics.origin ?? null,
-    updated_at: toIso(lyrics.updatedAt),
+    updated_at: toIsoRequired(lyrics.updatedAt),
   };
 }
 

@@ -699,3 +699,33 @@ describe("Priority 3: Unicode and corrupt filename handling", () => {
     expect(stored?.artist).toBe("穿越時空");
   });
 });
+
+describe("NOT NULL timestamp serialization", () => {
+  beforeEach(() => resetTable());
+
+  it("never sends null timestamps when updatedAt/addedAt are missing", () => {
+    const row = trackToRow(makeTrack({ updatedAt: undefined, addedAt: undefined as unknown as number }), "u-1");
+    for (const key of ["updated_at", "added_at", "last_synced_at"] as const) {
+      expect(typeof row[key]).toBe("string");
+      expect(Number.isNaN(Date.parse(row[key] as string))).toBe(false);
+    }
+  });
+
+  it("preserves a valid updatedAt and addedAt exactly", () => {
+    const row = trackToRow(makeTrack({ updatedAt: 1_700_000_000_000, addedAt: 1_600_000_000_000 }), "u-1");
+    expect(row.updated_at).toBe(new Date(1_700_000_000_000).toISOString());
+    expect(row.added_at).toBe(new Date(1_600_000_000_000).toISOString());
+  });
+
+  it("keeps nullable last_played_at null", () => {
+    expect(trackToRow(makeTrack({ lastPlayedAt: null }), "u-1").last_played_at).toBeNull();
+  });
+
+  it("upserts a track with undefined updatedAt without any null NOT NULL column", async () => {
+    await upsertCloudTracks([makeTrack({ id: "no-updated", updatedAt: undefined })]);
+    const row = [...table.rows.values()].find((r) => r.id === "no-updated")!;
+    expect(row.updated_at).toBeTruthy();
+    expect(row.added_at).toBeTruthy();
+    expect(row.last_synced_at).toBeTruthy();
+  });
+});

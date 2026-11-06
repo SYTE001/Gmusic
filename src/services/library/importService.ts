@@ -571,6 +571,8 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           fileSize: file.size,
           mimeType: file.type || "",
           addedAt: Date.now(),
+          updatedAt: Date.now(),
+          cloudStatus: "local",
           lastPlayedAt: null,
           playCount: 0,
           isLiked: false,

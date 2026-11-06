@@ -1,7 +1,7 @@
 import type { Track } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
-import { getSessionFile, queryHandlePermission } from "../file-access/FileAccessService";
-import { completeUpload, deleteCloudObject, requestUploadUrl, CloudStorageError } from "./r2StorageService";
+import { getSessionFile, queryHandlePermission, requestHandlePermission } from "../file-access/FileAccessService";
+import { completeUpload, deleteCloudObject, getPlayUrl, requestUploadUrl, CloudStorageError } from "./r2StorageService";
 import { upsertCloudTracks } from "./cloudLibraryService";
 
 /**
@@ -121,10 +121,16 @@ export function resolveAudioMimeType(fileName: string, detectedMimeType?: string
  * null when nothing is reachable right now; `planMigration` reports those
  * tracks separately so the user can re-link them.
  */
-export async function resolveLocalAudioForTrack(track: Track): Promise<File | null> {
+export async function resolveLocalAudioForTrack(
+  track: Track,
+  options: { promptForPermission?: boolean } = {},
+): Promise<File | null> {
   const handle = await repository.getHandle(track.id);
   if (handle) {
-    if ((await queryHandlePermission(handle)) !== "granted") return null;
+    let permission = await queryHandlePermission(handle);
+    // Only valid inside a user gesture (the migration is started by a click).
+    if (permission !== "granted" && options.promptForPermission) permission = await requestHandlePermission(handle);
+    if (permission !== "granted") return null;
     try {
       return await handle.getFile();
     } catch {
@@ -196,6 +202,26 @@ function recompute(progress: MigrationProgress): void {
   progress.failed = progress.items.filter((item) => item.status === "failed").length;
   progress.skipped = progress.items.filter((item) => item.status === "missing" || item.status === "needs-access").length;
   progress.done = progress.succeeded + progress.failed;
+}
+
+/**
+ * True when R2 already holds an object under `objectKey` whose byte length
+ * equals the local file's. Probes with a one-byte ranged GET on a fresh play
+ * URL; any failure means "not verified", so the caller uploads normally.
+ */
+async function existingObjectMatches(objectKey: string, expectedSize: number): Promise<boolean> {
+  try {
+    const url = await getPlayUrl(objectKey, { forceFresh: true });
+    const response = await fetch(url, { headers: { range: "bytes=0-0" } });
+    if (response.status === 206) {
+      const total = Number(response.headers.get("content-range")?.split("/")[1]);
+      return total === expectedSize;
+    }
+    if (response.ok) return Number(response.headers.get("content-length")) === expectedSize;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -310,10 +336,13 @@ export async function runMigration(
     progress.currentTitle = track.title;
     emit();
 
-    const file = await resolveLocalAudioForTrack(track);
+    const file = await resolveLocalAudioForTrack(track, { promptForPermission: true });
     if (!file) {
-      item.status = "failed";
-      item.error = "The audio file could not be opened. Use “Locate file” to re-link it, then retry.";
+      const handle = await repository.getHandle(track.id);
+      item.status = handle ? "needs-access" : "failed";
+      item.error = handle
+        ? "File access was not granted. Allow access to the file, then retry."
+        : "The audio file could not be opened. Use “Locate file” to re-link it, then retry.";
       return;
     }
 
@@ -321,7 +350,19 @@ export async function runMigration(
       // The upload MIME type follows the file name, not the blob's own
       // metadata, so a mislabeled `.m4a` is never sent as `audio/mpeg`.
       const mimeType = resolveAudioMimeType(track.fileName, file.type);
-      const objectKey = await uploadOne(track, file, mimeType, "audio");
+      await repository.updateTrack(track.id, { cloudStatus: "uploading" });
+
+      // Retry after a partial failure: the object may already be in R2 with
+      // only the metadata step missing. Reuse it (verified, never re-PUT).
+      let objectKey: string | null = null;
+      if (track.objectKey && (await existingObjectMatches(track.objectKey, file.size))) {
+        objectKey = track.objectKey;
+      } else {
+        objectKey = await uploadOne(track, file, mimeType, "audio");
+        // Remember the verified key before touching Postgres so a database
+        // failure can be retried without uploading the audio a second time.
+        await repository.updateTrack(track.id, { objectKey, storageProvider: "r2", cloudStatus: "uploading" });
+      }
 
       // Artwork follows the audio only after the audio object is verified;
       // a failed artwork upload must not mark the whole track as failed.
@@ -367,7 +408,9 @@ export async function runMigration(
       if (error instanceof CloudStorageError && error.kind === "cancelled") return;
       item.status = "failed";
       item.error = describeFailure(error);
-      // Local data is deliberately untouched on failure.
+      // Local audio is deliberately untouched on failure. Only the status is
+      // recorded; any verified objectKey stays so the retry skips the upload.
+      await repository.updateTrack(track.id, { cloudStatus: "failed" }).catch(() => undefined);
     }
   };
 
