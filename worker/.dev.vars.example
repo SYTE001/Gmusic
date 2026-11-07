@@ -1,0 +1,9 @@
+# Local development secrets for the Worker — COPY to .dev.vars and fill in.
+# .dev.vars is git-ignored. Never commit real values.
+
+R2_ACCOUNT_ID="place-holder-account-id"
+R2_ACCESS_KEY_ID="place-holder-access-key-id"
+R2_SECRET_ACCESS_KEY="place-holder-secret-access-key"
+SUPABASE_URL="https://your-project-ref.supabase.co"
+SUPABASE_JWT_SECRET="place-holder-supabase-jwt-secret"
+SUPABASE_ANON_KEY="place-holder-supabase-anon-key"
