@@ -230,6 +230,37 @@ input[type="range"].app-range::-moz-range-thumb {
   border: none;
 }
 
+/* Vertical range input (volume popover above the mini-player speaker button).
+   writing-mode: vertical-lr + direction: rtl places the minimum at the bottom;
+   the filled portion is painted inline with a bottom-up gradient. */
+input[type="range"].app-range-vertical {
+  -webkit-appearance: none;
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  width: 6px;
+  height: 128px;
+  border-radius: 999px;
+  background: var(--surface-hover);
+  cursor: pointer;
+}
+input[type="range"].app-range-vertical::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  border: none;
+}
+input[type="range"].app-range-vertical::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  border: none;
+}
+
 /* Animations kept minimal and purposeful (PRD §8.5) */
 @keyframes fade-in {
   from {

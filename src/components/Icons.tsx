@@ -110,6 +110,15 @@ export function VolumeIcon({ size, ...props }: IconProps) {
   );
 }
 
+export function VolumeLowIcon({ size, ...props }: IconProps) {
+  return (
+    <svg {...base(size, props)}>
+      <path d="M4 9.5h3l4.5-3.8v12.6L7 14.5H4z" fill="currentColor" stroke="none" />
+      <path d="M15 9.2a4 4 0 0 1 0 5.6" />
+    </svg>
+  );
+}
+
 export function VolumeMuteIcon({ size, ...props }: IconProps) {
   return (
     <svg {...base(size, props)}>
