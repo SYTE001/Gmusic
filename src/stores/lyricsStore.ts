@@ -84,9 +84,11 @@ export const useLyricsStore = create<LyricsState>((set, get) => {
     });
 
     try {
+      const libraryTracks = allTracksLookup();
       const result = await resolveLyricsForTrack(track, {
         force,
         signal: controller.signal,
+        ...(libraryTracks.length > 0 ? { libraryTracks } : {}),
         onProgress: (phase) => {
           if (token === resolutionToken) {
             set({ phase });
@@ -202,9 +204,14 @@ onLyricsResolved((trackId) => {
  * importing the library store (avoids a cycle).
  */
 let trackLookup: (id: string) => Track | undefined = () => undefined;
+let allTracksLookup: () => Track[] = () => [];
 
-export function bindLyricsTrackLookup(lookup: (id: string) => Track | undefined): void {
+export function bindLyricsTrackLookup(
+  lookup: (id: string) => Track | undefined,
+  getAllTracks?: () => Track[],
+): void {
   trackLookup = lookup;
+  if (getAllTracks) allTracksLookup = getAllTracks;
 }
 
 /**

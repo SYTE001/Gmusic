@@ -518,11 +518,17 @@ function describeLyricsError(error: unknown): string {
   return describeLrcmuxError(error);
 }
 
-function deduplicateRecords(records: LyricMatchRecord[]): LyricMatchRecord[] {
+function deduplicateRecords(
+  records: LyricMatchRecord[],
+  canonicalTrack?: Pick<Track, "title" | "artist" | "album" | "durationMs">,
+): LyricMatchRecord[] {
   const result: LyricMatchRecord[] = [];
   for (const record of records) {
     const existingIndex = result.findIndex((existing) => {
       if (existing.id === record.id && existing.provider === record.provider) return true;
+      if (existing.provider && record.provider && existing.provider === record.provider && existing.id !== record.id) {
+        return false;
+      }
       const titleMatch = similarity(record.trackName ?? "", existing.trackName ?? "") >= 0.9;
       const artistMatch =
         !record.artistName || !existing.artistName
@@ -544,6 +550,16 @@ function deduplicateRecords(records: LyricMatchRecord[]): LyricMatchRecord[] {
       const newCap = CAPABILITY_RANK[recordCapability(record)];
       if (newCap > existingCap) {
         result[existingIndex] = record;
+      } else if (newCap === existingCap && canonicalTrack) {
+        const existingQuality = decideMatch(canonicalTrack, existing).quality;
+        const newQuality = decideMatch(canonicalTrack, record).quality;
+        if (
+          newQuality.score > existingQuality.score ||
+          (newQuality.score === existingQuality.score &&
+            (newQuality.durationDeltaSeconds ?? Infinity) < (existingQuality.durationDeltaSeconds ?? Infinity))
+        ) {
+          result[existingIndex] = record;
+        }
       }
     }
   }
@@ -581,7 +597,7 @@ async function fetchFromLrcmux(
     lastError = error;
   }
 
-  if (exactRecord) {
+  if (exactRecord && decideMatch(canonicalTrack, exactRecord).autoAccept) {
     const cap = recordCapability(exactRecord);
     if (cap === "word" || cap === "line") {
       return { records: collected, exactRecord };
@@ -650,6 +666,9 @@ async function fetchFromLrclib(
   const collected: LyricMatchRecord[] = [];
   let exactRecord: LyricMatchRecord | null = null;
   let lastError: unknown = null;
+  const seenQueries = new Set<string>();
+  const markQueryKey = (q: LrclibQuery) =>
+    `${q.trackName ?? ""}|${q.artistName ?? ""}|${q.albumName ?? ""}|${q.q ?? ""}`;
 
   // Stage A — Exact identity
   const queryA: LrclibQuery = {
@@ -670,7 +689,7 @@ async function fetchFromLrclib(
     lastError = error;
   }
 
-  if (exactRecord) {
+  if (exactRecord && decideMatch(canonicalTrack, exactRecord).autoAccept) {
     const cap = recordCapability(exactRecord);
     if (cap === "word" || cap === "line") {
       return { records: collected, exactRecord };
@@ -683,6 +702,7 @@ async function fetchFromLrclib(
     artistName: normalized.artist || undefined,
     albumName: normalized.album || undefined,
   };
+  seenQueries.add(markQueryKey(queryB));
 
   try {
     const resultsB = await lrclibSearch(queryB, signal);
@@ -703,17 +723,13 @@ async function fetchFromLrclib(
     const altQuery: LrclibQuery = {
       trackName: alt.trackName || undefined,
       artistName: alt.artistName || undefined,
+      q: alt.q || undefined,
     };
+    const key = markQueryKey(altQuery);
+    if (seenQueries.has(key)) continue;
+    seenQueries.add(key);
+
     try {
-      const altExact = await lrclibGet(altQuery, signal);
-      if (altExact) {
-        exactRecord = { ...altExact, provider: "lrclib" };
-        collected.push(exactRecord);
-        const cap = recordCapability(exactRecord);
-        if (cap === "word" || cap === "line") {
-          return { records: collected, exactRecord };
-        }
-      }
       const altResults = await lrclibSearch(altQuery, signal);
       if (altResults && altResults.length > 0) {
         for (const r of altResults) {
@@ -761,7 +777,7 @@ async function fetchFromLyricsDb(
     lastError = error;
   }
 
-  if (exactRecord) {
+  if (exactRecord && decideMatch(canonicalTrack, exactRecord).autoAccept) {
     const cap = recordCapability(exactRecord);
     if (cap === "word" || cap === "line") {
       return { records: collected, exactRecord };
@@ -830,7 +846,7 @@ async function resolveLyrics(
     ...track,
     title: normalized.title,
     artist: normalized.artist,
-    album: normalized.album ?? track.album,
+    album: normalized.album ?? "",
   };
 
   options.onProgress?.("searching");
@@ -942,7 +958,7 @@ async function resolveLyrics(
   void Promise.allSettled(providerTasks).then(async () => {
     if (!timedOut && !options.signal?.aborted) return;
     try {
-      const lateDeduplicated = deduplicateRecords(allCollectedRecords);
+      const lateDeduplicated = deduplicateRecords(allCollectedRecords, canonicalTrack);
       const lateRanked = rankCandidates(canonicalTrack, lateDeduplicated);
       for (const candidate of lateRanked) {
         const currentLyrics = (await repository.getLyrics(track.id)) ?? null;
@@ -992,13 +1008,19 @@ async function resolveLyrics(
   }
 
   // 2. Evaluate search candidates: auto-accept if synchronized
-  const deduplicated = deduplicateRecords(allCollectedRecords);
+  const deduplicated = deduplicateRecords(allCollectedRecords, canonicalTrack);
   const ranked = rankCandidates(canonicalTrack, deduplicated);
+  const hasAnySyncedCandidate = ranked.some((c) => c.hasSynced);
 
   for (const candidate of ranked) {
     const consideration = considerRecord(canonicalTrack, candidate.record, cached, minCapabilityRank);
     if (!consideration) continue;
-    if (consideration.capability === "plain") continue;
+    if (consideration.capability === "plain") {
+      if (!plainFallback && !hasAnySyncedCandidate) {
+        plainFallback = { lyrics: consideration.lyrics, record: candidate.record };
+      }
+      continue;
+    }
     options.onProgress?.("validating");
     const lyrics = await persistAttached(track, consideration.lyrics, candidate.record, options.onProgress);
     recordSearchDiagnostic({
@@ -1062,7 +1084,7 @@ async function resolveLyrics(
       finalSelectedProvider: "none",
       finalCapability: "none",
     });
-    if (providerErrors.length > 0 && allCollectedRecords.length === 0) {
+    if (providerErrors.length > 0) {
       return { outcome: "error", message: describeLyricsError(providerErrors[0]) };
     }
     await repository.putLyricsCacheMeta({
@@ -1159,8 +1181,6 @@ export async function resolveLyricsForTrack(
           // Accepted marker without lyrics (e.g. cleared separately) — fall through.
         } else if (meta.status === "not-found") {
           if (Date.now() - meta.checkedAt < LYRICS_NOT_FOUND_TTL_MS) return { outcome: "skipped-recently" };
-        } else if (meta.status === "needs-selection") {
-          return { outcome: "skipped-recently" };
         }
       }
     }

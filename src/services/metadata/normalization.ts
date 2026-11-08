@@ -52,6 +52,8 @@ const BRACKETED_SEGMENT_REGEX = /\(([^()]*)\)|\[([^\][]*)\]|\{([^{}]*)\}/g;
 /** Pure noise patterns inside or outside brackets */
 const NOISE_PATTERNS = [
   /official\s+(?:music\s+)?video/i,
+  /\bmusic\s+video\b/i,
+  /^(?:official\s+)?video$/i,
   /dance\s+performance\s+video/i,
   /official\s+visualizer/i,
   /visualizer/i,
@@ -227,6 +229,7 @@ export function cleanNoiseFromText(input: string): {
   // Unbracketed video descriptors
   const unbracketedNoise = [
     /\b(?:official\s+music\s+video|official\s+video|dance\s+performance\s+video|official\s+audio|official\s+visualizer|lyric\s+video|lyrics\s+video)\b/gi,
+    /\s+\bmusic\s+video$/i,
     /\s+-\s+(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?$/i,
     /\b(?:remastered|remaster)\b$/i,
     /\b(?:hd|4k|1080p|720p|hq)\b/gi,
@@ -400,10 +403,6 @@ export function normalizeTrackMetadata(
   track: Pick<Track, "title" | "artist" | "album" | "durationMs" | "fileName">,
   context?: { libraryTracks?: Track[] },
 ): NormalizedIdentity {
-  const cacheKey = `${track.fileName}:${track.title}:${track.artist}:${track.album}:${track.durationMs ?? 0}`;
-  const cached = normalizedMetadataCache.get(cacheKey);
-  if (cached) return cached;
-
   const knownArtists = new Set<string>();
   if (context?.libraryTracks) {
     for (const t of context.libraryTracks) {
@@ -412,6 +411,10 @@ export function normalizeTrackMetadata(
       }
     }
   }
+
+  const cacheKey = `${track.fileName}:${track.title}:${track.artist}:${track.album}:${track.durationMs ?? 0}:${knownArtists.size}`;
+  const cached = normalizedMetadataCache.get(cacheKey);
+  if (cached) return cached;
 
   const rawTitle = track.title ?? "";
   const rawArtist = track.artist ?? "";
@@ -447,11 +450,22 @@ export function normalizeTrackMetadata(
     // Artist tag is present and valid, but title itself contains "Artist - Title" delimiter
     const extracted = extractArtistAndTitle(detectedTitle, {
       knownArtists,
-      tags: { title: rawTitle, artist: rawArtist },
+      tags: { artist: rawArtist },
     });
-    if (extracted.artist) {
-      detectedArtist = extracted.artist;
-      detectedTitle = extracted.title;
+    const extractedArtistNorm = normalizeForSearch(extracted.artist);
+    const detectedArtistNorm = normalizeForSearch(detectedArtist);
+    const extractedPrimaryNorm = normalizeForSearch(extractPrimaryArtist(extracted.artist));
+    const detectedPrimaryNorm = normalizeForSearch(extractPrimaryArtist(detectedArtist));
+    const matchesExistingArtist =
+      Boolean(extractedArtistNorm && detectedArtistNorm) &&
+      (extractedArtistNorm === detectedArtistNorm || extractedPrimaryNorm === detectedPrimaryNorm);
+    if (extracted.artist && (matchesExistingArtist || extracted.confidence >= 0.85)) {
+      if (matchesExistingArtist) {
+        detectedTitle = extracted.title;
+      } else {
+        detectedArtist = extracted.artist;
+        detectedTitle = extracted.title;
+      }
       isFlipped = extracted.isFlipped;
     }
   } else {
@@ -471,14 +485,14 @@ export function normalizeTrackMetadata(
 
     let fileSuggestsFlipped = false;
     if (DELIMITER_REGEX.test(rawFileName)) {
-      const fileExtracted = extractArtistAndTitle(rawFileName, { knownArtists });
-      if (fileExtracted.artist && fileExtracted.title) {
+      const fileExtracted = extractArtistAndTitle(rawFileName, {
+        knownArtists,
+        tags: { title: rawTitle, artist: rawArtist },
+      });
+      if (fileExtracted.artist && fileExtracted.title && fileExtracted.confidence >= 0.85) {
         const fileArtistNorm = normalizeForSearch(fileExtracted.artist);
         const fileTitleNorm = normalizeForSearch(fileExtracted.title);
-        if (
-          (fileArtistNorm === titleNorm || fileArtistNorm.includes(titleNorm) || titleNorm.includes(fileArtistNorm)) &&
-          (fileTitleNorm === artistNorm || fileTitleNorm.includes(artistNorm) || artistNorm.includes(fileTitleNorm))
-        ) {
+        if (fileArtistNorm === titleNorm && fileTitleNorm === artistNorm) {
           fileSuggestsFlipped = true;
         }
       }

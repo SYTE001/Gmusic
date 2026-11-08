@@ -85,12 +85,14 @@ function canonicalizeForMatch(input: string): string {
   const dashSplit = text.split(/\s+-\s+/);
   if (
     dashSplit.length > 1 &&
-    /(remaster|live|deluxe|version|edit|mono|stereo|anniversary|edition|single|album|explicit|bonus|acoustic|demo|instrumental|remix|extended|\d{4})/.test(
+    /(remaster|live|deluxe|version|edit|mono|stereo|anniversary|edition|single|album|explicit|bonus|acoustic|demo|instrumental|remix|extended|topic|video|\d{4})/.test(
       dashSplit[dashSplit.length - 1],
     )
   ) {
     text = dashSplit.slice(0, -1).join(" - ");
   }
+  text = text.replace(/\b(?:official\s+music\s+video|official\s+video|music\s+video|lyric\s+video|lyrics\s+video|official\s+audio)\b/g, " ");
+  text = text.replace(/\s+\b(?:topic|vevo)\b$/g, " ");
   text = text.replace(PUNCTUATION, " ").replace(WHITESPACE, " ").trim();
   return text.length > 0 ? text : plain;
 }
@@ -131,24 +133,79 @@ export function artistSimilarity(a: string, b: string): number {
 
 /**
  * Computes duration compatibility score (PRD §5: 15% weight).
- * Treats duration as a compatibility signal rather than an absolute rejection,
- * smoothly accommodating video intros, outros, and alternate edits.
+ * - 0–2 seconds: strong match (1.0)
+ * - 3–5 seconds: acceptable candidate, subject to metadata verification (0.85–0.92)
+ * - Above 5 seconds: lower confidence
  */
 export function durationScore(deltaSeconds: number): number {
-  if (deltaSeconds <= 3) return 1.0;
-  if (deltaSeconds <= 15) return Math.max(0.75, 1 - (deltaSeconds - 3) / 48);
-  if (deltaSeconds <= 60) return Math.max(0.25, 0.75 - ((deltaSeconds - 15) / 45) * 0.5);
-  if (deltaSeconds <= 120) return Math.max(0.05, 0.25 - ((deltaSeconds - 60) / 60) * 0.2);
+  if (deltaSeconds <= 2) return Math.max(0.96, 1.0 - deltaSeconds * 0.015);
+  if (deltaSeconds <= 5) return Math.max(0.85, 0.92 - ((deltaSeconds - 2) / 3) * 0.07);
+  if (deltaSeconds <= 15) return Math.max(0.55, 0.80 - ((deltaSeconds - 5) / 10) * 0.25);
+  if (deltaSeconds <= 60) return Math.max(0.20, 0.55 - ((deltaSeconds - 15) / 45) * 0.35);
+  if (deltaSeconds <= 120) return Math.max(0.05, 0.20 - ((deltaSeconds - 60) / 60) * 0.15);
   return 0;
+}
+
+const EMBEDDED_DELIMITER = /\s+[-–—|~_]\s+/;
+
+function titleSimilarityWithArtistPrefixStripped(
+  trackTitle: string,
+  trackArtist: string,
+  recordTrackName: string,
+  recordArtistName: string,
+): number {
+  const baseSim = similarity(trackTitle, recordTrackName);
+  if (baseSim >= 0.95) return baseSim;
+
+  const match = recordTrackName.match(EMBEDDED_DELIMITER);
+  if (!match || match.index === undefined) return baseSim;
+
+  const part0 = recordTrackName.slice(0, match.index).trim();
+  const part1 = recordTrackName.slice(match.index + match[0].length).trim();
+  const refArtist = trackArtist || recordArtistName;
+
+  if (refArtist) {
+    if (artistSimilarity(part0, refArtist) >= 0.85) {
+      return Math.max(baseSim, similarity(trackTitle, part1) * 0.98);
+    }
+    if (artistSimilarity(part1, refArtist) >= 0.85) {
+      return Math.max(baseSim, similarity(trackTitle, part0) * 0.98);
+    }
+  }
+  return baseSim;
 }
 
 export function evaluateMatch(
   track: Pick<Track, "title" | "artist" | "album" | "durationMs">,
   record: Pick<LyricMatchRecord, "trackName" | "artistName" | "albumName" | "duration">,
 ): MatchQuality {
-  let titleSim = similarity(track.title, record.trackName ?? "");
-  const artistSim =
+  const recordTrackName = record.trackName ?? "";
+  const recordArtistName = record.artistName ?? "";
+
+  let titleSim = titleSimilarityWithArtistPrefixStripped(
+    track.title,
+    track.artist,
+    recordTrackName,
+    recordArtistName,
+  );
+  let artistSim =
     track.artist && record.artistName ? artistSimilarity(track.artist, record.artistName) : null;
+
+  // Support reversed track metadata (where track.title holds artist and track.artist holds song title)
+  if ((titleSim < 0.5 || (artistSim !== null && artistSim < 0.5)) && track.artist && record.artistName) {
+    const swappedTitleSim = titleSimilarityWithArtistPrefixStripped(
+      track.artist,
+      track.title,
+      recordTrackName,
+      recordArtistName,
+    );
+    const swappedArtistSim = artistSimilarity(track.title, record.artistName);
+    if (swappedTitleSim >= 0.85 && swappedArtistSim >= 0.85) {
+      titleSim = swappedTitleSim;
+      artistSim = swappedArtistSim;
+    }
+  }
+
   const albumSim =
     track.album && record.albumName ? similarity(track.album, record.albumName) : null;
   const durationDeltaSeconds =
@@ -158,7 +215,7 @@ export function evaluateMatch(
 
   // Check version qualifiers (Case D: Live Acoustic vs Studio)
   const trackQualifiers = extractVersionQualifiers(track.title);
-  const recordQualifiers = extractVersionQualifiers(record.trackName ?? "");
+  const recordQualifiers = extractVersionQualifiers(recordTrackName);
   let versionMismatch = false;
 
   if (trackQualifiers.size > 0) {
@@ -171,28 +228,28 @@ export function evaluateMatch(
     }
   }
 
-  // PRD §5 Weights:
-  // Track title: 40%
-  // Artist identity: 35%
-  // Duration compatibility: 15%
-  // Album: 10%
-  let score = titleSim * 40;
-  let maxScore = 40;
+  // Weighted matching strategy:
+  // - Exact normalized title: Highest (45)
+  // - Exact normalized artist: Highest (40)
+  // - Duration difference: High (15)
+  // - Album metadata: Low (bonus/tie-breaker weight 5 when matching, 3 when differing)
+  let score = titleSim * 45;
+  let maxScore = 45;
 
   if (artistSim !== null) {
-    score += artistSim * 35;
-    maxScore += 35;
-  }
-  if (albumSim !== null) {
-    score += albumSim * 10;
-    maxScore += 10;
+    score += artistSim * 40;
+    maxScore += 40;
   }
   if (durationDeltaSeconds !== null) {
     score += durationScore(durationDeltaSeconds) * 15;
     maxScore += 15;
   }
+  if (albumSim !== null && albumSim >= 0.5) {
+    score += albumSim * 5;
+    maxScore += 5;
+  }
 
-  const rawTitleSimilarity = rawSimilarity(track.title, record.trackName ?? "");
+  const rawTitleSimilarity = rawSimilarity(track.title, recordTrackName);
   let rejected = false;
   let rejectReason: string | undefined;
 
@@ -299,7 +356,9 @@ export function rankCandidates(
       }
       const capabilityDiff = CAPABILITY_RANK[b.capability] - CAPABILITY_RANK[a.capability];
       if (capabilityDiff !== 0) return capabilityDiff;
-      return b.quality.score - a.quality.score;
+      const scoreDiff = b.quality.score - a.quality.score;
+      if (scoreDiff !== 0) return scoreDiff;
+      return (a.quality.durationDeltaSeconds ?? Infinity) - (b.quality.durationDeltaSeconds ?? Infinity);
     })
     .slice(0, 12);
 }

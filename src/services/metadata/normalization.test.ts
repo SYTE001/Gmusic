@@ -300,4 +300,35 @@ describe("normalizeTrackMetadata", () => {
     );
     expect(normalizedRealAlbum.album).toBe("Diamond Life");
   });
+
+  it("cleans Music Video tags and preserves valid title/artist when filename is Title - Artist", () => {
+    expect(cleanNoiseFromText("Smooth Operator (Music Video)").cleaned).toBe("Smooth Operator");
+    expect(cleanNoiseFromText("Justin Bieber Music Video").cleaned).toBe("Justin Bieber");
+
+    const normalized = normalizeTrackMetadata(
+      makeTrack({
+        title: "Flatline",
+        artist: "Justin Bieber",
+        album: "Journals",
+        durationMs: 219000,
+        fileName: "Flatline - Justin Bieber.mp3",
+      }),
+    );
+    expect(normalized.title).toBe("Flatline");
+    expect(normalized.artist).toBe("Justin Bieber");
+  });
+
+  it("does not overwrite valid artist when title contains a hyphenated subtitle", () => {
+    const normalized = normalizeTrackMetadata(
+      makeTrack({
+        title: "Flatline - Complete My Journals",
+        artist: "Justin Bieber",
+        album: "Journals",
+        durationMs: 219000,
+        fileName: "01 Flatline.mp3",
+      }),
+    );
+    expect(normalized.artist).toBe("Justin Bieber");
+    expect(normalized.title).toBe("Flatline - Complete My Journals");
+  });
 });

@@ -194,7 +194,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
         if (state.queueTrackIds !== prev.queueTrackIds) schedulePlaybackSessionPersist();
       });
     }
-    bindLyricsTrackLookup((id) => get().tracks.find((track) => track.id === id));
+    bindLyricsTrackLookup(
+      (id) => get().tracks.find((track) => track.id === id),
+      () => get().tracks,
+    );
     bindPlaybackHelpers({
       getTrackForPlayback: async (id) => get().tracks.find((track) => track.id === id),
       currentTrack: () => {

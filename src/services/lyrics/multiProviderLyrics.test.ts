@@ -622,4 +622,175 @@ describe("Multi-Provider Lyrics Integration (LRCmux + LRCLIB + LyricsDB)", () =>
     expect(diag?.providers.lrclib).toBeDefined();
     expect(diag?.providers.lrclib?.status).toBe(200);
   });
+
+  // 23. Primary reproduction case: Flatline — Justin Bieber — 3:39 (219s) with LRCLIB search results
+  it("resolves Flatline — Justin Bieber (3:39) from LRCLIB search candidates including 3:39, 3:38 (Music Video), and 3:40", async () => {
+    const flatlineTrack = makeTrack({
+      id: "flatline-jb",
+      title: "Flatline",
+      artist: "Justin Bieber",
+      album: "Complete My Journals",
+      durationMs: 219000, // 3:39
+      fileName: "Flatline - Justin Bieber.mp3",
+    });
+
+    const lrclibCandidates: LrclibRecord[] = [
+      makeLrclibRecord({
+        id: 21210247,
+        trackName: "Justin Bieber - Flatline (Music Video)",
+        artistName: "Justin Bieber Music Video",
+        albumName: null,
+        duration: 218, // 3:38
+        syncedLyrics: "[00:14.20] Now I'm not usually this way\n[00:18.00] Flatline",
+      }),
+      makeLrclibRecord({
+        id: 12306605,
+        trackName: "Flatline",
+        artistName: "Justin Bieber",
+        albumName: "Justin Bieber Videos",
+        duration: 220, // 3:40
+        syncedLyrics: "[00:14.50] Now I'm not usually this way\n[00:18.30] Flatline",
+      }),
+      makeLrclibRecord({
+        id: 10391079,
+        trackName: "Flatline",
+        artistName: "Justin Bieber",
+        albumName: "Justin Bieber",
+        duration: 219, // 3:39
+        syncedLyrics: "[00:14.37] Now I'm not usually this way\n[00:18.10] Flatline",
+      }),
+    ];
+
+    // /get 404s due to album difference ("Complete My Journals" vs LRCLIB catalog), /search returns the 3 candidates
+    mockLrclibGet.mockResolvedValue(null);
+    mockLrclibSearch.mockResolvedValue(lrclibCandidates);
+
+    const result = await resolveLyricsForTrack(flatlineTrack);
+    expect(result.outcome).toBe("attached");
+    if (result.outcome === "attached") {
+      expect(result.lyrics.origin?.kind).toBe("lrclib");
+      expect(result.lyrics.origin?.capability).toBe("line");
+      // Exact 3:39 (219s) candidate with exact title/artist is selected over 3:38 Music Video and 3:40
+      expect(result.lyrics.origin?.recordId).toBe(10391079);
+    }
+  });
+
+  // 24. Flatline — Justin Bieber when only the 3:38 (Music Video) entry or reversed tags are present
+  it("resolves Flatline — Justin Bieber when LRCLIB returns 'Justin Bieber - Flatline (Music Video)' (3:38) or when tags are reversed", async () => {
+    const reversedFlatline = makeTrack({
+      id: "flatline-reversed",
+      title: "Justin Bieber",
+      artist: "Flatline",
+      album: "",
+      durationMs: 219000,
+      fileName: "Flatline - Justin Bieber.mp3",
+    });
+
+    mockLrclibSearch.mockImplementation(async (q) => {
+      if (q.trackName === "Flatline" && q.artistName === "Justin Bieber") {
+        return [
+          makeLrclibRecord({
+            id: 21210247,
+            trackName: "Justin Bieber - Flatline (Music Video)",
+            artistName: "Justin Bieber Music Video",
+            albumName: null,
+            duration: 218,
+            syncedLyrics: "[00:14.20] Now I'm not usually this way",
+          }),
+        ];
+      }
+      return [];
+    });
+
+    const result = await resolveLyricsForTrack(reversedFlatline);
+    expect(result.outcome).toBe("attached");
+    if (result.outcome === "attached") {
+      expect(result.lyrics.origin?.recordId).toBe(21210247);
+      expect(result.lyrics.origin?.capability).toBe("line");
+    }
+  });
+
+  // 25. Synced lyrics unavailable but plain lyrics available in search results
+  it("falls back to plain lyrics when synced lyrics are unavailable in search results", async () => {
+    const track = makeTrack({
+      id: "plain-only-search",
+      title: "Flatline",
+      artist: "Justin Bieber",
+      durationMs: 219000,
+    });
+
+    mockLrclibGet.mockResolvedValue(null);
+    mockLrclibSearch.mockResolvedValue([
+      makeLrclibRecord({
+        id: 555,
+        trackName: "Flatline",
+        artistName: "Justin Bieber",
+        duration: 219,
+        syncedLyrics: null,
+        plainLyrics: "Now I'm not usually this way\nFlatline plain lyrics",
+      }),
+    ]);
+
+    const result = await resolveLyricsForTrack(track);
+    expect(result.outcome).toBe("attached");
+    if (result.outcome === "attached") {
+      expect(result.lyrics.origin?.capability).toBe("plain");
+      expect(result.lyrics.format).toBe("txt");
+    }
+  });
+
+  // 26. Unrelated secondary provider hit does not mask primary provider timeout/network error as not-found
+  it("returns error instead of caching not-found when LRCLIB/LRCmux fail and LyricsDB returns an unrelated song", async () => {
+    const track = makeTrack({
+      id: "flatline-err",
+      title: "Flatline",
+      artist: "Justin Bieber",
+      durationMs: 219000,
+    });
+
+    mockLrcmuxGet.mockRejectedValue(new LrcmuxError("timeout", "LRCmux timed out"));
+    mockLrcmuxSearch.mockRejectedValue(new LrcmuxError("timeout", "LRCmux timed out"));
+    mockLrclibGet.mockRejectedValue(new LrclibError("timeout", "LRCLIB request timed out."));
+    mockLrclibSearch.mockRejectedValue(new LrclibError("timeout", "LRCLIB request timed out."));
+    // LyricsDB returns an unrelated song matching the keyword "Flatline"
+    mockLyricsDbSearch.mockResolvedValue([
+      makeLyricsDbRecord({
+        id: "unrelated-dixie",
+        trackName: "Just Be Friends",
+        artistName: "Megurine Luka, Dixie Flatline",
+        duration: 302,
+      }),
+    ]);
+
+    const result = await resolveLyricsForTrack(track);
+    expect(result.outcome).toBe("error");
+    const meta = await repository.getLyricsCacheMeta(track.id);
+    expect(meta).toBeUndefined();
+  });
+
+  // 27. Case, punctuation, featuring artist, and 1-2s duration differences
+  it("matches across capitalization, punctuation, featuring artists, and 1-2s duration differences", async () => {
+    const track = makeTrack({
+      id: "case-punct-feat",
+      title: "FLATLINE! (feat. Someone)",
+      artist: "justin bieber",
+      durationMs: 219000,
+    });
+
+    mockLrclibSearch.mockResolvedValue([
+      makeLrclibRecord({
+        id: 12306605,
+        trackName: "Flatline",
+        artistName: "Justin Bieber",
+        duration: 221, // +2s difference
+        syncedLyrics: "[00:14.50] Now I'm not usually this way",
+      }),
+    ]);
+
+    const result = await resolveLyricsForTrack(track);
+    expect(result.outcome).toBe("attached");
+    if (result.outcome === "attached") {
+      expect(result.lyrics.origin?.recordId).toBe(12306605);
+    }
+  });
 });

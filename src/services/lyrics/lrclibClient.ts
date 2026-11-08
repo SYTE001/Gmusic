@@ -46,6 +46,7 @@ export type LrclibQuery = {
   albumName?: string;
   /** Seconds. */
   duration?: number;
+  q?: string;
 };
 
 export class LrclibError extends Error {
@@ -141,8 +142,12 @@ export function cancelQueuedJobs(): void {
 
 // -- HTTP core ----------------------------------------------------------------
 
-function buildUrl(path: string, params: Record<string, string | number | undefined>): string {
-  const base = getLrclibBaseUrl().replace(/\/$/, "");
+function buildUrl(
+  path: string,
+  params: Record<string, string | number | undefined>,
+  baseOverride?: string,
+): string {
+  const base = (baseOverride ?? getLrclibBaseUrl()).replace(/\/$/, "");
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   const url = new URL(`${base}${normalizedPath}`);
   for (const [key, value] of Object.entries(params)) {
@@ -152,7 +157,11 @@ function buildUrl(path: string, params: Record<string, string | number | undefin
   return url.toString();
 }
 
-async function fetchWithTimeout(url: string, signal: AbortSignal | undefined): Promise<Response> {
+async function fetchWithTimeout(
+  url: string,
+  signal: AbortSignal | undefined,
+  includeCustomHeader = true,
+): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new DOMException("Timeout", "TimeoutError")), requestTimeoutMs);
   const onExternalAbort = () => controller.abort(signal?.reason);
@@ -160,7 +169,9 @@ async function fetchWithTimeout(url: string, signal: AbortSignal | undefined): P
   try {
     return await transport(url, {
       method: "GET",
-      headers: { "Lrclib-Client": `local-music/${APP_VERSION} (personal offline music player)` },
+      headers: includeCustomHeader
+        ? { "Lrclib-Client": `local-music/${APP_VERSION} (personal offline music player)` }
+        : {},
       signal: controller.signal,
     });
   } finally {
@@ -178,6 +189,8 @@ async function requestJson<T>(
     throw new LrclibError("offline", "Device is offline.");
   }
   const url = buildUrl(path, params);
+  const canFallbackToDirect =
+    !hasCustomTransport && !customBaseUrl && getLrclibBaseUrl() === LRCLIB_DEFAULT_WORKER_URL;
 
   // Collapse duplicate in-flight requests for the same URL.
   const existing = inFlightByUrl.get(url);
@@ -187,7 +200,11 @@ async function requestJson<T>(
     for (let attemptIndex = 0; attemptIndex < MAX_ATTEMPTS; attemptIndex += 1) {
       if (signal?.aborted) throw new LrclibError("aborted", "Cancelled before dispatch.");
       try {
-        const response = await fetchWithTimeout(url, signal);
+        let response = await fetchWithTimeout(url, signal, true);
+        if ((response.status === 403 || response.status >= 500) && canFallbackToDirect) {
+          const directUrl = buildUrl(path, params, LRCLIB_BASE_URL);
+          response = await fetchWithTimeout(directUrl, signal, false);
+        }
         if (response.status === 404) return null;
         if (response.status === 429) {
           const retryAfterHeader = response.headers.get("Retry-After");
@@ -222,6 +239,18 @@ async function requestJson<T>(
       } catch (error) {
         if (error instanceof LrclibError) throw error;
         if (signal?.aborted) throw new LrclibError("aborted", "Cancelled.", { cause: error });
+        if (canFallbackToDirect) {
+          try {
+            const directUrl = buildUrl(path, params, LRCLIB_BASE_URL);
+            const fallbackRes = await fetchWithTimeout(directUrl, signal, false);
+            if (fallbackRes.status === 404) return null;
+            if (fallbackRes.ok) {
+              return (await fallbackRes.json()) as T;
+            }
+          } catch {
+            // Fall through to normal retry/error handling
+          }
+        }
         if (error instanceof DOMException && error.name === "TimeoutError") {
           if (attemptIndex === MAX_ATTEMPTS - 1) throw new LrclibError("timeout", "LRCLIB request timed out.", { cause: error });
           await sleep(retryDelaysMs[attemptIndex] ?? 1500, signal);
@@ -250,7 +279,43 @@ async function requestJson<T>(
 function isValidRecord(value: unknown): value is LrclibRecord {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;
-  return typeof record.id === "number" && (typeof record.trackName === "string" || record.trackName === null);
+  return (
+    typeof record.id === "number" &&
+    (typeof record.trackName === "string" || record.trackName === null || typeof record.name === "string")
+  );
+}
+
+function sanitizeRecord(raw: LrclibRecord): LrclibRecord {
+  const trackName =
+    typeof raw.trackName === "string" && raw.trackName.trim().length > 0
+      ? raw.trackName.trim()
+      : typeof raw.name === "string" && raw.name.trim().length > 0
+        ? raw.name.trim()
+        : null;
+  const artistName = typeof raw.artistName === "string" && raw.artistName.trim().length > 0 ? raw.artistName.trim() : null;
+  const albumName = typeof raw.albumName === "string" && raw.albumName.trim().length > 0 ? raw.albumName.trim() : null;
+  const numDuration = typeof raw.duration === "number" ? raw.duration : Number(raw.duration);
+  const duration = raw.duration != null && Number.isFinite(numDuration) && numDuration > 0 ? numDuration : null;
+  const plainLyrics =
+    typeof raw.plainLyrics === "string" && raw.plainLyrics.trim().length > 0 ? raw.plainLyrics : null;
+  const syncedLyrics =
+    typeof raw.syncedLyrics === "string" && raw.syncedLyrics.trim().length > 0 ? raw.syncedLyrics : null;
+  const lyricsfile =
+    typeof raw.lyricsfile === "string" && raw.lyricsfile.trim().length > 0 ? raw.lyricsfile : null;
+
+  return {
+    ...raw,
+    trackName,
+    artistName,
+    albumName,
+    duration,
+    instrumental: Boolean(raw.instrumental),
+    hasWordSync: Boolean(raw.hasWordSync),
+    plainLyrics,
+    syncedLyrics,
+    lyricsfile,
+    provider: "lrclib",
+  };
 }
 
 // -- Public API ---------------------------------------------------------------
@@ -261,27 +326,30 @@ export async function lrclibGet(query: LrclibQuery, signal?: AbortSignal): Promi
     track_name: query.trackName,
     artist_name: query.artistName,
     album_name: query.albumName,
-    duration: query.duration,
+    duration: query.duration != null ? Math.round(query.duration) : undefined,
   }, signal);
   if (data === null) return null;
   if (!isValidRecord(data)) throw new LrclibError("malformed", "LRCLIB /get returned an unexpected shape.");
-  return { ...data, provider: "lrclib" };
+  return sanitizeRecord(data);
 }
 
 /** Free-text / field search. Returns ranked-by-server candidates (unvalidated). */
 export async function lrclibSearch(query: LrclibQuery, signal?: AbortSignal): Promise<LrclibRecord[]> {
+  const combinedQ =
+    query.q || (query.trackName ? `${query.trackName} ${query.artistName ?? ""}`.trim() : query.artistName);
   const data = await requestJson<unknown>("/search", {
-    q: query.trackName ? `${query.trackName} ${query.artistName ?? ""}`.trim() : undefined,
+    q: combinedQ || undefined,
     track_name: query.trackName,
     artist_name: query.artistName,
     album_name: query.albumName,
   }, signal);
   if (data === null) return [];
   if (!Array.isArray(data)) throw new LrclibError("malformed", "LRCLIB /search returned an unexpected shape.");
-  return data.filter(isValidRecord).map((r) => ({ ...r, provider: "lrclib" as const }));
+  return data.filter(isValidRecord).map(sanitizeRecord);
 }
 
 /** Injectable transport so tests can stub the network without touching global fetch. */
+let hasCustomTransport = false;
 let transport: (url: string, init?: RequestInit) => Promise<Response> = (url, init) =>
   fetch(url, init);
 
@@ -289,6 +357,7 @@ let transport: (url: string, init?: RequestInit) => Promise<Response> = (url, in
 export const __testHooks = {
   setTransport(replacement: ((url: string, init?: RequestInit) => Promise<Response>) | null): void {
     const restore: (url: string, init?: RequestInit) => Promise<Response> = (url, init) => fetch(url, init);
+    hasCustomTransport = replacement !== null;
     transport = replacement ?? restore;
   },
   setTimers(timers: { queueGapMs?: number; retryDelaysMs?: number[]; requestTimeoutMs?: number; rateLimitWaitCapMs?: number }): void {

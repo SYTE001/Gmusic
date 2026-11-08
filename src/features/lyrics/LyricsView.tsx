@@ -475,16 +475,28 @@ export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
                             ? "Saving lyrics…"
                             : "Searching lyrics…"
                 : discoveryTrackId === track.id && discoveryStatus === "error"
-                  ? "Couldn’t load lyrics"
+                  ? errorMessage?.toLowerCase().includes("unexpected")
+                    ? "Invalid lyrics response"
+                    : "Couldn’t load lyrics"
                   : discoveryTrackId === track.id && discoveryStatus === "offline"
                     ? "Offline — nothing cached for this song"
-                    : discoveryTrackId === track.id && discoveryStatus === "not-found"
-                      ? "No reliable match found"
-                      : "No lyrics yet"}
+                    : discoveryTrackId === track.id && discoveryStatus === "needs-selection"
+                      ? "Multiple possible matches found"
+                      : discoveryTrackId === track.id && discoveryStatus === "not-found"
+                        ? "No reliable match found"
+                        : "No lyrics yet"}
             </p>
             <p className="mt-1 max-w-sm text-xs text-text-secondary">
-              Import an <code>.lrc</code> file with timestamps for synced lyrics, or a <code>.txt</code> for plain text.
-              Online, matching lyrics from LRCmux, LRCLIB and LyricsDB are found automatically.
+              {discoveryTrackId === track.id && discoveryStatus === "error" && errorMessage ? (
+                errorMessage
+              ) : discoveryTrackId === track.id && discoveryStatus === "needs-selection" ? (
+                "Select the matching lyrics from the candidates found online, or import a local file."
+              ) : (
+                <>
+                  Import an <code>.lrc</code> file with timestamps for synced lyrics, or a <code>.txt</code> for plain text.
+                  Online, matching lyrics from LRCmux, LRCLIB and LyricsDB are found automatically.
+                </>
+              )}
             </p>
           </div>
           <div className="flex flex-wrap items-center justify-center gap-2">
@@ -643,6 +655,8 @@ export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
               </span>
             ) : discoveryTrackId === track.id && discoveryStatus === "error" ? (
               <span className="text-danger">{errorMessage ?? "Lyrics lookup failed"}</span>
+            ) : discoveryTrackId === track.id && discoveryStatus === "needs-selection" ? (
+              <span>Select a matching lyrics candidate</span>
             ) : discoveryTrackId === track.id && discoveryStatus === "not-found" ? (
               <span>No reliable match found</span>
             ) : (
