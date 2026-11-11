@@ -15,7 +15,7 @@ describe("IntroSplash", () => {
     delete document.documentElement.dataset.motion;
   });
 
-  it("renders the official mark geometry and wordmark on a decorative overlay", () => {
+  it("renders the official mark geometry on a black decorative overlay", () => {
     const { container } = render(<IntroSplash />);
     const splash = container.firstElementChild as HTMLElement;
 
@@ -23,20 +23,23 @@ describe("IntroSplash", () => {
     expect(splash.getAttribute("role")).toBe("presentation");
     expect(splash.getAttribute("data-phase")).toBe("play");
 
-    // The svg frames the official mark bounds and reuses its exact beam path.
+    // The svg frames the official mark bounds and reuses its exact shapes.
     const svg = splash.querySelector("svg");
     expect(svg?.getAttribute("viewBox")).toBe("196 112 206 258");
-    expect(svg?.querySelectorAll("rect")).toHaveLength(7); // 7 waveform bars
+    expect(svg?.querySelectorAll("path")).toHaveLength(1);
     expect(svg?.querySelector("path")?.getAttribute("d")).toBe("M322 118l-118 26v40l118-26z");
+    expect(svg?.querySelectorAll("rect")).toHaveLength(1);
+    expect(svg?.querySelectorAll("circle")).toHaveLength(2);
 
-    expect(splash.textContent).toContain("Gmusic");
+    // No text in the intro composition.
+    expect(splash.textContent?.trim()).toBe("");
   });
 
-  it("unmounts itself after the settle (2.5s) and handoff fade (340ms)", () => {
+  it("unmounts itself after the hold (3.75s) and handoff fade (250ms)", () => {
     const { container } = render(<IntroSplash />);
 
     act(() => {
-      vi.advanceTimersByTime(2499);
+      vi.advanceTimersByTime(3749);
     });
     expect(container.firstElementChild?.getAttribute("data-phase")).toBe("play");
 
@@ -46,7 +49,7 @@ describe("IntroSplash", () => {
     expect(container.firstElementChild?.getAttribute("data-phase")).toBe("exit");
 
     act(() => {
-      vi.advanceTimersByTime(339);
+      vi.advanceTimersByTime(249);
     });
     expect(container.firstElementChild).not.toBeNull();
 
@@ -61,13 +64,13 @@ describe("IntroSplash", () => {
     const splash = container.firstElementChild as HTMLElement;
 
     act(() => {
-      vi.advanceTimersByTime(600);
+      vi.advanceTimersByTime(1000);
     });
     fireEvent.pointerDown(splash);
 
     expect(splash.getAttribute("data-phase")).toBe("exit");
     act(() => {
-      vi.advanceTimersByTime(340);
+      vi.advanceTimersByTime(250);
     });
     expect(container.firstElementChild).toBeNull();
   });
@@ -79,7 +82,7 @@ describe("IntroSplash", () => {
 
     expect(container.firstElementChild?.getAttribute("data-phase")).toBe("exit");
     act(() => {
-      vi.advanceTimersByTime(340);
+      vi.advanceTimersByTime(250);
     });
     expect(container.firstElementChild).toBeNull();
   });
