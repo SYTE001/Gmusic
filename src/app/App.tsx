@@ -7,6 +7,7 @@ import { usePlaybackStore } from "../stores/playbackStore";
 import { useCloudStore } from "../stores/cloudStore";
 import { startLyricsPrefetch } from "../stores/lyricsStore";
 import { registerServiceWorker } from "../services/offline/offlineService";
+import { IntroSplash } from "../components/IntroSplash";
 
 /** Top-level error boundary: a crash shows a recoverable message, not a blank page. */
 export class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -113,8 +114,13 @@ export function App() {
   }, []);
 
   return (
-    <BrowserRouter>
-      <AppRoutes />
-    </BrowserRouter>
+    <>
+      {/* One-shot intro above the router: route changes never replay it, and
+          it is purely presentational so app initialization runs in parallel. */}
+      <IntroSplash />
+      <BrowserRouter>
+        <AppRoutes />
+      </BrowserRouter>
+    </>
   );
 }
