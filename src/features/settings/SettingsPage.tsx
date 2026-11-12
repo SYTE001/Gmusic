@@ -23,6 +23,13 @@ import { CloudAccountSection } from "./CloudAccountSection";
 import { CloudMigrationSection } from "./CloudMigrationSection";
 import { LibraryMetadataSection } from "./LibraryMetadataSection";
 
+const MINI_PLAYER_MODE_OPTIONS: SelectOption[] = [
+  { value: "auto", label: "Auto" },
+  { value: "compact", label: "Compact" },
+  { value: "standard", label: "Standard" },
+  { value: "expanded", label: "Expanded" },
+];
+
 const REDUCED_MOTION_OPTIONS: SelectOption[] = [
   { value: "system", label: "Follow system" },
   { value: "on", label: "Always reduce" },
@@ -161,6 +168,16 @@ export function SettingsPage() {
         </Row>
         <Row label="Artwork background tint" hint="Tint Now Playing with a soft color from the current cover.">
           <Toggle checked={prefs.artworkTint} onChange={(value) => update({ artworkTint: value })} label="Artwork tint" />
+        </Row>
+        <Row label="Mini player mode" hint="Auto uses Standard on desktop and Compact on narrower screens.">
+          <Select
+            size="sm"
+            align="right"
+            value={prefs.miniPlayerMode}
+            onChange={(val) => update({ miniPlayerMode: val as typeof prefs.miniPlayerMode })}
+            options={MINI_PLAYER_MODE_OPTIONS}
+            ariaLabel="Mini player mode"
+          />
         </Row>
         <Row label="Reduced motion" hint="Follows your system setting by default.">
           <Select

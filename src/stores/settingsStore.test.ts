@@ -44,6 +44,21 @@ describe("settings theme application", () => {
   it("falls back to defaults when no preferences are stored", async () => {
     await useSettingsStore.getState().init();
     expect(useSettingsStore.getState().prefs).toEqual(DEFAULT_PREFERENCES);
+    expect(useSettingsStore.getState().prefs.miniPlayerMode).toBe("auto");
     expect(useSettingsStore.getState().loaded).toBe(true);
+  });
+
+  it("hydrates legacy stored preferences without miniPlayerMode using default auto", async () => {
+    const legacy = { ...DEFAULT_PREFERENCES } as Partial<AppPreferences>;
+    delete legacy.miniPlayerMode;
+    await repository.putPreferences(legacy as AppPreferences);
+
+    await useSettingsStore.getState().init();
+    expect(useSettingsStore.getState().prefs.miniPlayerMode).toBe("auto");
+  });
+
+  it("updates and persists miniPlayerMode", async () => {
+    useSettingsStore.getState().update({ miniPlayerMode: "compact" });
+    expect(useSettingsStore.getState().prefs.miniPlayerMode).toBe("compact");
   });
 });

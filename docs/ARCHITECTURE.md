@@ -16,12 +16,12 @@ This document describes how Gmusic is actually built — the layers, the data fl
 src/
   app/        App.tsx (bootstrap, init sequence), router.tsx (lazy routes), error boundary
   components/ shared presentation: AppShell, Sidebar, TopBar, TrackRow, TrackListSection,
-              MiniPlayer, QueuePanel, SeekBar, Menu, Modal, ConfirmDialog,
+              MiniPlayer, CommandPalette, QueuePanel, SeekBar, Menu, Modal, ConfirmDialog,
               DynamicIslandNotification, Artwork, Icons (original inline SVG set)
   features/   page-level orchestration:
               home · library (import + track actions) · liked · playlists · recent ·
               player (NowPlayingPage, queue helpers) · lyrics (renderer, editor, matcher) ·
-              broken (triage) · settings (incl. cloud sections)
+              command-palette (catalog, local search) · broken (triage) · settings (incl. cloud sections)
   stores/     Zustand: playback, library, lyrics, settings, cloud, toast, dynamicIsland
   services/   audio/ (engine) · indexeddb/ (db, repository) · file-access/ ·
               library/ (import, playback session) · metadata/ (tag parsers) ·

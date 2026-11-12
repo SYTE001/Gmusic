@@ -162,6 +162,7 @@ export type RepeatMode = "off" | "all" | "one";
 
 export type ThemeSetting = "dark" | "light" | "system";
 export type ReducedMotionSetting = "system" | "on" | "off";
+export type MiniPlayerMode = "auto" | "compact" | "standard" | "expanded";
 
 export type AppPreferences = {
   theme: ThemeSetting;
@@ -169,6 +170,7 @@ export type AppPreferences = {
   shuffle: boolean;
   repeatMode: RepeatMode;
   reducedMotion: ReducedMotionSetting;
+  miniPlayerMode: MiniPlayerMode;
   artworkTint: boolean;
   lyricsStyle: "line" | "word";
   lyricFontSize: "sm" | "md" | "lg";

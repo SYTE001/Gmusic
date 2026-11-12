@@ -11,6 +11,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   shuffle: false,
   repeatMode: "off",
   reducedMotion: "system",
+  miniPlayerMode: "auto",
   artworkTint: true,
   lyricsStyle: "line",
   lyricFontSize: "md",
