@@ -647,7 +647,7 @@ export function NowPlayingPage() {
   return (
     <div
       className={`fixed inset-0 ${
-        isMobile ? "z-30" : "z-10"
+        isMobile ? "z-30" : "z-30 min-[900px]:z-10"
       } flex flex-col overflow-hidden animate-fade-in select-none bg-app-bg`}
       role="region"
       aria-label="Now playing"

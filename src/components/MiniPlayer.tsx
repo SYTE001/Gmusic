@@ -38,10 +38,10 @@ export const DESKTOP_MINI_PLAYER_BREAKPOINT_PX = 900;
 export type ResolvedMiniPlayerMode = "compact" | "standard" | "expanded";
 
 export function resolveMiniPlayerMode(mode: MiniPlayerMode, isDesktop: boolean): ResolvedMiniPlayerMode {
-  if (mode === "auto") {
-    return isDesktop ? "standard" : "compact";
+  if (!isDesktop) {
+    return "compact";
   }
-  if (mode === "expanded" && !isDesktop) {
+  if (mode === "auto") {
     return "standard";
   }
   return mode;
@@ -85,11 +85,15 @@ export function useIsDesktopMiniPlayer(): boolean {
  * AppShell re-renders on every tick.
  */
 function CompactProgressLine() {
-  const durationMs = usePlaybackStore((state) => state.durationMs);
   const fillRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const apply = (currentTimeMs: number) => {
+    let lastTimeMs = -1;
+    let lastDurationMs: number | null = -1;
+    const apply = (currentTimeMs: number, durationMs: number | null) => {
+      if (currentTimeMs === lastTimeMs && durationMs === lastDurationMs) return;
+      lastTimeMs = currentTimeMs;
+      lastDurationMs = durationMs;
       const dur = durationMs ?? 0;
       const frac = dur > 0 ? Math.min(1, Math.max(0, currentTimeMs / dur)) : 0;
       const safeFrac = Number.isFinite(frac) ? frac : 0;
@@ -97,17 +101,21 @@ function CompactProgressLine() {
         fillRef.current.style.transform = `scaleX(${safeFrac})`;
       }
     };
-    apply(usePlaybackStore.getState().currentTimeMs);
+    const initial = usePlaybackStore.getState();
+    apply(initial.currentTimeMs, initial.durationMs);
     return usePlaybackStore.subscribe((state) => {
-      apply(state.currentTimeMs);
+      apply(state.currentTimeMs, state.durationMs);
     });
-  }, [durationMs]);
+  }, []);
 
   return (
-    <div className="pointer-events-none absolute inset-x-4 bottom-0 h-0.5 overflow-hidden rounded-full bg-surface-hover" aria-hidden="true">
+    <div
+      className="pointer-events-none absolute inset-x-4 bottom-0 h-[3px] overflow-hidden rounded-full bg-surface-hover"
+      aria-hidden="true"
+    >
       <div
         ref={fillRef}
-        className="h-full w-full origin-left bg-accent transition-transform duration-150 ease-out"
+        className="h-full w-full origin-left bg-accent transition-transform duration-100 ease-linear"
         style={{ transform: "scaleX(0)", willChange: "transform" }}
       />
     </div>
@@ -295,13 +303,146 @@ const MODE_LABELS: Record<MiniPlayerMode, string> = {
 };
 
 /**
+ * Mobile Compact Now Playing Dock (< 900px).
+ * Displays album artwork, track title + artist, circular Play/Pause, Next,
+ * and an isolated thin progress bar at the bottom of the dock. Secondary
+ * controls live in Now Playing so the mobile dock stays uncluttered and fits
+ * cleanly above the bottom navigation bar.
+ */
+function MobileMiniPlayerDock({ miniPlayerMode }: { miniPlayerMode: MiniPlayerMode }) {
+  const navigate = useNavigate();
+  const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
+  const isPlaying = usePlaybackStore((state) => state.isPlaying);
+  const isBuffering = usePlaybackStore((state) => state.isBuffering);
+  const status = usePlaybackStore((state) => state.status);
+  const error = usePlaybackStore((state) => state.error);
+  const track = useTrackById(currentTrackId);
+
+  if (!track && status === "idle") return null;
+
+  const controlsDisabled = !track;
+  const isBusy = isBuffering || status === "loading";
+  const isError = status === "error";
+
+  const subtitleText = isError
+    ? error?.title || "Playback error — tap play to retry"
+    : status === "loading" && !track
+      ? "Loading track…"
+      : track?.artist || (track ? "Unknown artist" : "Pick a song to begin");
+
+  return (
+    <div
+      className="relative z-20 shrink-0 pb-2 pt-1"
+      style={{
+        paddingLeft: "max(0.875rem, env(safe-area-inset-left, 0px))",
+        paddingRight: "max(0.875rem, env(safe-area-inset-right, 0px))",
+      }}
+      data-mini-player-mode="compact"
+      data-mini-player-pref={miniPlayerMode}
+      data-viewport="mobile"
+    >
+      <div
+        className="relative mx-auto flex h-[78px] w-full max-w-[1600px] items-center justify-between gap-2.5 overflow-hidden rounded-[22px] border bg-surface px-3 pb-[3px]"
+        style={{ borderColor: "var(--border-subtle)" }}
+      >
+        {/* Left: Artwork + Track info -> opens Now Playing without disturbing playback */}
+        <button
+          type="button"
+          className="flex min-w-0 flex-1 items-center gap-3 rounded-xl text-left transition-opacity duration-150 active:opacity-80 disabled:opacity-50"
+          onClick={() => {
+            if (track) navigate("/now-playing");
+          }}
+          aria-label="Open Now Playing"
+          disabled={!track}
+        >
+          <div className="relative shrink-0">
+            <Artwork
+              trackId={track?.id}
+              alt=""
+              className="size-12 transition-opacity duration-200"
+              rounded="rounded-xl"
+            />
+            {isBusy && (
+              <span
+                className="absolute inset-0 grid place-items-center rounded-xl bg-black/45 transition-opacity duration-150"
+                aria-hidden="true"
+              >
+                <span className="size-2 rounded-full bg-white/90 animate-pulse" />
+              </span>
+            )}
+          </div>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[14.5px] font-semibold leading-tight text-text-primary">
+              {track?.title ?? (status === "loading" ? "Loading…" : "Nothing playing")}
+            </span>
+            <span
+              className={`mt-0.5 block truncate text-[12.5px] leading-tight ${
+                isError ? "text-danger" : "text-text-secondary"
+              }`}
+            >
+              {subtitleText}
+            </span>
+          </span>
+        </button>
+
+        {/* Right: Independent Play/Pause and Next buttons (touch targets >= 44px) */}
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            className="grid size-11 shrink-0 place-items-center rounded-full bg-accent text-accent-contrast transition-transform duration-100 active:scale-95 disabled:opacity-40 disabled:active:scale-100"
+            title={isPlaying ? "Pause" : "Play"}
+            aria-label={isPlaying ? "Pause" : "Play"}
+            onClick={() => usePlaybackStore.getState().togglePlay()}
+            disabled={controlsDisabled}
+          >
+            {isPlaying ? <PauseIcon size={18} /> : <PlayIcon size={18} />}
+          </button>
+          <button
+            type="button"
+            className="grid size-11 shrink-0 place-items-center rounded-full text-text-primary transition-colors duration-100 hover:bg-surface-hover active:scale-95 disabled:opacity-40 disabled:active:scale-100"
+            title="Next track"
+            aria-label="Next track"
+            onClick={() => usePlaybackStore.getState().next(true)}
+            disabled={controlsDisabled}
+          >
+            <NextIcon size={20} />
+          </button>
+        </div>
+
+        {track && <CompactProgressLine />}
+      </div>
+    </div>
+  );
+}
+
+/**
  * Persistent bottom player bar, docked across all routes (PRD §7.9) with
- * adaptive presentation modes: Compact, Standard, and Expanded (desktop dock).
- * Mounted once in the shell so route changes and mode changes never restart
- * playback; high-frequency time state is isolated to the SeekBar / preview subtrees.
+ * adaptive presentation modes on desktop and a compact Now Playing dock on
+ * mobile. Mounted once in the shell so route changes and mode changes never
+ * restart playback; high-frequency time state is isolated to progress/SeekBar
+ * subtrees.
  */
 export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => void; queueOpen: boolean }) {
   recordComponentRender("MiniPlayer");
+  const isDesktop = useIsDesktopMiniPlayer();
+  const miniPlayerMode = useSettingsStore((state) => state.prefs.miniPlayerMode ?? "auto");
+
+  if (!isDesktop) {
+    return <MobileMiniPlayerDock miniPlayerMode={miniPlayerMode} />;
+  }
+
+  return <DesktopMiniPlayer miniPlayerMode={miniPlayerMode} onToggleQueue={onToggleQueue} queueOpen={queueOpen} />;
+}
+
+function DesktopMiniPlayer({
+  miniPlayerMode,
+  onToggleQueue,
+  queueOpen,
+}: {
+  miniPlayerMode: MiniPlayerMode;
+  onToggleQueue: () => void;
+  queueOpen: boolean;
+}) {
   const navigate = useNavigate();
   const currentTrackId = usePlaybackStore((state) => state.currentTrackId);
   const isPlaying = usePlaybackStore((state) => state.isPlaying);
@@ -313,9 +454,8 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
   const track = useTrackById(currentTrackId);
   const toggleLike = useLibraryStore((state) => state.toggleLike);
 
-  const miniPlayerMode = useSettingsStore((state) => state.prefs.miniPlayerMode ?? "auto");
   const updateSettings = useSettingsStore((state) => state.update);
-  const isDesktop = useIsDesktopMiniPlayer();
+  const isDesktop = true;
   const resolvedMode = resolveMiniPlayerMode(miniPlayerMode, isDesktop);
 
   if (!track && status === "idle") return null;
@@ -323,10 +463,6 @@ export function MiniPlayer({ onToggleQueue, queueOpen }: { onToggleQueue: () => 
   const controlsDisabled = !track;
 
   const setPlayerMode = (nextMode: MiniPlayerMode) => {
-    if (nextMode === "expanded" && !isDesktop) {
-      navigate("/now-playing");
-      return;
-    }
     updateSettings({ miniPlayerMode: nextMode });
   };
 

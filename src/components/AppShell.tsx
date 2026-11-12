@@ -142,8 +142,11 @@ export function AppShell() {
       {/* Mobile bottom navigation */}
       <nav
         aria-label="Primary"
-        className="flex h-14 min-[900px]:hidden items-stretch border-t bg-app-bg"
-        style={{ borderColor: "var(--border-subtle)" }}
+        className="flex min-h-14 shrink-0 min-[900px]:hidden items-stretch border-t bg-app-bg"
+        style={{
+          borderColor: "var(--border-subtle)",
+          paddingBottom: "env(safe-area-inset-bottom, 0px)",
+        }}
       >
         <NavLink to="/" className={mobileNavClass} end>
           <HomeIcon size={20} />
@@ -312,7 +315,7 @@ function Toasts() {
   const dismiss = useToastStore((state) => state.dismiss);
   if (toasts.length === 0) return null;
   return (
-    <div className="pointer-events-none fixed bottom-24 left-1/2 z-50 flex w-full max-w-sm -translate-x-1/2 flex-col gap-2 px-4 lg:bottom-28">
+    <div className="pointer-events-none fixed bottom-[156px] left-1/2 z-50 flex w-full max-w-sm -translate-x-1/2 flex-col gap-2 px-4 min-[900px]:bottom-28">
       {toasts.map((toastEntry) => (
         <div
           key={toastEntry.id}
