@@ -68,6 +68,7 @@ export async function buildBackup(): Promise<BackupFile> {
           shuffle: prefs.shuffle,
           repeatMode: prefs.repeatMode,
           reducedMotion: prefs.reducedMotion,
+          miniPlayerMode: prefs.miniPlayerMode,
           artworkTint: prefs.artworkTint,
           lyricsStyle: prefs.lyricsStyle,
           lyricFontSize: prefs.lyricFontSize,
@@ -193,8 +194,12 @@ function sanitizePreferences(raw: Partial<AppPreferences>): AppPreferences {
   for (const key of Object.keys(DEFAULT_PREFERENCES) as Array<keyof AppPreferences>) {
     if (typeof raw[key] === typeof DEFAULT_PREFERENCES[key]) prefs[key] = raw[key];
   }
+  const validMiniPlayerModes = new Set(["auto", "compact", "standard", "expanded"]);
   return {
     ...(prefs as AppPreferences),
+    miniPlayerMode: validMiniPlayerModes.has(raw.miniPlayerMode as string)
+      ? (raw.miniPlayerMode as AppPreferences["miniPlayerMode"])
+      : "auto",
     lyricsStyle: raw.lyricsStyle === "word" ? "word" : "line",
     schemaVersion: DB_SCHEMA_VERSION,
   };

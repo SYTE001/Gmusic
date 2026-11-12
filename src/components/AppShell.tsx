@@ -4,6 +4,8 @@ import { SidebarContent, focusVisibleSearch } from "./Sidebar";
 import { CloudBadge, MobileTopBar, OfflineBadge } from "./TopBar";
 import { MiniPlayer } from "./MiniPlayer";
 import { QueuePanel } from "./QueuePanel";
+import { CommandPalette } from "./CommandPalette";
+import { CreatePlaylistModal } from "../features/playlists/CreatePlaylistModal";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { useLibraryStore } from "../stores/libraryStore";
 import { useToastStore } from "../stores/toastStore";
@@ -29,6 +31,8 @@ const SIDEBAR_COLLAPSED_KEY = "lm-sidebar-collapsed";
 export function AppShell() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [creatingPlaylist, setCreatingPlaylist] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
   const location = useLocation();
 
@@ -42,7 +46,11 @@ export function AppShell() {
     setDrawerOpen(false);
   }, [location.pathname]);
 
-  useGlobalKeyboardShortcuts(() => setQueueOpen((open) => !open));
+  useGlobalKeyboardShortcuts(
+    () => setQueueOpen((open) => !open),
+    () => setPaletteOpen((open) => !open),
+    paletteOpen,
+  );
 
   return (
     <div className="flex h-dvh flex-col overflow-hidden bg-app-bg text-text-primary">
@@ -100,6 +108,7 @@ export function AppShell() {
             <SidebarContent
               collapsed={sidebarCollapsed}
               onExpand={() => applySidebarCollapsed(false)}
+              onOpenCommandPalette={() => setPaletteOpen(true)}
             />
           </div>
           {!sidebarCollapsed && (
@@ -112,7 +121,10 @@ export function AppShell() {
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <MobileTopBar onOpenSidebar={() => setDrawerOpen(true)} />
+          <MobileTopBar
+            onOpenSidebar={() => setDrawerOpen(true)}
+            onOpenCommandPalette={() => setPaletteOpen(true)}
+          />
           <main id="main-content" className="min-h-0 flex-1 overflow-y-auto" tabIndex={-1}>
             <div className="mx-auto w-full max-w-[1400px] px-4 pb-8 pt-5 md:px-8 md:pt-7 lg:pb-10">
               <TrackActionsProvider>
@@ -174,11 +186,25 @@ export function AppShell() {
                   // Let the drawer unmount first so the top-bar field is visible.
                   window.setTimeout(focusVisibleSearch, 80);
                 }}
+                onOpenCommandPalette={() => {
+                  setDrawerOpen(false);
+                  setPaletteOpen(true);
+                }}
               />
             </div>
           </div>
         </div>
       )}
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        queueOpen={queueOpen}
+        onToggleQueue={() => setQueueOpen((open) => !open)}
+        onOpenCreatePlaylist={() => setCreatingPlaylist(true)}
+      />
+
+      <CreatePlaylistModal open={creatingPlaylist} onClose={() => setCreatingPlaylist(false)} />
 
       <DynamicIslandNotification />
       <Toasts />
@@ -188,12 +214,30 @@ export function AppShell() {
 }
 
 /**
- * Global playback keyboard shortcuts (PRD §7.6). Never hijacks typing in
- * inputs, textareas, selects, or editable content (rules §10).
+ * Global playback & Command Palette keyboard shortcuts (PRD §6.2, §6.6, §7.6).
+ * Ctrl/Meta+K is handled before the modifier-key guard. Playback shortcuts
+ * never fire while the Command Palette is open or while typing in inputs,
+ * textareas, selects, sliders, or editable content (rules §10).
  */
-function useGlobalKeyboardShortcuts(toggleQueue: () => void) {
+function useGlobalKeyboardShortcuts(
+  toggleQueue: () => void,
+  togglePalette: () => void,
+  paletteOpen: boolean,
+) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing) return;
+
+      // Command Palette trigger (Ctrl+K or Meta+K) handled before modifier guards
+      if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        togglePalette();
+        return;
+      }
+
+      // Global playback shortcuts are inactive while the Command Palette is open
+      if (paletteOpen) return;
+
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -201,11 +245,12 @@ function useGlobalKeyboardShortcuts(toggleQueue: () => void) {
           target.tagName === "TEXTAREA" ||
           target.tagName === "SELECT" ||
           target.isContentEditable ||
-          target.role === "slider")
+          target.role === "slider" ||
+          target.getAttribute?.("role") === "slider")
       ) {
         return;
       }
-      if (event.metaKey || event.altKey) return;
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
       const playback = usePlaybackStore.getState();
       const library = useLibraryStore.getState();
 
@@ -258,7 +303,7 @@ function useGlobalKeyboardShortcuts(toggleQueue: () => void) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [toggleQueue]);
+  }, [toggleQueue, togglePalette, paletteOpen]);
 }
 
 /** Visible toast stack. Errors also reach screen readers via role=alert. */

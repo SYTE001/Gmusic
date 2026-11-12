@@ -35,7 +35,7 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
         target &&
         (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable);
       if (typing) return;
-      if (event.key === "/" || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k")) {
+      if (event.key === "/") {
         // Skip instances hidden by the responsive layout swap (display:none
         // subtrees report a null offsetParent).
         const input = inputRef.current;
@@ -93,7 +93,7 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
           }}
           placeholder="Search your library…"
           aria-label="Search your library"
-          title="Search — press / or Ctrl+K to focus"
+          title="Search — press / to focus"
           className="w-full bg-transparent text-sm text-text-primary outline-none placeholder:text-text-muted [&::-webkit-search-cancel-button]:hidden"
         />
         {!query && (
@@ -186,7 +186,13 @@ export function SearchField({ inTopBar = false }: { inTopBar?: boolean }) {
  * cloud/offline status badges. Hidden from the 900px breakpoint up, where
  * search and status live in the sidebar.
  */
-export function MobileTopBar({ onOpenSidebar }: { onOpenSidebar: () => void }) {
+export function MobileTopBar({
+  onOpenSidebar,
+  onOpenCommandPalette,
+}: {
+  onOpenSidebar: () => void;
+  onOpenCommandPalette?: () => void;
+}) {
   return (
     <header
       className="sticky top-0 z-30 flex min-[900px]:hidden items-center gap-2 border-b bg-app-bg px-3 py-2.5"
@@ -198,6 +204,19 @@ export function MobileTopBar({ onOpenSidebar }: { onOpenSidebar: () => void }) {
         </svg>
       </button>
       <SearchField inTopBar />
+      {onOpenCommandPalette && (
+        <button
+          type="button"
+          className="icon-btn shrink-0"
+          aria-label="Open Command Palette"
+          title="Quick Actions (Ctrl+K)"
+          onClick={onOpenCommandPalette}
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+            <path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z" />
+          </svg>
+        </button>
+      )}
       <CloudBadge />
       <OfflineBadge />
     </header>
