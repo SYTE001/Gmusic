@@ -4,7 +4,8 @@ import { useLibraryStore, useTrackById } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { toast } from "../../stores/toastStore";
 import { recordComponentRender } from "../../utils/perf";
-import { Artwork } from "../../components/Artwork";
+import { Artwork, useArtworkUrl } from "../../components/Artwork";
+import { invalidateArtworkForTrackId } from "../../services/artwork/artworkCache";
 import { Menu, type MenuItemSpec } from "../../components/Menu";
 import { QueuePanel } from "../../components/QueuePanel";
 import { SeekBar } from "../../components/SeekBar";
@@ -301,6 +302,22 @@ export function MobilePlayer({
   setQueueOpen: React.Dispatch<React.SetStateAction<boolean>>;
   buildOverflowMenuItems: () => MenuItemSpec[];
 }) {
+  const artworkUrl = useArtworkUrl(track.id);
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  const hasArtwork = Boolean(artworkUrl && failedUrl !== artworkUrl);
+
+  const artworkThemeVars: CSSProperties | undefined = hasArtwork
+    ? ({
+        "--text-primary": "#ffffff",
+        "--text-secondary": "rgba(255, 255, 255, 0.72)",
+        "--text-muted": "rgba(255, 255, 255, 0.54)",
+        "--surface-hover": "rgba(255, 255, 255, 0.14)",
+        "--accent": "#ffffff",
+        "--accent-strong": "#ffffff",
+        "--accent-contrast": "#0e1116",
+      } as CSSProperties)
+    : undefined;
+
   return lyricsMode ? (
     /* Mode 2: Fullscreen Lyrics */
     <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-2xl flex-1 flex-col animate-fade-in">
@@ -347,54 +364,73 @@ export function MobilePlayer({
     </div>
   ) : (
     /* Mode 1: Now Playing */
-    <div className="relative z-10 mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col justify-between animate-fade-in">
-      {/* Top Navigation: X button left closes fullscreen player */}
-      <header className="flex shrink-0 items-center justify-between px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]">
+    <div
+      className={`relative z-10 mx-auto flex min-h-0 w-full max-w-xl flex-1 flex-col overflow-hidden animate-fade-in ${
+        hasArtwork ? "bg-[#0e1116]" : ""
+      }`}
+      data-has-artwork={hasArtwork ? "true" : "false"}
+      style={artworkThemeVars}
+    >
+      {hasArtwork && artworkUrl && (
+        <>
+          {/* Layer 1: Full-width upper artwork (65-75% height) with soft bottom transition */}
+          <div
+            className="pointer-events-none absolute inset-x-0 top-0 h-[72%] overflow-hidden rounded-t-[24px] mobile-artwork-layer"
+            data-mobile-artwork-layer="true"
+          >
+            <img
+              key={artworkUrl}
+              src={artworkUrl}
+              alt={`${track.title} artwork`}
+              decoding="async"
+              onError={() => {
+                setFailedUrl(artworkUrl);
+                void invalidateArtworkForTrackId(track.id);
+              }}
+              className="size-full object-cover object-center transition-opacity duration-200"
+            />
+          </div>
+          {/* Layer 2: Subtle gradient-free darkening overlay */}
+          <div className="pointer-events-none absolute inset-0 bg-black/15" aria-hidden="true" />
+        </>
+      )}
+
+      {/* Top Navigation: Close button left */}
+      <header className="relative z-10 flex shrink-0 items-center justify-between px-5 pb-2 pt-[max(0.75rem,env(safe-area-inset-top))]">
         <button
           type="button"
-          className="icon-btn shrink-0 text-text-secondary hover:text-text-primary"
+          className={`icon-btn shrink-0 ${
+            hasArtwork
+              ? "rounded-full bg-black/25 text-white hover:bg-black/40 hover:text-white"
+              : "text-text-secondary hover:text-text-primary"
+          }`}
           aria-label="Close Now Playing"
           title="Close Now Playing"
           onClick={closeFullscreenPlayer}
         >
           <CloseIcon size={20} />
         </button>
-        <span className="min-w-0 flex-1 truncate px-3 text-center text-sm font-medium text-text-secondary">
-          {track.title}
-        </span>
-        <Menu
-          buttonLabel="More options"
-          trigger={<MoreIcon size={20} />}
-          items={buildOverflowMenuItems}
-        />
+        <div className="size-9 shrink-0" aria-hidden="true" />
       </header>
 
-      {/* Main Content: Responsive 1:1 Album Artwork + Controls */}
-      <div className="flex min-h-0 flex-1 flex-col items-center justify-between px-6 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1">
-        {/* Album Artwork */}
-        <div className="flex min-h-0 w-full flex-1 items-center justify-center py-2">
-          <div className="aspect-square w-full max-w-[min(82vw,calc(100dvh-350px))] sm:max-w-[min(360px,calc(100dvh-350px))] overflow-hidden rounded-[28px]">
-            <Artwork
-              trackId={track.id}
-              alt={`${track.title} artwork`}
-              className="size-full object-cover"
-              rounded="rounded-[28px]"
-            />
+      {/* Layer 3 & 4: Lower Blurred Player Overlay + Controls */}
+      <div
+        className={`relative z-10 mt-auto flex w-full shrink-0 flex-col gap-3.5 px-6 pb-[max(0.875rem,env(safe-area-inset-bottom))] pt-5 ${
+          hasArtwork ? "mobile-player-overlay" : ""
+        }`}
+        data-mobile-player-overlay={hasArtwork ? "true" : "false"}
+      >
+        {/* Track Information + Favorite + More options */}
+        <div className="flex min-w-0 w-full items-center justify-between gap-3">
+          <div className="min-w-0 flex-1 text-left">
+            <h1 className="truncate text-xl font-bold tracking-tight text-text-primary sm:text-2xl">
+              {track.title}
+            </h1>
+            <p className="mt-0.5 truncate text-sm font-medium text-text-secondary sm:text-base">
+              {track.artist || "Unknown artist"}
+            </p>
           </div>
-        </div>
-
-        {/* Track Info, SeekBar, Transport Controls, and Bottom Actions */}
-        <div className="flex w-full shrink-0 flex-col gap-3.5">
-          {/* Track Information + Favorite */}
-          <div className="flex min-w-0 w-full items-center justify-between gap-3">
-            <div className="min-w-0 flex-1 text-left">
-              <h1 className="truncate text-xl font-bold tracking-tight text-text-primary sm:text-2xl">
-                {track.title}
-              </h1>
-              <p className="mt-0.5 truncate text-base font-medium text-text-secondary">
-                {track.artist || "Unknown artist"}
-              </p>
-            </div>
+          <div className="flex shrink-0 items-center gap-1">
             <button
               type="button"
               className="icon-btn shrink-0 text-text-secondary hover:text-text-primary transition-transform active:scale-90"
@@ -403,90 +439,95 @@ export function MobilePlayer({
               aria-pressed={track.isLiked}
               onClick={() => void useLibraryStore.getState().toggleLike(track.id)}
             >
-              <HeartIcon size={22} filled={track.isLiked} className={track.isLiked ? "text-text-primary" : ""} />
+              <HeartIcon size={21} filled={track.isLiked} className={track.isLiked ? "text-text-primary" : ""} />
+            </button>
+            <Menu
+              buttonLabel="More options"
+              trigger={<MoreIcon size={20} />}
+              items={buildOverflowMenuItems}
+            />
+          </div>
+        </div>
+
+        {/* Progress Bar */}
+        <SeekBar stackedLabels />
+
+        {/* Main Playback Controls: Shuffle | Previous | Play/Pause | Next | Repeat */}
+        <div className="flex w-full items-center justify-between px-1 sm:px-3">
+          <TransportToggle
+            active={shuffleEnabled}
+            label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
+            title="Shuffle (S)"
+            onClick={() => usePlaybackStore.getState().toggleShuffle()}
+          >
+            <ShuffleIcon size={19} />
+          </TransportToggle>
+          <button
+            type="button"
+            className="icon-btn text-text-primary"
+            aria-label="Previous track"
+            onClick={() => usePlaybackStore.getState().previous()}
+          >
+            <PrevIcon size={26} />
+          </button>
+          <button
+            type="button"
+            className="grid size-[68px] sm:size-[72px] place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
+            title="Play/Pause (Space)"
+            aria-label={isPlaying ? "Pause" : "Play"}
+            onClick={() => usePlaybackStore.getState().togglePlay()}
+          >
+            {isPlaying ? <PauseIcon size={28} /> : <PlayIcon size={28} />}
+          </button>
+          <button
+            type="button"
+            className="icon-btn text-text-primary"
+            aria-label="Next track"
+            onClick={() => usePlaybackStore.getState().next(true)}
+          >
+            <NextIcon size={26} />
+          </button>
+          <TransportToggle
+            active={repeatMode !== "off"}
+            label={
+              repeatMode === "off"
+                ? "Enable repeat all"
+                : repeatMode === "all"
+                  ? "Enable repeat one"
+                  : "Disable repeat"
+            }
+            title="Repeat (R)"
+            onClick={() => usePlaybackStore.getState().cycleRepeat()}
+          >
+            {repeatMode === "one" ? <RepeatOneIcon size={19} /> : <RepeatIcon size={19} />}
+          </TransportToggle>
+        </div>
+
+        {/* Bottom Secondary Actions: Lyrics bottom-center, Queue bottom-right */}
+        <div className="grid w-full grid-cols-3 items-center pt-0.5">
+          <div aria-hidden="true" />
+          <div className="flex justify-center">
+            <button
+              type="button"
+              className="inline-flex min-h-10 flex-col items-center justify-center gap-0.5 rounded-xl px-4 py-1 text-text-secondary transition-colors hover:text-text-primary active:scale-95"
+              aria-label="Show lyrics"
+              onClick={openLyrics}
+            >
+              <ChevronUpIcon size={15} />
+              <span className="text-xs font-medium tracking-tight">Lyrics</span>
             </button>
           </div>
-
-          {/* Progress Bar */}
-          <SeekBar stackedLabels />
-
-          {/* Main Playback Controls: Shuffle | Previous | Play/Pause | Next | Repeat */}
-          <div className="flex w-full items-center justify-between px-1 sm:px-3">
-            <TransportToggle
-              active={shuffleEnabled}
-              label={shuffleEnabled ? "Disable shuffle" : "Enable shuffle"}
-              title="Shuffle (S)"
-              onClick={() => usePlaybackStore.getState().toggleShuffle()}
-            >
-              <ShuffleIcon size={20} />
-            </TransportToggle>
+          <div className="flex justify-end">
             <button
               type="button"
-              className="icon-btn text-text-primary"
-              aria-label="Previous track"
-              onClick={() => usePlaybackStore.getState().previous()}
+              className={`icon-btn ${queueOpen ? "text-text-primary" : "text-text-secondary"}`}
+              title="Queue (Q)"
+              aria-label={queueOpen ? "Close queue" : "Open queue"}
+              aria-pressed={queueOpen}
+              onClick={() => setQueueOpen((open) => !open)}
             >
-              <PrevIcon size={26} />
+              <QueueIcon size={19} />
             </button>
-            <button
-              type="button"
-              className="grid size-[72px] sm:size-20 place-items-center rounded-full bg-accent-strong text-accent-contrast transition-transform hover:scale-105 active:scale-95 shrink-0 disabled:opacity-40"
-              title="Play/Pause (Space)"
-              aria-label={isPlaying ? "Pause" : "Play"}
-              onClick={() => usePlaybackStore.getState().togglePlay()}
-            >
-              {isPlaying ? <PauseIcon size={30} /> : <PlayIcon size={30} />}
-            </button>
-            <button
-              type="button"
-              className="icon-btn text-text-primary"
-              aria-label="Next track"
-              onClick={() => usePlaybackStore.getState().next(true)}
-            >
-              <NextIcon size={26} />
-            </button>
-            <TransportToggle
-              active={repeatMode !== "off"}
-              label={
-                repeatMode === "off"
-                  ? "Enable repeat all"
-                  : repeatMode === "all"
-                    ? "Enable repeat one"
-                    : "Disable repeat"
-              }
-              title="Repeat (R)"
-              onClick={() => usePlaybackStore.getState().cycleRepeat()}
-            >
-              {repeatMode === "one" ? <RepeatOneIcon size={20} /> : <RepeatIcon size={20} />}
-            </TransportToggle>
-          </div>
-
-          {/* Bottom Secondary Actions: Primary Lyrics button bottom-center, Queue icon bottom-right */}
-          <div className="grid w-full grid-cols-3 items-center pt-0.5">
-            <div aria-hidden="true" />
-            <div className="flex justify-center">
-              <button
-                type="button"
-                className="inline-flex min-h-11 flex-col items-center justify-center gap-0.5 rounded-xl px-4 py-1 text-text-secondary transition-colors hover:text-text-primary active:scale-95"
-                aria-label="Show lyrics"
-                onClick={openLyrics}
-              >
-                <ChevronUpIcon size={16} />
-                <span className="text-xs font-medium tracking-tight">Lyrics</span>
-              </button>
-            </div>
-            <div className="flex justify-end">
-              <button
-                type="button"
-                className={`icon-btn ${queueOpen ? "text-text-primary" : "text-text-secondary"}`}
-                title="Queue (Q)"
-                aria-label={queueOpen ? "Close queue" : "Open queue"}
-                aria-pressed={queueOpen}
-                onClick={() => setQueueOpen((open) => !open)}
-              >
-                <QueueIcon size={20} />
-              </button>
-            </div>
           </div>
         </div>
       </div>

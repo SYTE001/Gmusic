@@ -31,23 +31,28 @@ export function useArtworkUrl(trackOrId: Track | string | null | undefined): str
   const trackId = typeof trackOrId === "string" ? trackOrId : trackOrId?.id;
   const trackOrIdRef = useRef(trackOrId);
   trackOrIdRef.current = trackOrId;
-  const [url, setUrl] = useState<string | undefined>(() => (trackId ? getArtworkUrl(trackId) : undefined));
+  const [loaded, setLoaded] = useState<{ trackId: string | undefined; url: string | undefined }>(() => ({
+    trackId,
+    url: trackId ? getArtworkUrl(trackId) : undefined,
+  }));
 
   useEffect(() => {
     const currentInput = trackOrIdRef.current;
     if (!trackId || !currentInput) {
-      setUrl(undefined);
+      setLoaded({ trackId: undefined, url: undefined });
       return;
     }
 
     const existing = getArtworkUrl(trackId);
     if (existing) {
-      setUrl(existing);
+      setLoaded({ trackId, url: existing });
       return;
     }
 
+    setLoaded({ trackId, url: undefined });
+
     const unsubscribe = subscribeArtwork(trackId, (loadedUrl) => {
-      setUrl(loadedUrl);
+      setLoaded({ trackId, url: loadedUrl });
     });
 
     void loadArtworkUrl(currentInput);
@@ -57,7 +62,9 @@ export function useArtworkUrl(trackOrId: Track | string | null | undefined): str
     };
   }, [trackId]);
 
-  return url;
+  if (!trackId) return undefined;
+  if (loaded.trackId === trackId) return loaded.url;
+  return getArtworkUrl(trackId);
 }
 
 export function Artwork({ trackId, alt, className, rounded = "rounded-lg" }: ArtworkProps) {
