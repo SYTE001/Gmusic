@@ -382,3 +382,22 @@ input[type="range"].app-range-vertical::-moz-range-thumb {
   background: var(--surface-raised);
   flex: none;
 }
+
+
+/* Mobile Now Playing full-bleed artwork fade and blurred overlay */
+.mobile-artwork-layer {
+  -webkit-mask-image: linear-gradient(to bottom, #000 58%, transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 58%, transparent 100%);
+}
+
+.mobile-player-overlay {
+  background-color: rgba(14, 17, 22, 0.92);
+}
+
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .mobile-player-overlay {
+    background-color: rgba(14, 17, 22, 0.64);
+    -webkit-backdrop-filter: blur(28px) saturate(135%);
+    backdrop-filter: blur(28px) saturate(135%);
+  }
+}

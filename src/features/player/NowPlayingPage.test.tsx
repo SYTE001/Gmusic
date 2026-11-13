@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
 import { MiniPlayer } from "../../components/MiniPlayer";
+import { clearArtworkCache, setCachedArtworkForTrack } from "../../components/Artwork";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { DEFAULT_PREFERENCES, useSettingsStore } from "../../stores/settingsStore";
@@ -58,6 +59,7 @@ describe("NowPlayingPage component", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     clearPaletteCache();
+    clearArtworkCache();
     setViewport(390, 844);
     const track = createTrack();
     useLibraryStore.setState({
@@ -501,5 +503,93 @@ describe("NowPlayingPage component", () => {
     expect(usePlaybackStore.getState().currentTrackId).toBe("track-1");
     expect(usePlaybackStore.getState().currentTimeMs).toBe(30000);
     expect(usePlaybackStore.getState().isPlaying).toBe(true);
+  });
+
+  it("renders full-bleed artwork background and blurred overlay on Mobile when active track has artwork", () => {
+    setViewport(390, 844);
+    setCachedArtworkForTrack("track-1", "blob:test-cover-1");
+
+    const { container } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const artworkLayer = container.querySelector('[data-mobile-artwork-layer="true"]');
+    expect(artworkLayer).toBeTruthy();
+    const img = screen.getByAltText("Test Song artwork") as HTMLImageElement;
+    expect(img.src).toContain("blob:test-cover-1");
+    expect(img.className).toContain("object-cover");
+
+    const overlay = container.querySelector('[data-mobile-player-overlay="true"]');
+    expect(overlay).toBeTruthy();
+    expect(overlay?.className).toContain("mobile-player-overlay");
+    expect(container.querySelector('[data-has-artwork="true"]')).toBeTruthy();
+  });
+
+  it("renders theme fallback without artwork layer, broken img, or blur when track has no artwork", () => {
+    setViewport(390, 844);
+    const { container } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const root = screen.getByRole("region", { name: "Now playing" });
+    expect(root.className).toContain("bg-app-bg");
+    expect(container.querySelector('[data-has-artwork="false"]')).toBeTruthy();
+    expect(container.querySelector("[data-mobile-artwork-layer]")).toBeNull();
+    expect(container.querySelector(".mobile-player-overlay")).toBeNull();
+    expect(screen.queryByRole("img")).toBeNull();
+  });
+
+  it("immediately clears previous artwork and switches to fallback when changing to a track without artwork", () => {
+    setViewport(390, 844);
+    const track1 = createTrack("track-1", { title: "With Art" });
+    const track2 = createTrack("track-2", { title: "Without Art" });
+    useLibraryStore.setState({ tracks: [track1, track2], playlists: [], status: "ready", loadError: null });
+    usePlaybackStore.setState({ currentTrackId: "track-1", queueTrackIds: ["track-1", "track-2"] });
+    setCachedArtworkForTrack("track-1", "blob:test-cover-1");
+
+    const { container, rerender } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByAltText("With Art artwork")).toBeTruthy();
+    expect(container.querySelector('[data-has-artwork="true"]')).toBeTruthy();
+
+    act(() => {
+      usePlaybackStore.setState({ currentTrackId: "track-2", queueIndex: 1 });
+    });
+    rerender(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByAltText("With Art artwork")).toBeNull();
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(container.querySelector('[data-has-artwork="false"]')).toBeTruthy();
+    expect(container.querySelector(".mobile-player-overlay")).toBeNull();
+  });
+
+  it("falls back to no-artwork state when the artwork image errors", () => {
+    setViewport(390, 844);
+    setCachedArtworkForTrack("track-1", "blob:broken-cover");
+
+    const { container } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const img = screen.getByAltText("Test Song artwork");
+    fireEvent.error(img);
+
+    expect(screen.queryByRole("img")).toBeNull();
+    expect(container.querySelector('[data-has-artwork="false"]')).toBeTruthy();
+    expect(container.querySelector(".mobile-player-overlay")).toBeNull();
   });
 });
