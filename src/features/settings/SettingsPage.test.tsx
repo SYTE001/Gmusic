@@ -174,7 +174,7 @@ describe("SettingsPage — Reload missing artwork (end-to-end)", () => {
 
     await waitFor(() => {
       const msg =
-        "Scanned 1: 0 valid preserved · Detected 1 missing · Restored 0, 1 still missing · 1 provider failure.";
+        "Scanned 1: 0 valid preserved · Detected 1 missing · Restored 0, 1 still missing · 1 track affected by provider failure (4 failed HTTP requests).";
       expect(screen.getByText(msg)).toBeTruthy();
       expect(toast).toHaveBeenCalledWith("error", msg);
     });
@@ -198,5 +198,82 @@ describe("SettingsPage — Reload missing artwork (end-to-end)", () => {
       expect(toast).toHaveBeenCalledWith("error", msg);
     });
     expect((await repository.getArtwork(valid.id))?.size).toBe(256);
+  });
+
+  it("renders compact expandable diagnostics breakdown without exposing signed URL query parameters", async () => {
+    const insufTrack = makeTrack("s-diag-meta", { title: "Track 01", artist: "Unknown Artist", album: "" });
+    const signedFailTrack = makeTrack("s-diag-signed", {
+      title: "Signed Decode Fail",
+      artist: "Signed Artist",
+      album: "Signed LP",
+    });
+    await repository.putTracks([insufTrack, signedFailTrack]);
+    useLibraryStore.setState({ tracks: [insufTrack, signedFailTrack] });
+
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => {
+      throw new Error("corrupt payload");
+    }));
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const rawUrl = String(input);
+        if (rawUrl.includes("musicbrainz.org/ws/2/release")) {
+          return { ok: true, status: 200, json: async () => ({ "release-groups": [], releases: [] }) } as unknown as Response;
+        }
+        if (rawUrl.includes("itunes.apple.com/search")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              resultCount: 1,
+              results: [
+                {
+                  trackId: 77,
+                  trackName: "Signed Decode Fail",
+                  artistName: "Signed Artist",
+                  collectionName: "Signed LP",
+                  artworkUrl100: "https://cdn.example.com/100x100bb.jpg?X-Amz-Signature=supersecrettoken123",
+                },
+              ],
+            }),
+          } as unknown as Response;
+        }
+        if (rawUrl.startsWith("https://cdn.example.com/600x600bb.jpg")) {
+          return {
+            ok: true,
+            status: 200,
+            blob: async () => new Blob(["not-an-image"], { type: "text/html" }),
+          } as unknown as Response;
+        }
+        return { ok: false, status: 404, blob: async () => new Blob() } as unknown as Response;
+      }),
+    );
+
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByRole("button", { name: /reload missing artwork/i }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("artwork-recovery-diagnostics")).toBeTruthy();
+    });
+
+    const diagCard = screen.getByTestId("artwork-recovery-diagnostics");
+    expect(diagCard.textContent).toContain("No match: 1");
+    expect(diagCard.textContent).toContain("Image validation: 1");
+
+    const toggleBtn = screen.getByRole("button", { name: /view diagnostics/i });
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggleBtn);
+    expect(toggleBtn.getAttribute("aria-expanded")).toBe("true");
+
+    const metaRow = screen.getByTestId("artwork-diagnostic-track-s-diag-meta");
+    expect(metaRow.textContent).toContain("Result: METADATA_INSUFFICIENT");
+    expect(metaRow.textContent).toContain("MusicBrainz: Skipped");
+
+    const signedRow = screen.getByTestId("artwork-diagnostic-track-s-diag-signed");
+    expect(signedRow.textContent).toContain("Result: IMAGE_DECODE_FAILED");
+    expect(signedRow.textContent).toContain("Host: cdn.example.com");
+    expect(signedRow.textContent).not.toContain("supersecrettoken123");
+    expect(signedRow.textContent).not.toContain("X-Amz-Signature");
   });
 });

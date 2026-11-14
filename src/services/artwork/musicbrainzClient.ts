@@ -1,6 +1,17 @@
 import { workerConfigured, workerUrl } from "../cloud/cloudAuthService";
-import { cleanNoiseFromText, extractPrimaryArtist, isYearOnly, normalizeTrackMetadata } from "../metadata/normalization";
+import {
+  cleanNoiseFromText,
+  extractPrimaryArtist,
+  isYearOnly,
+  normalizeForMatching,
+  normalizeTrackMetadata,
+} from "../metadata/normalization";
 import { normalizeForSearch } from "../../utils/misc";
+import {
+  isAbortError,
+  type CandidateScoreDiagnostic,
+  type ProviderStageClassification,
+} from "./artworkDiagnostics";
 
 /**
  * MusicBrainz Web Service (WS/2) discovery and intelligent release-group / release matcher.
@@ -14,7 +25,7 @@ import { normalizeForSearch } from "../../utils/misc";
 
 export const MUSICBRAINZ_WS_BASE = "https://musicbrainz.org/ws/2";
 export const GMUSIC_USER_AGENT = "Gmusic/1.1.0 ( https://github.com/SYTE001/Gmusic )";
-const MUSICBRAINZ_FETCH_TIMEOUT_MS = 8_000;
+const MUSICBRAINZ_FETCH_TIMEOUT_MS = 12_500;
 
 const MBID_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -149,11 +160,29 @@ export interface MusicBrainzTrackQuery {
 
 export type MusicBrainzFetchStatus = "ok" | "not-found" | "transient-error" | "skipped";
 
+export interface MusicBrainzStageTelemetry {
+  httpStatus: number | null;
+  classification: ProviderStageClassification;
+  rawCount: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  candidateScores: CandidateScoreDiagnostic[];
+  failedRequests: number;
+}
+
+export interface MusicBrainzDiscoveryOptions {
+  maxRetries?: number;
+  retryDelayMs?: number;
+  includeDiagnostics?: boolean;
+  verifyTracksIfAlbumMissing?: boolean;
+}
+
 export interface MusicBrainzDiscoveryResult {
   status: MusicBrainzFetchStatus;
   candidates: ScoredReleaseGroupCandidate[];
   bestCandidate: ScoredReleaseGroupCandidate | null;
   secondaryCandidates: ScoredReleaseGroupCandidate[];
+  diagnostic?: MusicBrainzStageTelemetry;
 }
 
 const PLACEHOLDER_VALUES = new Set([
@@ -234,16 +263,19 @@ export function extractEditionFlags(text: string | undefined | null): EditionFla
 export function normalizeCoreTitle(raw: string | undefined | null): string {
   if (!raw) return "";
   let text = cleanNoiseFromText(raw).cleaned;
-  // Strip parenthetical/bracketed qualifiers that describe editions/remasters
+  // Strip parenthetical/bracketed qualifiers that describe editions, remasters, features, or years
   text = text.replace(
-    /\s*[([][^)\]]*\b(deluxe|expanded|special|collector|anniversary|remaster|remastered|bonus|edition|version|live|remix|remixes|explicit|clean|disc\s*\d+|cd\s*\d+|vol\.?\s*\d+|ep|single|soundtrack|ost)\b[^)\]]*[)\]]/gi,
+    /\s*[([][^)\]]*\b(deluxe|expanded|special|collector|anniversary|remaster|remastered|bonus|edition|version|live|remix|remixes|explicit|clean|disc\s*\d+|cd\s*\d+|vol\.?\s*\d+|ep|single|soundtrack|ost|feat\.?|ft\.?|featuring|with)\b[^)\]]*[)\]]/gi,
     "",
   );
-  // Strip trailing "- Deluxe Edition", "- Remastered 2020", etc.
+  // Strip pure bracketed release years like "(2020)" or "[1999]"
+  text = text.replace(/\s*[([](?:18|19|20)\d{2}[)\]]/g, "");
+  // Strip trailing "- Deluxe Edition", "- Remastered 2020", or unbracketed "feat. Artist"
   text = text.replace(
     /\s+[-–—:]\s*([0-9]{4}\s+)?(deluxe|expanded|special|anniversary|remaster|remastered|edition|version|bonus\s+track|live|ep|single)\b.*$/i,
     "",
   );
+  text = text.replace(/\s+(?:feat|ft|featuring)\.?\s+.+$/i, "");
   return normalizeForSearch(text);
 }
 
@@ -255,12 +287,12 @@ export function extractArtistVariants(rawArtist: string): string[] {
   const primary = extractPrimaryArtist(cleaned);
   const parts = cleaned
     .split(/(?:\s+(?:feat\.?|ft\.?|featuring|with|vs\.?|x)\s+|\s*[,;&/]\s*)/i)
-    .map((part: string) => normalizeForSearch(part))
+    .map((part: string) => normalizeForMatching(part))
     .filter(Boolean);
 
   const set = new Set<string>();
-  const fullNorm = normalizeForSearch(cleaned);
-  const primaryNorm = normalizeForSearch(primary);
+  const fullNorm = normalizeForMatching(cleaned);
+  const primaryNorm = normalizeForMatching(primary);
   if (fullNorm) set.add(fullNorm);
   if (primaryNorm) set.add(primaryNorm);
   for (const part of parts) set.add(part);
@@ -274,16 +306,16 @@ function collectCandidateArtistNames(credits: MusicBrainzArtistCreditEntry[] | u
 
   for (const entry of credits) {
     if (entry.name) {
-      const norm = normalizeForSearch(entry.name);
+      const norm = normalizeForMatching(entry.name);
       if (norm) names.add(norm);
       joinedParts.push(entry.name + (entry.joinphrase ?? " "));
     }
     if (entry.artist?.name) {
-      const norm = normalizeForSearch(entry.artist.name);
+      const norm = normalizeForMatching(entry.artist.name);
       if (norm) names.add(norm);
     }
     if (entry.artist?.["sort-name"]) {
-      const norm = normalizeForSearch(entry.artist["sort-name"]);
+      const norm = normalizeForMatching(entry.artist["sort-name"]);
       if (norm) names.add(norm);
       // Also reverse "Last, First" sort-name to "First Last"
       if (entry.artist["sort-name"].includes(",")) {
@@ -292,14 +324,14 @@ function collectCandidateArtistNames(credits: MusicBrainzArtistCreditEntry[] | u
           .map((s) => s.trim())
           .reverse()
           .join(" ");
-        const revNorm = normalizeForSearch(reversed);
+        const revNorm = normalizeForMatching(reversed);
         if (revNorm) names.add(revNorm);
       }
     }
     if (Array.isArray(entry.artist?.aliases)) {
       for (const alias of entry.artist.aliases) {
         if (alias.name) {
-          const norm = normalizeForSearch(alias.name);
+          const norm = normalizeForMatching(alias.name);
           if (norm) names.add(norm);
         }
       }
@@ -307,7 +339,7 @@ function collectCandidateArtistNames(credits: MusicBrainzArtistCreditEntry[] | u
   }
 
   if (joinedParts.length > 0) {
-    const fullJoined = normalizeForSearch(joinedParts.join(""));
+    const fullJoined = normalizeForMatching(joinedParts.join(""));
     if (fullJoined) names.add(fullJoined);
   }
 
@@ -316,16 +348,16 @@ function collectCandidateArtistNames(credits: MusicBrainzArtistCreditEntry[] | u
 
 /**
  * Computes string similarity in [0..1] combining exact match, core equality,
- * and token Jaccard / containment.
+ * and token Jaccard / containment with unified matching normalization.
  */
 export function computeTextSimilarity(targetRaw: string, candidateRaw: string): number {
-  const targetFull = normalizeForSearch(targetRaw);
-  const candidateFull = normalizeForSearch(candidateRaw);
+  const targetFull = normalizeForMatching(targetRaw);
+  const candidateFull = normalizeForMatching(candidateRaw);
   if (!targetFull || !candidateFull) return 0;
   if (targetFull === candidateFull) return 1.0;
 
-  const targetCore = normalizeCoreTitle(targetRaw);
-  const candidateCore = normalizeCoreTitle(candidateRaw);
+  const targetCore = normalizeForMatching(normalizeCoreTitle(targetRaw));
+  const candidateCore = normalizeForMatching(normalizeCoreTitle(candidateRaw));
   if (targetCore && candidateCore && targetCore === candidateCore) {
     return 0.96;
   }
@@ -517,6 +549,36 @@ function extractReleaseMbids(releases: MusicBrainzReleaseSummary[] | undefined):
 }
 
 /**
+ * Produces a concise human-readable rejection reason for candidate diagnostics.
+ */
+function explainCandidateRejection(params: {
+  artistSim: number;
+  titleSim: number;
+  confidence: number;
+  mediumThreshold: number;
+  liveMismatch?: boolean;
+  remixMismatch?: boolean;
+  compilationMismatch?: boolean;
+}): string {
+  if (params.artistSim < 0.45) {
+    return `Artist similarity too low (${Math.round(params.artistSim * 100)}%)`;
+  }
+  if (params.titleSim < 0.5) {
+    return `Title/album similarity too low (${Math.round(params.titleSim * 100)}%)`;
+  }
+  if (params.liveMismatch) {
+    return "Live edition penalty lowered confidence";
+  }
+  if (params.remixMismatch) {
+    return "Remix edition penalty lowered confidence";
+  }
+  if (params.compilationMismatch) {
+    return "Compilation penalty lowered confidence";
+  }
+  return `Confidence ${params.confidence} below minimum threshold ${params.mediumThreshold}`;
+}
+
+/**
  * Scores an individual MusicBrainz Release candidate, incorporating duration and track evidence
  * when available.
  */
@@ -525,14 +587,36 @@ export function scoreReleaseCandidate(
   query: MusicBrainzTrackQuery,
   thresholds: ConfidenceThresholds = activeThresholds,
 ): ScoredReleaseCandidate {
-  const targetTitle = !isPlaceholderMetadata(query.album) ? query.album! : (query.title ?? "");
+  const hasAlbumMetadata = !isPlaceholderMetadata(query.album);
+  const targetTitle = hasAlbumMetadata ? query.album! : (query.title ?? "");
   const artistSim =
     release["artist-credit"] && release["artist-credit"].length > 0
       ? computeArtistSimilarity(query.artist, release["artist-credit"])
       : 0.85; // When fetched via release-group={MBID}, artist is already validated
-  const titleSim = computeTextSimilarity(targetTitle, release.title ?? targetTitle);
+  const releaseTitleSim = computeTextSimilarity(targetTitle, release.title ?? targetTitle);
 
-  if (artistSim < 0.45 || titleSim < 0.5) {
+  // Check embedded tracklist evidence when available (essential for album-less tracks matched by recording).
+  const allTracks = Array.isArray(release.media)
+    ? release.media.flatMap((m) => m.tracks ?? [])
+    : [];
+  let matchedTrack: { title?: string; length?: number } | undefined;
+  let matchedTrackSim = 0;
+  if (allTracks.length > 0 && query.title && !isPlaceholderMetadata(query.title)) {
+    for (const track of allTracks) {
+      const sim = computeTextSimilarity(query.title, track.title ?? "");
+      if (sim > matchedTrackSim) {
+        matchedTrackSim = sim;
+        matchedTrack = track;
+      }
+    }
+  }
+
+  const effectiveTitleSim =
+    !hasAlbumMetadata && matchedTrackSim >= 0.78
+      ? Math.max(releaseTitleSim, matchedTrackSim)
+      : releaseTitleSim;
+
+  if (artistSim < 0.45 || effectiveTitleSim < 0.5) {
     return {
       release,
       mbid: release.id,
@@ -542,7 +626,7 @@ export function scoreReleaseCandidate(
     };
   }
 
-  let score = artistSim * 45 + titleSim * 42;
+  let score = artistSim * 45 + effectiveTitleSim * 42;
 
   if ((release.status ?? "").toLowerCase() === "official") {
     score += 8;
@@ -560,19 +644,13 @@ export function scoreReleaseCandidate(
   else if (!queryFlags.deluxe && releaseFlags.deluxe) score -= 4;
 
   // Duration and track title validation evidence when media tracks are present
-  if (Array.isArray(release.media) && release.media.length > 0) {
-    const allTracks = release.media.flatMap((m) => m.tracks ?? []);
-    if (allTracks.length > 0 && query.title && !isPlaceholderMetadata(query.title)) {
-      const matchedTrack = allTracks.find((t) => computeTextSimilarity(query.title!, t.title ?? "") >= 0.8);
-      if (matchedTrack) {
-        score += 5;
-        if (query.durationMs && query.durationMs > 0 && matchedTrack.length && matchedTrack.length > 0) {
-          const diffMs = Math.abs(query.durationMs - matchedTrack.length);
-          if (diffMs <= 5000) score += 6;
-          else if (diffMs <= 15000) score += 3;
-          else if (diffMs > 45000) score -= 12;
-        }
-      }
+  if (matchedTrack && matchedTrackSim >= 0.8) {
+    score += 5;
+    if (query.durationMs && query.durationMs > 0 && matchedTrack.length && matchedTrack.length > 0) {
+      const diffMs = Math.abs(query.durationMs - matchedTrack.length);
+      if (diffMs <= 5000) score += 6;
+      else if (diffMs <= 15000) score += 3;
+      else if (diffMs > 45000) score -= 12;
     }
   }
 
@@ -662,84 +740,212 @@ async function waitForRateLimitSlot(): Promise<void> {
 interface RawMusicBrainzResponse<T> {
   status: MusicBrainzFetchStatus;
   data: T | null;
+  httpStatus: number | null;
+  classification: ProviderStageClassification;
+  failedRequests: number;
 }
 
-async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<{ response: Response; aborted: boolean }> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), MUSICBRAINZ_FETCH_TIMEOUT_MS);
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    return { response, aborted: controller.signal.aborted };
+  } catch (err) {
+    const isTimeout =
+      controller.signal.aborted || isAbortError(err);
+    throw Object.assign(err instanceof Error ? err : new Error("Network failure"), { isTimeout });
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
 async function fetchMusicBrainzJson<T>(
-  entity: "release-group" | "release",
+  path: string,
   params: Record<string, string>,
+  options?: { maxRetries?: number; retryDelayMs?: number; skipProxy?: boolean },
 ): Promise<RawMusicBrainzResponse<T>> {
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
-    return { status: "transient-error", data: null };
+    return {
+      status: "transient-error",
+      data: null,
+      httpStatus: null,
+      classification: "network-error",
+      failedRequests: 0,
+    };
   }
   // Never make real external network calls in unit tests when fetch is not mocked
   if (import.meta.env.MODE === "test" && typeof fetch === "function" && !("mock" in fetch)) {
-    return { status: "transient-error", data: null };
+    return {
+      status: "transient-error",
+      data: null,
+      httpStatus: null,
+      classification: "network-error",
+      failedRequests: 0,
+    };
   }
 
-  await waitForRateLimitSlot();
-
+  const maxRetries = Math.max(0, options?.maxRetries ?? 0);
+  const retryBaseMs =
+    options?.retryDelayMs ?? (import.meta.env.MODE === "test" ? 0 : 1200);
   const searchParams = new URLSearchParams({ ...params, fmt: "json" });
-  const proxyBase = getMetadataProxyBaseUrl();
+  const proxyBase = options?.skipProxy ? null : getMetadataProxyBaseUrl();
 
-  // 1. Try optional Cloudflare Worker proxy first when configured
-  if (proxyBase) {
-    const proxyUrl = `${proxyBase}/api/musicbrainz/${entity}?${searchParams.toString()}`;
-    try {
-      const response = await fetchWithTimeout(proxyUrl, {
-        method: "GET",
-        headers: { Accept: "application/json" },
-      });
-      if (response.ok) {
+  let failedRequests = 0;
+  let lastHttpStatus: number | null = null;
+  let lastClassification: ProviderStageClassification = "not-queried";
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0 && retryBaseMs > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, retryBaseMs * attempt));
+    }
+
+    await waitForRateLimitSlot();
+
+    // 1. Try optional Cloudflare Worker proxy first when configured
+    let fallThroughToDirect = !proxyBase;
+    if (proxyBase) {
+      const proxyUrl = `${proxyBase}/api/musicbrainz/${path}?${searchParams.toString()}`;
+      try {
+        const { response } = await fetchWithTimeout(proxyUrl, {
+          method: "GET",
+          headers: { Accept: "application/json" },
+        });
+        lastHttpStatus = response.status;
+        if (response.ok) {
+          const json = (await response.json()) as T;
+          return {
+            status: "ok",
+            data: json,
+            httpStatus: response.status,
+            classification: "ok",
+            failedRequests,
+          };
+        }
+        if (response.status === 429) {
+          failedRequests += 1;
+          lastClassification = "rate-limited";
+          if (attempt < maxRetries) continue;
+          return {
+            status: "transient-error",
+            data: null,
+            httpStatus: 429,
+            classification: "rate-limited",
+            failedRequests,
+          };
+        }
+        if (response.status === 503 || response.status >= 500) {
+          failedRequests += 1;
+          lastClassification = "http-error";
+          if (attempt < maxRetries) continue;
+          return {
+            status: "transient-error",
+            data: null,
+            httpStatus: response.status,
+            classification: "http-error",
+            failedRequests,
+          };
+        }
+        // Undeployed Worker routes return 404/405/501 and unsupported Worker params return 400;
+        // fall through to direct MusicBrainz WS/2 instead of falsely declaring no match.
+        fallThroughToDirect = true;
+      } catch {
+        // Worker unreachable -> fall through to direct MusicBrainz WS/2 after slot spacing
+        fallThroughToDirect = true;
+      }
+    }
+
+    if (fallThroughToDirect) {
+      if (proxyBase) {
+        await waitForRateLimitSlot();
+      }
+      const directUrl = `${MUSICBRAINZ_WS_BASE}/${path}?${searchParams.toString()}`;
+      try {
+        const { response } = await fetchWithTimeout(directUrl, {
+          method: "GET",
+          headers: {
+            Accept: "application/json",
+            "User-Agent": GMUSIC_USER_AGENT,
+          },
+        });
+        lastHttpStatus = response.status;
+        if (response.status === 404) {
+          return {
+            status: "not-found",
+            data: null,
+            httpStatus: 404,
+            classification: "not-found",
+            failedRequests,
+          };
+        }
+        if (response.status === 429) {
+          failedRequests += 1;
+          lastClassification = "rate-limited";
+          if (attempt < maxRetries) continue;
+          return {
+            status: "transient-error",
+            data: null,
+            httpStatus: 429,
+            classification: "rate-limited",
+            failedRequests,
+          };
+        }
+        if (response.status === 503 || response.status >= 500) {
+          failedRequests += 1;
+          lastClassification = "http-error";
+          if (attempt < maxRetries) continue;
+          return {
+            status: "transient-error",
+            data: null,
+            httpStatus: response.status,
+            classification: "http-error",
+            failedRequests,
+          };
+        }
+        if (!response.ok) {
+          failedRequests += 1;
+          return {
+            status: "not-found",
+            data: null,
+            httpStatus: response.status,
+            classification: "http-error",
+            failedRequests,
+          };
+        }
         const json = (await response.json()) as T;
-        return { status: "ok", data: json };
+        return {
+          status: "ok",
+          data: json,
+          httpStatus: response.status,
+          classification: "ok",
+          failedRequests,
+        };
+      } catch (err) {
+        failedRequests += 1;
+        lastHttpStatus = null;
+        lastClassification =
+          err && typeof err === "object" && "isTimeout" in err && (err as { isTimeout?: boolean }).isTimeout
+            ? "timeout"
+            : "network-error";
+        if (attempt < maxRetries) continue;
+        return {
+          status: "transient-error",
+          data: null,
+          httpStatus: null,
+          classification: lastClassification,
+          failedRequests,
+        };
       }
-      if (response.status === 429 || response.status === 503) {
-        return { status: "transient-error", data: null };
-      }
-      // If proxy route returns 404 with an entity not-found code, treat as not-found;
-      // if Worker is older and returns 400 "Unknown endpoint", fall through to direct MusicBrainz WS/2.
-      if (response.status === 404) {
-        return { status: "not-found", data: null };
-      }
-    } catch {
-      // Worker unreachable -> fall through to direct MusicBrainz WS/2
     }
   }
 
-  // 2. Direct MusicBrainz WS/2 request (with identifiable User-Agent header)
-  const directUrl = `${MUSICBRAINZ_WS_BASE}/${entity}?${searchParams.toString()}`;
-  try {
-    const response = await fetchWithTimeout(directUrl, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        "User-Agent": GMUSIC_USER_AGENT,
-      },
-    });
-    if (response.status === 404) {
-      return { status: "not-found", data: null };
-    }
-    if (response.status === 429 || response.status === 503 || response.status >= 500) {
-      return { status: "transient-error", data: null };
-    }
-    if (!response.ok) {
-      return { status: "not-found", data: null };
-    }
-    const json = (await response.json()) as T;
-    return { status: "ok", data: json };
-  } catch {
-    return { status: "transient-error", data: null };
-  }
+  return {
+    status: "transient-error",
+    data: null,
+    httpStatus: lastHttpStatus,
+    classification: lastClassification,
+    failedRequests,
+  };
 }
 
 /**
@@ -748,14 +954,34 @@ async function fetchMusicBrainzJson<T>(
 export async function searchMusicBrainzReleaseGroups(
   query: MusicBrainzTrackQuery,
   thresholds: ConfidenceThresholds = activeThresholds,
+  options?: MusicBrainzDiscoveryOptions,
 ): Promise<MusicBrainzDiscoveryResult> {
+  const withDiag = (
+    base: MusicBrainzDiscoveryResult,
+    diagnostic: MusicBrainzStageTelemetry,
+  ): MusicBrainzDiscoveryResult => {
+    if (!options?.includeDiagnostics) return base;
+    return { ...base, diagnostic };
+  };
+
   if (!hasSufficientMetadataForMusicBrainz(query)) {
-    return {
-      status: "skipped",
-      candidates: [],
-      bestCandidate: null,
-      secondaryCandidates: [],
-    };
+    return withDiag(
+      {
+        status: "skipped",
+        candidates: [],
+        bestCandidate: null,
+        secondaryCandidates: [],
+      },
+      {
+        httpStatus: null,
+        classification: "skipped",
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: 0,
+      },
+    );
   }
 
   const luceneQuery = buildReleaseGroupSearchQuery(query);
@@ -765,15 +991,27 @@ export async function searchMusicBrainzReleaseGroups(
       query: luceneQuery,
       limit: "10",
     },
+    options,
   );
 
   if (response.status !== "ok" || !response.data) {
-    return {
-      status: response.status,
-      candidates: [],
-      bestCandidate: null,
-      secondaryCandidates: [],
-    };
+    return withDiag(
+      {
+        status: response.status,
+        candidates: [],
+        bestCandidate: null,
+        secondaryCandidates: [],
+      },
+      {
+        httpStatus: response.httpStatus,
+        classification: response.classification,
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
   const rawGroups = Array.isArray(response.data["release-groups"])
@@ -781,34 +1019,152 @@ export async function searchMusicBrainzReleaseGroups(
     : [];
 
   if (rawGroups.length === 0) {
-    return {
-      status: "not-found",
-      candidates: [],
-      bestCandidate: null,
-      secondaryCandidates: [],
-    };
+    return withDiag(
+      {
+        status: "not-found",
+        candidates: [],
+        bestCandidate: null,
+        secondaryCandidates: [],
+      },
+      {
+        httpStatus: response.httpStatus,
+        classification: "not-found",
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
-  const scored = rawGroups
-    .map((group) => scoreReleaseGroupCandidate(group, query, thresholds))
+  const allScored = rawGroups.map((group) => scoreReleaseGroupCandidate(group, query, thresholds));
+  const scored = allScored
     .filter((candidate) => candidate.tier !== "low")
     .sort((a, b) => b.confidence - a.confidence);
 
+  const queryFlags = extractEditionFlags(`${query.album ?? ""} ${query.title ?? ""}`);
+  const candidateScores: CandidateScoreDiagnostic[] = allScored
+    .slice(0, 6)
+    .map((candidate) => {
+      const secTypes = (candidate.releaseGroup["secondary-types"] ?? []).map((t) => t.toLowerCase());
+      const cFlags = extractEditionFlags(
+        `${candidate.releaseGroup.title ?? ""} ${candidate.releaseGroup.disambiguation ?? ""}`,
+      );
+      const accepted = candidate.tier !== "low";
+      return {
+        title: candidate.releaseGroup.title,
+        artist: candidate.releaseGroup["artist-credit"]?.map((c) => c.name ?? c.artist?.name ?? "").filter(Boolean).join(", "),
+        confidence: candidate.confidence,
+        accepted,
+        ...(accepted
+          ? {}
+          : {
+              rejectionReason: explainCandidateRejection({
+                artistSim: candidate.artistScore,
+                titleSim: candidate.titleScore,
+                confidence: candidate.confidence,
+                mediumThreshold: thresholds.medium,
+                liveMismatch: (secTypes.includes("live") || cFlags.live) && !queryFlags.live,
+                remixMismatch: (secTypes.includes("remix") || cFlags.remix) && !queryFlags.remix,
+                compilationMismatch: (secTypes.includes("compilation") || cFlags.compilation) && !queryFlags.compilation,
+              }),
+            }),
+      };
+    });
+
+  const rejectedCount = allScored.length - scored.length;
+
   if (scored.length === 0) {
-    return {
-      status: "not-found",
-      candidates: [],
-      bestCandidate: null,
-      secondaryCandidates: [],
-    };
+    return withDiag(
+      {
+        status: "not-found",
+        candidates: [],
+        bestCandidate: null,
+        secondaryCandidates: [],
+      },
+      {
+        httpStatus: response.httpStatus,
+        classification: "candidates-rejected",
+        rawCount: rawGroups.length,
+        acceptedCount: 0,
+        rejectedCount,
+        candidateScores,
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
+  return withDiag(
+    {
+      status: "ok",
+      candidates: scored,
+      bestCandidate: scored[0],
+      secondaryCandidates: scored.slice(1),
+    },
+    {
+      httpStatus: response.httpStatus,
+      classification: "ok",
+      rawCount: rawGroups.length,
+      acceptedCount: scored.length,
+      rejectedCount,
+      candidateScores,
+      failedRequests: response.failedRequests,
+    },
+  );
+}
+
+/**
+ * Fetches full details (recordings + media tracklists + artist credits + release-groups)
+ * for an individual Release MBID.
+ */
+export async function fetchReleaseDetailsByMbid(
+  releaseMbid: string,
+  options?: { maxRetries?: number; retryDelayMs?: number },
+): Promise<{
+  status: MusicBrainzFetchStatus;
+  release: MusicBrainzReleaseSummary | null;
+  httpStatus: number | null;
+  classification: ProviderStageClassification;
+  failedRequests: number;
+}> {
+  if (!isValidMbid(releaseMbid)) {
+    return {
+      status: "not-found",
+      release: null,
+      httpStatus: null,
+      classification: "skipped",
+      failedRequests: 0,
+    };
+  }
+  const cleanMbid = releaseMbid.trim().toLowerCase();
+  const response = await fetchMusicBrainzJson<MusicBrainzReleaseSummary>(
+    `release/${cleanMbid}`,
+    { inc: "recordings+media+artist-credits+release-groups" },
+    { ...options, skipProxy: true },
+  );
+  if (response.status !== "ok" || !response.data || !isValidMbid(response.data.id)) {
+    return {
+      status: response.status,
+      release: null,
+      httpStatus: response.httpStatus,
+      classification: response.classification,
+      failedRequests: response.failedRequests,
+    };
+  }
   return {
     status: "ok",
-    candidates: scored,
-    bestCandidate: scored[0],
-    secondaryCandidates: scored.slice(1),
+    release: response.data,
+    httpStatus: response.httpStatus,
+    classification: "ok",
+    failedRequests: response.failedRequests,
   };
+}
+
+export interface MusicBrainzReleaseSearchResult {
+  status: MusicBrainzFetchStatus;
+  releases: ScoredReleaseCandidate[];
+  diagnostic?: MusicBrainzStageTelemetry;
 }
 
 /**
@@ -819,19 +1175,54 @@ export async function fetchReleasesForReleaseGroup(
   releaseGroupMbid: string,
   query: MusicBrainzTrackQuery,
   thresholds: ConfidenceThresholds = activeThresholds,
-): Promise<{ status: MusicBrainzFetchStatus; releases: ScoredReleaseCandidate[] }> {
+  options?: MusicBrainzDiscoveryOptions,
+): Promise<MusicBrainzReleaseSearchResult> {
+  const withDiag = (
+    base: MusicBrainzReleaseSearchResult,
+    diagnostic: MusicBrainzStageTelemetry,
+  ): MusicBrainzReleaseSearchResult => {
+    if (!options?.includeDiagnostics) return base;
+    return { ...base, diagnostic };
+  };
+
   if (!isValidMbid(releaseGroupMbid)) {
-    return { status: "not-found", releases: [] };
+    return withDiag(
+      { status: "not-found", releases: [] },
+      {
+        httpStatus: null,
+        classification: "skipped",
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: 0,
+      },
+    );
   }
 
-  const response = await fetchMusicBrainzJson<{ releases?: MusicBrainzReleaseSummary[] }>("release", {
-    "release-group": releaseGroupMbid.toLowerCase(),
-    inc: "recordings+media+artist-credits",
-    limit: "10",
-  });
+  const response = await fetchMusicBrainzJson<{ releases?: MusicBrainzReleaseSummary[] }>(
+    "release",
+    {
+      "release-group": releaseGroupMbid.toLowerCase(),
+      inc: "recordings+media+artist-credits",
+      limit: "10",
+    },
+    options,
+  );
 
   if (response.status !== "ok" || !response.data) {
-    return { status: response.status, releases: [] };
+    return withDiag(
+      { status: response.status, releases: [] },
+      {
+        httpStatus: response.httpStatus,
+        classification: response.classification,
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
   const rawReleases = Array.isArray(response.data.releases)
@@ -839,18 +1230,45 @@ export async function fetchReleasesForReleaseGroup(
     : [];
 
   if (rawReleases.length === 0) {
-    return { status: "not-found", releases: [] };
+    return withDiag(
+      { status: "not-found", releases: [] },
+      {
+        httpStatus: response.httpStatus,
+        classification: "not-found",
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
-  const scored = rawReleases
-    .map((rel) => scoreReleaseCandidate(rel, query, thresholds))
+  const allScored = rawReleases.map((rel) => scoreReleaseCandidate(rel, query, thresholds));
+  const scored = allScored
     .filter((rel) => rel.tier !== "low")
     .sort((a, b) => b.confidence - a.confidence);
 
-  return {
-    status: scored.length > 0 ? "ok" : "not-found",
-    releases: scored,
-  };
+  const rejectedCount = allScored.length - scored.length;
+  return withDiag(
+    {
+      status: scored.length > 0 ? "ok" : "not-found",
+      releases: scored,
+    },
+    {
+      httpStatus: response.httpStatus,
+      classification: scored.length > 0 ? "ok" : "candidates-rejected",
+      rawCount: rawReleases.length,
+      acceptedCount: scored.length,
+      rejectedCount,
+      candidateScores: allScored.slice(0, 6).map((r) => ({
+        title: r.release.title ?? "",
+        confidence: r.confidence,
+        accepted: r.tier !== "low",
+      })),
+      failedRequests: response.failedRequests,
+    },
+  );
 }
 
 /**
@@ -860,19 +1278,54 @@ export async function fetchReleasesForReleaseGroup(
 export async function searchMusicBrainzReleases(
   query: MusicBrainzTrackQuery,
   thresholds: ConfidenceThresholds = activeThresholds,
-): Promise<{ status: MusicBrainzFetchStatus; releases: ScoredReleaseCandidate[] }> {
+  options?: MusicBrainzDiscoveryOptions,
+): Promise<MusicBrainzReleaseSearchResult> {
+  const withDiag = (
+    base: MusicBrainzReleaseSearchResult,
+    diagnostic: MusicBrainzStageTelemetry,
+  ): MusicBrainzReleaseSearchResult => {
+    if (!options?.includeDiagnostics) return base;
+    return { ...base, diagnostic };
+  };
+
   if (!hasSufficientMetadataForMusicBrainz(query)) {
-    return { status: "skipped", releases: [] };
+    return withDiag(
+      { status: "skipped", releases: [] },
+      {
+        httpStatus: null,
+        classification: "skipped",
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: 0,
+      },
+    );
   }
 
   const luceneQuery = buildReleaseSearchQuery(query);
-  const response = await fetchMusicBrainzJson<{ releases?: MusicBrainzReleaseSummary[] }>("release", {
-    query: luceneQuery,
-    limit: "10",
-  });
+  const response = await fetchMusicBrainzJson<{ releases?: MusicBrainzReleaseSummary[] }>(
+    "release",
+    {
+      query: luceneQuery,
+      limit: "10",
+    },
+    options,
+  );
 
   if (response.status !== "ok" || !response.data) {
-    return { status: response.status, releases: [] };
+    return withDiag(
+      { status: response.status, releases: [] },
+      {
+        httpStatus: response.httpStatus,
+        classification: response.classification,
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
   const rawReleases = Array.isArray(response.data.releases)
@@ -880,16 +1333,109 @@ export async function searchMusicBrainzReleases(
     : [];
 
   if (rawReleases.length === 0) {
-    return { status: "not-found", releases: [] };
+    return withDiag(
+      { status: "not-found", releases: [] },
+      {
+        httpStatus: response.httpStatus,
+        classification: "not-found",
+        rawCount: 0,
+        acceptedCount: 0,
+        rejectedCount: 0,
+        candidateScores: [],
+        failedRequests: response.failedRequests,
+      },
+    );
   }
 
-  const scored = rawReleases
-    .map((rel) => scoreReleaseCandidate(rel, query, thresholds))
+  let extraFailedRequests = 0;
+  let allScored = rawReleases.map((rel) => scoreReleaseCandidate(rel, query, thresholds));
+  let scored = allScored
     .filter((rel) => rel.tier !== "low")
     .sort((a, b) => b.confidence - a.confidence);
 
-  return {
-    status: scored.length > 0 ? "ok" : "not-found",
-    releases: scored,
-  };
+  // When album metadata is absent and release-level search returned artist-matching albums
+  // without embedded tracklists, verify up to top 2 official releases for matching track evidence.
+  const hasAlbumMetadata = !isPlaceholderMetadata(query.album);
+  if (
+    scored.length === 0 &&
+    !hasAlbumMetadata &&
+    options?.verifyTracksIfAlbumMissing &&
+    query.title &&
+    !isPlaceholderMetadata(query.title)
+  ) {
+    const candidatesToVerify = rawReleases
+      .filter((rel) => {
+        const hasTracks = Array.isArray(rel.media) && rel.media.some((m) => Array.isArray(m.tracks) && m.tracks.length > 0);
+        if (hasTracks) return false;
+        const artistSim =
+          rel["artist-credit"] && rel["artist-credit"].length > 0
+            ? computeArtistSimilarity(query.artist, rel["artist-credit"])
+            : 0;
+        return artistSim >= 0.65;
+      })
+      .sort((a, b) => {
+        const aOff = (a.status ?? "").toLowerCase() === "official" ? 0 : 1;
+        const bOff = (b.status ?? "").toLowerCase() === "official" ? 0 : 1;
+        return aOff - bOff;
+      })
+      .slice(0, 2);
+
+    const verifiedReleases: MusicBrainzReleaseSummary[] = [];
+    for (const candidateRel of candidatesToVerify) {
+      const details = await fetchReleaseDetailsByMbid(candidateRel.id, options);
+      extraFailedRequests += details.failedRequests;
+      if (details.status === "ok" && details.release) {
+        verifiedReleases.push(details.release);
+      }
+    }
+
+    if (verifiedReleases.length > 0) {
+      allScored = verifiedReleases.map((rel) => scoreReleaseCandidate(rel, query, thresholds));
+      scored = allScored
+        .filter((rel) => rel.tier !== "low")
+        .sort((a, b) => b.confidence - a.confidence);
+    }
+  }
+
+  const candidateScores: CandidateScoreDiagnostic[] = allScored.slice(0, 6).map((rel) => {
+    const artistSim =
+      rel.release["artist-credit"] && rel.release["artist-credit"].length > 0
+        ? computeArtistSimilarity(query.artist, rel.release["artist-credit"])
+        : 0.85;
+    const titleTarget = !isPlaceholderMetadata(query.album) ? query.album! : (query.title ?? "");
+    const titleSim = computeTextSimilarity(titleTarget, rel.release.title ?? "");
+    const accepted = rel.tier !== "low";
+    return {
+      title: rel.release.title ?? "",
+      confidence: rel.confidence,
+      accepted,
+      ...(accepted
+        ? {}
+        : {
+            rejectionReason: explainCandidateRejection({
+              artistSim,
+              titleSim,
+              confidence: rel.confidence,
+              mediumThreshold: thresholds.medium,
+            }),
+          }),
+    };
+  });
+
+  const rejectedCount = allScored.length - scored.length;
+  return withDiag(
+    {
+      status: scored.length > 0 ? "ok" : "not-found",
+      releases: scored,
+    },
+    {
+      httpStatus: response.httpStatus,
+      classification: scored.length > 0 ? "ok" : "candidates-rejected",
+      rawCount: rawReleases.length,
+      acceptedCount: scored.length,
+      rejectedCount,
+      candidateScores,
+      failedRequests: response.failedRequests + extraFailedRequests,
+    },
+  );
 }

@@ -1,6 +1,21 @@
 import type { Track } from "../../types";
 import { normalizeForSearch } from "../../utils/misc";
 
+/**
+ * Matching normalization that unifies diacritics, smart quotes/apostrophes,
+ * ampersands (`&` <-> `and`), brackets, and separators without mutating
+ * display strings stored in track metadata.
+ */
+export function normalizeForMatching(input: string): string {
+  if (!input) return "";
+  return normalizeForSearch(input)
+    .replace(/[’'`‘]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[“”"()[\]{}<>.,:;!?/\\|_*~+=\-–—]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export type NormalizedIdentity = {
   title: string;
   artist: string;
@@ -68,7 +83,11 @@ const NOISE_PATTERNS = [
   /video\s+clip/i,
   /\bmv\b/i,
   /\b(?:hd|4k|1080p|720p|hq|60fps)\b/i,
+  /\b(?:320\s*kbps|256\s*kbps|192\s*kbps|128\s*kbps|flac|lossless|webrip|cdrip)\b/i,
   /(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?/i,
+  /^(?:explicit|clean|explicit\s+version|clean\s+version)$/i,
+  /^(?:deluxe|expanded|special|anniversary|collector'?s?)\s+(?:edition|version)$/i,
+  /^(?:18|19|20)\d{2}$/,
 ];
 
 /** File extensions to strip from filenames */
@@ -122,12 +141,22 @@ const KNOWN_PROMOTER_CHANNELS = new Set([
   "regravar",
 ]);
 
-export function isSuspectChannelOrNoise(artist: string | undefined | null): boolean {
+export function isPlaceholderArtist(artist: string | undefined | null): boolean {
   if (!artist) return true;
   const norm = normalizeForSearch(artist);
   if (!norm) return true;
+  return /^(?:unknown(?:\s+artist)?|various(?:\s+artists)?|va|v\.a\.|none|null|undefined)$/i.test(norm);
+}
+
+export function isSuspectChannelOrNoise(artist: string | undefined | null): boolean {
+  if (isPlaceholderArtist(artist)) return true;
+  const norm = normalizeForSearch(artist ?? "");
+  if (!norm) return true;
   if (KNOWN_PROMOTER_CHANNELS.has(norm)) return true;
-  if (/^(?:lyrics?|official\s+audio|audio|topic|channel|vevo|records|unknown(?:\s+artist)?|various(?:\s+artists)?)$/i.test(norm)) {
+  if (
+    /^(?:lyrics?|official\s+(?:audio|video|music|channel)|audio|topic|channel|vevo|records|music\s+channel)$/i.test(norm) ||
+    /(?:official\s+channel|music\s+channel|lyrics?\s+channel|vevo)$/i.test(norm)
+  ) {
     return true;
   }
   return false;
@@ -157,6 +186,14 @@ export function hasArtistCollaboration(text: string): boolean {
 export function extractPrimaryArtist(artist: string): string {
   if (!artist) return "";
   const primary = artist.replace(/\s*-\s*topic\b/i, "").trim();
+  // Preserve compound single-artist/band names like "Tyler, The Creator" or "Florence and the Machine"
+  if (/^[^,]+,\s*the\s+\S+/i.test(primary) || /^.+\s+(?:and|&)\s+the\s+\S+/i.test(primary)) {
+    const featSplit = primary.split(/\s+(?:feat|ft|featuring)\.?\s+|\s+x\s+|\s+with\s+|\s+vs\.?\s+/i);
+    if (featSplit.length > 0 && featSplit[0].trim().length > 0) {
+      return featSplit[0].trim();
+    }
+    return primary;
+  }
   const split = primary.split(/\s+(?:feat|ft|featuring)\.?\s+|\s+&\s+|\s*,\s*|\s+x\s+|\s+with\s+|\s+vs\.?\s+|\s+(?:dan|and)\s+/i);
   if (split.length > 0 && split[0].trim().length > 0) {
     return split[0].trim();
@@ -531,9 +568,17 @@ export function normalizeTrackMetadata(
     }
   }
 
-  // Cleaned title without any version qualifiers (for broad search query)
+  // Blank pure placeholder artists like "Unknown Artist" / "Various Artists" so providers
+  // do not search literal "Unknown Artist <song>".
+  if (isPlaceholderArtist(canonicalArtist)) {
+    canonicalArtist = "";
+  }
+
+  // Cleaned title without any version qualifiers or trailing unbracketed feat. credits
   const baseTitleWithoutBrackets = canonicalTitle
     .replace(BRACKETED_SEGMENT_REGEX, " ")
+    .replace(/\s+(?:feat|ft|featuring)\.?\s+.+$/i, "")
+    .replace(/\s*[-–—|~]\s*$/, "")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -541,10 +586,20 @@ export function normalizeTrackMetadata(
 
   // 3. Generate alternative search queries (prioritized, deduplicated)
   const alternateQueries: Array<{ trackName: string; artistName: string; q?: string; reason: string }> = [];
+  const seenQueries = new Set<string>();
+  const primaryKey = `${normalizeForMatching(canonicalTitle)}||${normalizeForMatching(canonicalArtist)}||`;
+  seenQueries.add(primaryKey);
+
+  const pushAlternate = (entry: { trackName: string; artistName: string; q?: string; reason: string }) => {
+    const key = `${normalizeForMatching(entry.trackName)}||${normalizeForMatching(entry.artistName)}||${normalizeForMatching(entry.q ?? "")}`;
+    if (seenQueries.has(key)) return;
+    seenQueries.add(key);
+    alternateQueries.push(entry);
+  };
 
   // Cleaned title + normalized artist:
   if (baseTitleWithoutBrackets && baseTitleWithoutBrackets !== canonicalTitle) {
-    alternateQueries.push({
+    pushAlternate({
       trackName: baseTitleWithoutBrackets,
       artistName: canonicalArtist,
       reason: "Cleaned base title without brackets",
@@ -553,13 +608,13 @@ export function normalizeTrackMetadata(
 
   // Canonical title + primary artist (without featured artists):
   if (primaryArtist && primaryArtist !== canonicalArtist) {
-    alternateQueries.push({
+    pushAlternate({
       trackName: canonicalTitle,
       artistName: primaryArtist,
       reason: "Primary artist without featured credits",
     });
     if (baseTitleWithoutBrackets && baseTitleWithoutBrackets !== canonicalTitle) {
-      alternateQueries.push({
+      pushAlternate({
         trackName: baseTitleWithoutBrackets,
         artistName: primaryArtist,
         reason: "Cleaned base title with primary artist",
@@ -569,7 +624,7 @@ export function normalizeTrackMetadata(
 
   // Original title + normalized artist:
   if (rawTitle && rawTitle !== canonicalTitle && rawTitle !== baseTitleWithoutBrackets) {
-    alternateQueries.push({
+    pushAlternate({
       trackName: rawTitle,
       artistName: canonicalArtist,
       reason: "Original title with normalized artist",
@@ -578,7 +633,7 @@ export function normalizeTrackMetadata(
 
   // Delimiter-less free query
   if (canonicalTitle && canonicalArtist) {
-    alternateQueries.push({
+    pushAlternate({
       trackName: canonicalTitle,
       artistName: canonicalArtist,
       q: `${canonicalArtist} ${canonicalTitle}`.trim(),
@@ -586,9 +641,9 @@ export function normalizeTrackMetadata(
     });
   }
 
-  // Swapped order as last fallback:
-  if (canonicalArtist && canonicalTitle) {
-    alternateQueries.push({
+  // Swapped order as last fallback (only when artist and title differ meaningfully):
+  if (canonicalArtist && canonicalTitle && normalizeForMatching(canonicalArtist) !== normalizeForMatching(canonicalTitle)) {
+    pushAlternate({
       trackName: canonicalArtist,
       artistName: canonicalTitle,
       reason: isFlipped ? "Original unswapped ordering" : "Alternative title/artist ordering (swapped)",

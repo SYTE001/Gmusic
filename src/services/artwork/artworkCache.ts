@@ -9,6 +9,20 @@ import {
   markArtworkUrlFailed,
   resolveArtworkForTrack,
 } from "./artworkService";
+import {
+  classifyTrackFailure,
+  createEmptyCaaDiagnostic,
+  createEmptyItunesDiagnostic,
+  createEmptyMusicBrainzDiagnostic,
+  extractSafeUrlHost,
+  isAbortError,
+  isProviderFailureReason,
+  type ArtworkFailureReason,
+  type ImageDecodeDiagnostic,
+  type ImageDownloadDiagnostic,
+  type TrackArtworkDiagnostic,
+  type TrackDiscoveryDiagnostic,
+} from "./artworkDiagnostics";
 import type { Track } from "../../types";
 import { perfMark, perfMeasure } from "../../utils/perf";
 
@@ -231,35 +245,42 @@ async function looksLikeHtmlOrJsonPayload(blob: Blob): Promise<boolean> {
   }
 }
 
-/**
- * Validates that a downloaded or persisted blob is a real, decodable image
- * before it is ever persisted or displayed.
- */
-export async function validateArtworkBlob(blob: Blob): Promise<boolean> {
+async function validateArtworkBlobWithReason(blob: Blob): Promise<{
+  valid: boolean;
+  reason: NonNullable<ImageDecodeDiagnostic["reason"]>;
+}> {
   if (
     !blob ||
     typeof blob.size !== "number" ||
     !Number.isFinite(blob.size) ||
-    blob.size < MIN_ARTWORK_BLOB_BYTES ||
-    blob.size > MAX_ARTWORK_BLOB_BYTES
+    blob.size < MIN_ARTWORK_BLOB_BYTES
   ) {
-    return false;
+    return { valid: false, reason: "undersized" };
   }
-  if (blob.type && !blob.type.startsWith("image/")) return false;
-  if (await looksLikeHtmlOrJsonPayload(blob)) return false;
+  if (blob.size > MAX_ARTWORK_BLOB_BYTES) {
+    return { valid: false, reason: "oversized" };
+  }
+  if (blob.type && !blob.type.startsWith("image/")) {
+    return { valid: false, reason: "invalid-mime" };
+  }
+  if (await looksLikeHtmlOrJsonPayload(blob)) {
+    return { valid: false, reason: "html-or-json" };
+  }
 
   if (typeof createImageBitmap === "function") {
     try {
       const bitmap = await createImageBitmap(blob);
       bitmap.close();
-      return true;
+      return { valid: true, reason: "ok" };
     } catch {
-      return false;
+      return { valid: false, reason: "decode-failed" };
     }
   }
 
   if (!canUseDomImageElement()) {
-    return !blob.type || blob.type.startsWith("image/");
+    return !blob.type || blob.type.startsWith("image/")
+      ? { valid: true, reason: "ok" }
+      : { valid: false, reason: "invalid-mime" };
   }
 
   // Fallback decode path (environments without createImageBitmap)
@@ -269,13 +290,24 @@ export async function validateArtworkBlob(blob: Blob): Promise<boolean> {
     const finish = (ok: boolean) => {
       clearTimeout(timer);
       URL.revokeObjectURL(objectUrl);
-      resolve(ok);
+      resolve({ valid: ok, reason: ok ? "ok" : "decode-failed" });
     };
     const timer = setTimeout(() => finish(false), 5000);
-    img.onload = () => finish(img.naturalWidth === 0 && img.naturalHeight === 0 ? true : img.naturalWidth > 0);
+    img.onload = () => {
+      const ok = img.naturalWidth === 0 && img.naturalHeight === 0 ? true : img.naturalWidth > 0;
+      finish(ok);
+    };
     img.onerror = () => finish(false);
     img.src = objectUrl;
   });
+}
+
+/**
+ * Validates that a downloaded or persisted blob is a real, decodable image
+ * before it is ever persisted or displayed.
+ */
+export async function validateArtworkBlob(blob: Blob): Promise<boolean> {
+  return (await validateArtworkBlobWithReason(blob)).valid;
 }
 
 async function probeImageElement(url: string, timeoutMs = IMAGE_PROBE_TIMEOUT_MS): Promise<boolean> {
@@ -300,21 +332,30 @@ async function probeImageElement(url: string, timeoutMs = IMAGE_PROBE_TIMEOUT_MS
 }
 
 type RemoteValidationOutcome =
-  | { status: "valid-blob"; blob: Blob }
-  | { status: "valid-cors" }
-  | { status: "broken" }
-  | { status: "transient-error" }
-  | { status: "offline" };
+  | { status: "valid-blob"; blob: Blob; httpStatus?: number | null }
+  | { status: "valid-cors"; httpStatus?: number | null }
+  | {
+      status: "broken";
+      httpStatus?: number | null;
+      downloadClassification?: ImageDownloadDiagnostic["classification"];
+      decodeReason?: ImageDecodeDiagnostic["reason"];
+    }
+  | {
+      status: "transient-error";
+      httpStatus?: number | null;
+      downloadClassification?: ImageDownloadDiagnostic["classification"];
+    }
+  | { status: "offline"; httpStatus?: number | null };
 
 async function validateRemoteArtworkUrl(
   url: string,
   sessionProbeCache?: Map<string, Promise<RemoteValidationOutcome>>,
 ): Promise<RemoteValidationOutcome> {
   if (typeof isArtworkUrlFailed === "function" && isArtworkUrlFailed(url)) {
-    return { status: "broken" };
+    return { status: "broken", httpStatus: null, downloadClassification: "http-error" };
   }
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
-    return { status: "offline" };
+    return { status: "offline", httpStatus: null };
   }
 
   if (sessionProbeCache) {
@@ -327,23 +368,32 @@ async function validateRemoteArtworkUrl(
     const timer = setTimeout(() => controller.abort(), ARTWORK_DOWNLOAD_TIMEOUT_MS);
     try {
       const response = await fetch(url, { signal: controller.signal, credentials: "omit", mode: "cors" });
+      const httpStatus = typeof response.status === "number" ? response.status : null;
       if (response.ok) {
         const blob = await response.blob();
-        if (await validateArtworkBlob(blob)) {
+        const decodeResult = await validateArtworkBlobWithReason(blob);
+        if (decodeResult.valid) {
           failedDownloadAt.delete(url);
-          return { status: "valid-blob", blob };
+          return { status: "valid-blob", blob, httpStatus };
         }
-        return { status: "broken" };
+        return {
+          status: "broken",
+          httpStatus,
+          downloadClassification: "ok",
+          decodeReason: decodeResult.reason,
+        };
       }
 
-      const httpStatus = typeof response.status === "number" ? response.status : 0;
-      if (httpStatus === 429 || httpStatus === 503 || httpStatus >= 500) {
-        return { status: "transient-error" };
+      if (httpStatus === 429) {
+        return { status: "transient-error", httpStatus, downloadClassification: "rate-limited" };
       }
-      return { status: "broken" };
-    } catch {
-      if (controller.signal.aborted) {
-        return { status: "transient-error" };
+      if (httpStatus === 503 || (httpStatus !== null && httpStatus >= 500)) {
+        return { status: "transient-error", httpStatus, downloadClassification: "http-error" };
+      }
+      return { status: "broken", httpStatus, downloadClassification: "http-error" };
+    } catch (err) {
+      if (controller.signal.aborted || isAbortError(err)) {
+        return { status: "transient-error", httpStatus: null, downloadClassification: "timeout" };
       }
       // CORS-restricted remote image hosts can block fetch() while allowing <img> loading.
       // Only treat the URL as broken if <img> loading also fails.
@@ -351,11 +401,11 @@ async function validateRemoteArtworkUrl(
         const displayable = await probeImageElement(url);
         if (displayable) {
           failedDownloadAt.delete(url);
-          return { status: "valid-cors" };
+          return { status: "valid-cors", httpStatus: null };
         }
-        return { status: "broken" };
+        return { status: "broken", httpStatus: null, downloadClassification: "cors-blocked" };
       }
-      return { status: "transient-error" };
+      return { status: "transient-error", httpStatus: null, downloadClassification: "network-error" };
     } finally {
       clearTimeout(timer);
     }
@@ -689,10 +739,25 @@ export interface ArtworkHealthSummary {
   staleDetected: number;
   restored: number;
   stillMissing: number;
+  /** Number of tracks affected by provider HTTP/network/timeout/rate-limit/download failures. */
   providerFailures: number;
+  /** Explicit alias clarifying affected track count vs failed HTTP request count. */
+  providerFailedTracks: number;
+  /** Total failed HTTP requests across discovery and image downloads. */
+  failedHttpRequests: number;
+  /** Tracks failing due to metadata insufficiency, rejected candidates, or 404/no catalogue match. */
+  noMatchCount: number;
+  /** Tracks failing during remote image download validation or image decoding. */
+  imageValidationErrorCount: number;
+  /** Tracks failing during IndexedDB persistence (`repository.putArtwork`). */
+  storageErrorCount: number;
   offline: boolean;
   alreadyHaveArtwork: number;
   missingFound: number;
+  /** Per-track diagnostics collected across the recovery session. */
+  diagnostics: TrackArtworkDiagnostic[];
+  /** Subset of `diagnostics` for tracks that could not be durably restored. */
+  failedTracks: TrackArtworkDiagnostic[];
 }
 
 /** @deprecated Alias kept for callers referencing the previous name. */
@@ -810,15 +875,23 @@ export async function inspectTrackArtworkHealth(
   return { trackId: track.id, state: "MISSING" };
 }
 
-async function applyVerifiedBlobToTracks(tracks: Track[], blob: Blob, fallbackUrl?: string): Promise<number> {
+async function applyVerifiedBlobToTracks(
+  tracks: Track[],
+  blob: Blob,
+  fallbackUrl?: string,
+): Promise<{ updated: number; durableCount: number; failedTrackIds: Set<string> }> {
   let updated = 0;
+  let durableCount = 0;
+  const failedTrackIds = new Set<string>();
+
   for (const track of tracks) {
     let persisted = false;
     try {
       await repository.putArtwork(track.id, blob);
       persisted = true;
+      durableCount++;
     } catch {
-      // Quota failure: fallback to URL if available
+      failedTrackIds.add(track.id);
     }
     try {
       const blobUrl = URL.createObjectURL(blob);
@@ -835,7 +908,7 @@ async function applyVerifiedBlobToTracks(tracks: Track[], blob: Blob, fallbackUr
       }
     }
   }
-  return updated;
+  return { updated, durableCount, failedTrackIds };
 }
 
 async function tryRecoverTrackFromCloud(
@@ -873,6 +946,16 @@ function emitReloadProgress(progress: ReloadMissingArtworkProgress): void {
 }
 
 async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSummary> {
+  const emptyDiagnosticFields = {
+    providerFailedTracks: 0,
+    failedHttpRequests: 0,
+    noMatchCount: 0,
+    imageValidationErrorCount: 0,
+    storageErrorCount: 0,
+    diagnostics: [] as TrackArtworkDiagnostic[],
+    failedTracks: [] as TrackArtworkDiagnostic[],
+  };
+
   if (tracks.length === 0) {
     return {
       totalTracks: 0,
@@ -887,6 +970,7 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
       offline: false,
       alreadyHaveArtwork: 0,
       missingFound: 0,
+      ...emptyDiagnosticFields,
     };
   }
 
@@ -930,9 +1014,11 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
   let brokenUrlDetected = 0;
   let staleDetected = 0;
   const needsRecovery: Array<{ track: Track; report: ArtworkHealthReport }> = [];
+  const healthBeforeByTrackId = new Map<string, ArtworkHealthState>();
 
   for (const item of reports) {
     if (!item) continue;
+    healthBeforeByTrackId.set(item.track.id, item.report.state);
     switch (item.report.state) {
       case "VALID":
         validPreserved++;
@@ -972,11 +1058,35 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
       offline: false,
       alreadyHaveArtwork: validPreserved,
       missingFound: 0,
+      ...emptyDiagnosticFields,
     };
   }
 
   // Never destroy local/remote caches when offline; report recovery unavailable honestly.
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    const offlineDiagnostics: TrackArtworkDiagnostic[] = needsRecovery.map(({ track, report }) => ({
+      trackId: track.id,
+      originalTitle: track.title,
+      originalArtist: track.artist,
+      originalAlbum: track.album ?? "",
+      normalizedTitle: track.title,
+      normalizedArtist: track.artist,
+      normalizedAlbum: track.album || undefined,
+      healthBefore: report.state,
+      outcome: "skipped-offline",
+      primaryReason: "NETWORK_ERROR",
+      secondaryReasons: [],
+      selectedProvider: "none",
+      selectedArtworkHost: null,
+      musicbrainz: { ...createEmptyMusicBrainzDiagnostic(), skipped: true, skipReason: "Device offline" },
+      caa: createEmptyCaaDiagnostic(),
+      itunes: { ...createEmptyItunesDiagnostic(), classification: "skipped" },
+      imageDownload: { attempted: false, httpStatus: null, classification: "offline", failedRequests: 0 },
+      imageDecode: { attempted: false, valid: null, reason: "not-attempted" },
+      indexedDb: { attempted: false, ok: null, reason: "not-attempted" },
+      failedHttpRequests: 0,
+    }));
+
     return {
       totalTracks: tracks.length,
       validPreserved,
@@ -987,9 +1097,16 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
       restored: 0,
       stillMissing: missingFound,
       providerFailures: 0,
+      providerFailedTracks: 0,
+      failedHttpRequests: 0,
+      noMatchCount: 0,
+      imageValidationErrorCount: 0,
+      storageErrorCount: 0,
       offline: true,
       alreadyHaveArtwork: validPreserved,
       missingFound,
+      diagnostics: offlineDiagnostics,
+      failedTracks: offlineDiagnostics,
     };
   }
 
@@ -1041,7 +1158,8 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
   let groupCursor = 0;
   let recoveryDone = 0;
   let restored = 0;
-  let providerFailures = 0;
+  let totalFailedHttpRequests = 0;
+  const diagnosticsByTrackId = new Map<string, TrackArtworkDiagnostic>();
 
   const markGroupProgress = (count: number, newlyRestored: number) => {
     recoveryDone += count;
@@ -1054,6 +1172,88 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
     });
   };
 
+  const makeBaselineDiscovery = (track: Track): TrackDiscoveryDiagnostic => ({
+    originalTitle: track.title,
+    originalArtist: track.artist,
+    originalAlbum: track.album ?? "",
+    normalizedTitle: track.title,
+    normalizedArtist: track.artist,
+    normalizedAlbum: track.album || undefined,
+    musicbrainz: createEmptyMusicBrainzDiagnostic(),
+    caa: createEmptyCaaDiagnostic(),
+    itunes: createEmptyItunesDiagnostic(),
+    selectedProvider: "none",
+    selectedArtworkHost: null,
+    failedHttpRequests: 0,
+    observedFailures: [],
+  });
+
+  const recordBlobApplyDiagnostics = (
+    targetTracks: Track[],
+    provider: "sibling-album" | "cloud" | "musicbrainz-caa" | "itunes",
+    discoveryDiag: TrackDiscoveryDiagnostic,
+    downloadDiag: ImageDownloadDiagnostic,
+    decodeDiag: ImageDecodeDiagnostic,
+    idbFailedIds: Set<string>,
+    selectedHost: string | null,
+    groupHttpFailures: number,
+  ) => {
+    for (const t of targetTracks) {
+      const idbFailed = idbFailedIds.has(t.id);
+      const idbDiag = idbFailed
+        ? ({ attempted: true, ok: false, reason: "write-failed" } as const)
+        : ({ attempted: true, ok: true, reason: "ok" } as const);
+
+      if (idbFailed) {
+        diagnosticsByTrackId.set(t.id, {
+          trackId: t.id,
+          originalTitle: t.title,
+          originalArtist: t.artist,
+          originalAlbum: t.album ?? "",
+          normalizedTitle: discoveryDiag.normalizedTitle,
+          normalizedArtist: discoveryDiag.normalizedArtist,
+          normalizedAlbum: discoveryDiag.normalizedAlbum,
+          healthBefore: healthBeforeByTrackId.get(t.id) ?? "MISSING",
+          outcome: "failed",
+          primaryReason: "INDEXEDDB_WRITE_FAILED",
+          secondaryReasons: [],
+          selectedProvider: provider,
+          selectedArtworkHost: selectedHost,
+          musicbrainz: discoveryDiag.musicbrainz,
+          caa: discoveryDiag.caa,
+          itunes: discoveryDiag.itunes,
+          imageDownload: downloadDiag,
+          imageDecode: decodeDiag,
+          indexedDb: idbDiag,
+          failedHttpRequests: groupHttpFailures,
+        });
+      } else {
+        diagnosticsByTrackId.set(t.id, {
+          trackId: t.id,
+          originalTitle: t.title,
+          originalArtist: t.artist,
+          originalAlbum: t.album ?? "",
+          normalizedTitle: discoveryDiag.normalizedTitle,
+          normalizedArtist: discoveryDiag.normalizedArtist,
+          normalizedAlbum: discoveryDiag.normalizedAlbum,
+          healthBefore: healthBeforeByTrackId.get(t.id) ?? "MISSING",
+          outcome: "restored",
+          primaryReason: null,
+          secondaryReasons: [],
+          selectedProvider: provider,
+          selectedArtworkHost: selectedHost,
+          musicbrainz: discoveryDiag.musicbrainz,
+          caa: discoveryDiag.caa,
+          itunes: discoveryDiag.itunes,
+          imageDownload: downloadDiag,
+          imageDecode: decodeDiag,
+          indexedDb: idbDiag,
+          failedHttpRequests: groupHttpFailures,
+        });
+      }
+    }
+  };
+
   const recoverGroup = async (groupTracks: Track[]): Promise<void> => {
     if (groupTracks.length === 0) return;
 
@@ -1062,8 +1262,18 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
     // 1. Reuse validated sibling album blob if any valid track in the same album already has one
     if (firstAlbumKey && validAlbumBlobs.has(firstAlbumKey)) {
       const siblingBlob = validAlbumBlobs.get(firstAlbumKey)!;
-      const count = await applyVerifiedBlobToTracks(groupTracks, siblingBlob);
-      markGroupProgress(groupTracks.length, count);
+      const applyRes = await applyVerifiedBlobToTracks(groupTracks, siblingBlob);
+      recordBlobApplyDiagnostics(
+        groupTracks,
+        "sibling-album",
+        makeBaselineDiscovery(groupTracks[0]),
+        { attempted: false, httpStatus: null, classification: "not-attempted", failedRequests: 0 },
+        { attempted: true, valid: true, reason: "ok" },
+        applyRes.failedTrackIds,
+        null,
+        0,
+      );
+      markGroupProgress(groupTracks.length, applyRes.durableCount);
       return;
     }
 
@@ -1075,8 +1285,18 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
         const cloudBlob = await tryRecoverTrackFromCloud(track, sessionProbeCache);
         if (cloudBlob) {
           cloudAlbumBlob = cloudAlbumBlob ?? cloudBlob;
-          const okCount = await applyVerifiedBlobToTracks([track], cloudBlob);
-          markGroupProgress(1, okCount);
+          const applyRes = await applyVerifiedBlobToTracks([track], cloudBlob);
+          recordBlobApplyDiagnostics(
+            [track],
+            "cloud",
+            makeBaselineDiscovery(track),
+            { attempted: true, httpStatus: 200, classification: "ok", failedRequests: 0 },
+            { attempted: true, valid: true, reason: "ok" },
+            applyRes.failedTrackIds,
+            null,
+            0,
+          );
+          markGroupProgress(1, applyRes.durableCount);
           continue;
         }
       }
@@ -1087,39 +1307,109 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
 
     if (cloudAlbumBlob && firstAlbumKey) {
       validAlbumBlobs.set(firstAlbumKey, cloudAlbumBlob);
-      const okCount = await applyVerifiedBlobToTracks(remainingTracks, cloudAlbumBlob);
-      markGroupProgress(remainingTracks.length, okCount);
+      const applyRes = await applyVerifiedBlobToTracks(remainingTracks, cloudAlbumBlob);
+      recordBlobApplyDiagnostics(
+        remainingTracks,
+        "cloud",
+        makeBaselineDiscovery(remainingTracks[0]),
+        { attempted: true, httpStatus: 200, classification: "ok", failedRequests: 0 },
+        { attempted: true, valid: true, reason: "ok" },
+        applyRes.failedTrackIds,
+        null,
+        0,
+      );
+      markGroupProgress(remainingTracks.length, applyRes.durableCount);
       return;
     }
 
-    // 3. Shared album-level provider discovery with explicit force-refresh + broken-URL retry
+    // 3. Shared album-level provider discovery with explicit force-refresh, failed-URL exclusion & diagnostics
     const representative = remainingTracks[0];
     let groupRestored = 0;
-    let sawProviderFailure = false;
+    const groupExcludedUrls: string[] = [];
+    const observedFailures: ArtworkFailureReason[] = [];
+    let groupFailedHttpRequests = 0;
+
+    let lastDiscoveryDiag: TrackDiscoveryDiagnostic = makeBaselineDiscovery(representative);
+    let lastDownloadDiag: ImageDownloadDiagnostic = {
+      attempted: false,
+      httpStatus: null,
+      classification: "not-attempted",
+      failedRequests: 0,
+    };
+    let lastDecodeDiag: ImageDecodeDiagnostic = {
+      attempted: false,
+      valid: null,
+      reason: "not-attempted",
+    };
+    let lastSelectedHost: string | null = null;
+    let idbWriteFailedForAll = false;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       let resolution;
       try {
-        resolution = await resolveArtworkForTrack(representative, { forceRefresh: true });
+        resolution = await resolveArtworkForTrack(representative, {
+          forceRefresh: true,
+          includeDiagnostics: true,
+          excludeUrls: groupExcludedUrls,
+          maxRetries: 1,
+        });
       } catch {
-        sawProviderFailure = true;
+        groupFailedHttpRequests += 1;
+        totalFailedHttpRequests += 1;
+        observedFailures.push("NETWORK_ERROR");
         break;
       }
 
+      if (resolution.diagnostic) {
+        // Accumulate failures across retry attempts rather than overwriting attempt 1 telemetry
+        const prevObs = lastDiscoveryDiag.observedFailures;
+        lastDiscoveryDiag = {
+          ...resolution.diagnostic,
+          observedFailures: Array.from(
+            new Set([...prevObs, ...resolution.diagnostic.observedFailures]),
+          ),
+        };
+        groupFailedHttpRequests += resolution.diagnostic.failedHttpRequests;
+        totalFailedHttpRequests += resolution.diagnostic.failedHttpRequests;
+      } else if (resolution.transientFailure) {
+        groupFailedHttpRequests += 1;
+        totalFailedHttpRequests += 1;
+        observedFailures.push("NETWORK_ERROR");
+        lastDiscoveryDiag.observedFailures = Array.from(
+          new Set([...lastDiscoveryDiag.observedFailures, "NETWORK_ERROR"]),
+        );
+      }
+
       if (!resolution.url) {
-        if (resolution.transientFailure) {
-          sawProviderFailure = true;
-        }
         break;
       }
+
+      const candidateProvider =
+        resolution.source === "itunes" ? "itunes" : "musicbrainz-caa";
+      lastSelectedHost = extractSafeUrlHost(resolution.url);
 
       if (resolution.url.startsWith("blob:")) {
         try {
           const idbBlob = await repository.getArtwork(representative.id);
-          if (idbBlob && (await validateArtworkBlob(idbBlob))) {
-            if (firstAlbumKey) validAlbumBlobs.set(firstAlbumKey, idbBlob);
-            groupRestored = await applyVerifiedBlobToTracks(remainingTracks, idbBlob);
-            break;
+          if (idbBlob) {
+            const dec = await validateArtworkBlobWithReason(idbBlob);
+            lastDecodeDiag = { attempted: true, valid: dec.valid, reason: dec.reason };
+            if (dec.valid) {
+              if (firstAlbumKey) validAlbumBlobs.set(firstAlbumKey, idbBlob);
+              const applyRes = await applyVerifiedBlobToTracks(remainingTracks, idbBlob);
+              groupRestored = applyRes.durableCount;
+              recordBlobApplyDiagnostics(
+                remainingTracks,
+                candidateProvider,
+                lastDiscoveryDiag,
+                { attempted: true, httpStatus: null, classification: "ok", failedRequests: 0 },
+                lastDecodeDiag,
+                applyRes.failedTrackIds,
+                lastSelectedHost,
+                groupFailedHttpRequests,
+              );
+              break;
+            }
           }
         } catch {
           // Fall through
@@ -1129,29 +1419,140 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
       const validation = await validateRemoteArtworkUrl(resolution.url, sessionProbeCache);
       if (validation.status === "valid-blob") {
         if (firstAlbumKey) validAlbumBlobs.set(firstAlbumKey, validation.blob);
-        groupRestored = await applyVerifiedBlobToTracks(remainingTracks, validation.blob, resolution.url);
+        const applyRes = await applyVerifiedBlobToTracks(
+          remainingTracks,
+          validation.blob,
+          resolution.url,
+        );
+        groupRestored = applyRes.durableCount;
+        lastDownloadDiag = {
+          attempted: true,
+          httpStatus: validation.httpStatus ?? 200,
+          classification: "ok",
+          failedRequests: 0,
+        };
+        lastDecodeDiag = { attempted: true, valid: true, reason: "ok" };
+        if (applyRes.failedTrackIds.size === remainingTracks.length) {
+          idbWriteFailedForAll = true;
+        }
+        recordBlobApplyDiagnostics(
+          remainingTracks,
+          candidateProvider,
+          lastDiscoveryDiag,
+          lastDownloadDiag,
+          lastDecodeDiag,
+          applyRes.failedTrackIds,
+          lastSelectedHost,
+          groupFailedHttpRequests,
+        );
         break;
       }
 
       if (validation.status === "valid-cors") {
+        lastDownloadDiag = {
+          attempted: true,
+          httpStatus: validation.httpStatus ?? null,
+          classification: "cors-displayable",
+          failedRequests: 0,
+        };
+        lastDecodeDiag = { attempted: false, valid: true, reason: "cors-displayable" };
         for (const t of remainingTracks) {
           insertUrlCache(t.id, resolution.url);
           notifyArtworkLoaded(t.id, resolution.url);
           groupRestored++;
+          diagnosticsByTrackId.set(t.id, {
+            trackId: t.id,
+            originalTitle: t.title,
+            originalArtist: t.artist,
+            originalAlbum: t.album ?? "",
+            normalizedTitle: lastDiscoveryDiag.normalizedTitle,
+            normalizedArtist: lastDiscoveryDiag.normalizedArtist,
+            normalizedAlbum: lastDiscoveryDiag.normalizedAlbum,
+            healthBefore: healthBeforeByTrackId.get(t.id) ?? "MISSING",
+            outcome: "restored",
+            primaryReason: null,
+            secondaryReasons: [],
+            selectedProvider: candidateProvider,
+            selectedArtworkHost: lastSelectedHost,
+            musicbrainz: lastDiscoveryDiag.musicbrainz,
+            caa: lastDiscoveryDiag.caa,
+            itunes: lastDiscoveryDiag.itunes,
+            imageDownload: lastDownloadDiag,
+            imageDecode: lastDecodeDiag,
+            indexedDb: { attempted: false, ok: null, reason: "skipped-cors" },
+            failedHttpRequests: groupFailedHttpRequests,
+          });
         }
         break;
       }
 
-      if (validation.status === "transient-error") {
-        sawProviderFailure = true;
-        continue;
-      }
-
       if (validation.status === "offline") {
+        lastDownloadDiag = {
+          attempted: true,
+          httpStatus: null,
+          classification: "offline",
+          failedRequests: 0,
+        };
+        observedFailures.push("NETWORK_ERROR");
         break;
       }
 
-      // Confirmed broken URL returned by provider/cache: blacklist it and try next provider/release once
+      if (validation.status === "transient-error") {
+        groupFailedHttpRequests += 1;
+        totalFailedHttpRequests += 1;
+        const cls = validation.downloadClassification ?? "network-error";
+        lastDownloadDiag = {
+          attempted: true,
+          httpStatus: validation.httpStatus ?? null,
+          classification: cls,
+          failedRequests: 1,
+        };
+        observedFailures.push(
+          cls === "timeout"
+            ? "PROVIDER_TIMEOUT"
+            : cls === "rate-limited"
+              ? "PROVIDER_RATE_LIMITED"
+              : "IMAGE_DOWNLOAD_FAILED",
+        );
+        // Exclude timed-out/failing URL so Attempt 2 falls through to alternate release/provider
+        if (!groupExcludedUrls.includes(resolution.url)) {
+          groupExcludedUrls.push(resolution.url);
+        }
+        if (typeof invalidateArtworkCacheForTrack === "function") {
+          invalidateArtworkCacheForTrack(representative);
+        }
+        if (typeof clearNegativeArtworkCacheForTrack === "function") {
+          clearNegativeArtworkCacheForTrack(representative);
+        }
+        continue;
+      }
+
+      // Confirmed broken URL or undecodable payload
+      if (validation.decodeReason && validation.decodeReason !== "ok") {
+        lastDownloadDiag = {
+          attempted: true,
+          httpStatus: validation.httpStatus ?? 200,
+          classification: "ok",
+          failedRequests: 0,
+        };
+        lastDecodeDiag = { attempted: true, valid: false, reason: validation.decodeReason };
+        observedFailures.push("IMAGE_DECODE_FAILED");
+      } else {
+        const failedReqInc = 1;
+        groupFailedHttpRequests += failedReqInc;
+        totalFailedHttpRequests += failedReqInc;
+        lastDownloadDiag = {
+          attempted: true,
+          httpStatus: validation.httpStatus ?? null,
+          classification: validation.downloadClassification ?? "http-error",
+          failedRequests: failedReqInc,
+        };
+        observedFailures.push("IMAGE_DOWNLOAD_FAILED");
+      }
+
+      if (!groupExcludedUrls.includes(resolution.url)) {
+        groupExcludedUrls.push(resolution.url);
+      }
       if (resolution.url.startsWith("http") && typeof markArtworkUrlFailed === "function") {
         markArtworkUrlFailed(resolution.url);
       }
@@ -1163,19 +1564,54 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
       }
     }
 
-    if (groupRestored === 0) {
-      if (sawProviderFailure) {
-        providerFailures += remainingTracks.length;
-      }
+    if (groupRestored === 0 && !idbWriteFailedForAll) {
+      const mergedObserved = Array.from(
+        new Set([...observedFailures, ...lastDiscoveryDiag.observedFailures]),
+      );
+      const classified = classifyTrackFailure({
+        musicbrainz: lastDiscoveryDiag.musicbrainz,
+        caa: lastDiscoveryDiag.caa,
+        itunes: lastDiscoveryDiag.itunes,
+        imageDownload: lastDownloadDiag,
+        imageDecode: lastDecodeDiag,
+        indexedDb: { attempted: false, ok: null, reason: "not-attempted" },
+        observedFailures: mergedObserved,
+      });
+
       for (const t of remainingTracks) {
         notifyArtworkLoaded(t.id, undefined);
+        if (!diagnosticsByTrackId.has(t.id)) {
+          diagnosticsByTrackId.set(t.id, {
+            trackId: t.id,
+            originalTitle: t.title,
+            originalArtist: t.artist,
+            originalAlbum: t.album ?? "",
+            normalizedTitle: lastDiscoveryDiag.normalizedTitle,
+            normalizedArtist: lastDiscoveryDiag.normalizedArtist,
+            normalizedAlbum: lastDiscoveryDiag.normalizedAlbum,
+            healthBefore: healthBeforeByTrackId.get(t.id) ?? "MISSING",
+            outcome: "failed",
+            primaryReason: classified.primaryReason,
+            secondaryReasons: classified.secondaryReasons,
+            selectedProvider: lastDiscoveryDiag.selectedProvider,
+            selectedArtworkHost: lastSelectedHost,
+            musicbrainz: lastDiscoveryDiag.musicbrainz,
+            caa: lastDiscoveryDiag.caa,
+            itunes: lastDiscoveryDiag.itunes,
+            imageDownload: lastDownloadDiag,
+            imageDecode: lastDecodeDiag,
+            indexedDb: { attempted: false, ok: null, reason: "not-attempted" },
+            failedHttpRequests: groupFailedHttpRequests,
+          });
+        }
       }
     }
 
     markGroupProgress(remainingTracks.length, groupRestored);
   };
 
-  const concurrency = Math.min(2, groupEntries.length);
+  // Sequential worker (concurrency = 1) prevents bursting iTunes/MusicBrainz rate limits while
+  // sharing album-level hits across every track in the same album.
   const recoveryWorker = async () => {
     while (groupCursor < groupEntries.length) {
       const idx = groupCursor++;
@@ -1185,7 +1621,38 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
     }
   };
 
-  await Promise.all(Array.from({ length: concurrency }, () => recoveryWorker()));
+  await recoveryWorker();
+
+  const diagnostics: TrackArtworkDiagnostic[] = [];
+  for (const { track } of needsRecovery) {
+    const entry = diagnosticsByTrackId.get(track.id);
+    if (entry) diagnostics.push(entry);
+  }
+  const failedTracks = diagnostics.filter((d) => d.outcome === "failed");
+
+  const providerFailedTracks = failedTracks.filter(
+    (d) =>
+      (d.primaryReason && isProviderFailureReason(d.primaryReason)) ||
+      d.secondaryReasons.some((r) => isProviderFailureReason(r)),
+  ).length;
+
+  const noMatchCount = failedTracks.filter(
+    (d) =>
+      d.primaryReason === "NO_PROVIDER_MATCH" ||
+      d.primaryReason === "MUSICBRAINZ_NOT_FOUND" ||
+      d.primaryReason === "CAA_ARTWORK_NOT_FOUND" ||
+      d.primaryReason === "ITUNES_NO_MATCH" ||
+      d.primaryReason === "METADATA_INSUFFICIENT" ||
+      d.primaryReason === "CANDIDATE_REJECTED",
+  ).length;
+
+  const imageValidationErrorCount = failedTracks.filter(
+    (d) => d.primaryReason === "IMAGE_DECODE_FAILED" || d.primaryReason === "IMAGE_DOWNLOAD_FAILED",
+  ).length;
+
+  const storageErrorCount = failedTracks.filter(
+    (d) => d.primaryReason === "INDEXEDDB_WRITE_FAILED",
+  ).length;
 
   return {
     totalTracks: tracks.length,
@@ -1196,10 +1663,17 @@ async function executeArtworkRecovery(tracks: Track[]): Promise<ArtworkHealthSum
     staleDetected,
     restored,
     stillMissing: missingFound - restored,
-    providerFailures,
+    providerFailures: providerFailedTracks,
+    providerFailedTracks,
+    failedHttpRequests: totalFailedHttpRequests,
+    noMatchCount,
+    imageValidationErrorCount,
+    storageErrorCount,
     offline: false,
     alreadyHaveArtwork: validPreserved,
     missingFound,
+    diagnostics,
+    failedTracks,
   };
 }
 

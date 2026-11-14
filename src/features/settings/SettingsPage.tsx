@@ -16,8 +16,24 @@ import { resetPlaybackState } from "../../stores/libraryStore";
 import { fileSystemAccessSupported } from "../../services/file-access/FileAccessService";
 import { humanBytes } from "../../utils/misc";
 import { APP_VERSION } from "../../types";
-import { ImportIcon, InfoIcon, OfflineIcon, RefreshIcon } from "../../components/Icons";
-import { reloadMissingArtwork, type ReloadMissingArtworkProgress } from "../../services/artwork/artworkCache";
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ImportIcon,
+  InfoIcon,
+  OfflineIcon,
+  RefreshIcon,
+} from "../../components/Icons";
+import {
+  reloadMissingArtwork,
+  type ArtworkHealthSummary,
+  type ReloadMissingArtworkProgress,
+} from "../../services/artwork/artworkCache";
+import {
+  formatCaaStatusLine,
+  formatItunesStatusLine,
+  formatMusicBrainzStatusLine,
+} from "../../services/artwork/artworkDiagnostics";
 import { SegmentedControl } from "../../components/SegmentedControl";
 import { Select, type SelectOption } from "../../components/Select";
 import { CloudAccountSection } from "./CloudAccountSection";
@@ -75,6 +91,8 @@ export function SettingsPage() {
   const [reloadingArtwork, setReloadingArtwork] = useState(false);
   const [artworkProgress, setArtworkProgress] = useState<ReloadMissingArtworkProgress | null>(null);
   const [artworkReloadSummary, setArtworkReloadSummary] = useState<string | null>(null);
+  const [artworkHealthResult, setArtworkHealthResult] = useState<ArtworkHealthSummary | null>(null);
+  const [showArtworkDiagnostics, setShowArtworkDiagnostics] = useState(false);
   const [restore, setRestore] = useState<RestoreState>({ phase: "idle" });
   const [storage, setStorage] = useState<{ usage: number | null; quota: number | null; persisted: boolean | null }>({
     usage: null,
@@ -103,11 +121,17 @@ export function SettingsPage() {
       const result = await reloadMissingArtwork(tracks, {
         onProgress: (progress) => setArtworkProgress(progress),
       });
+      setArtworkHealthResult(result);
+      const providerAffected = result.providerFailedTracks ?? result.providerFailures ?? 0;
+      const failedHttpReqs = result.failedHttpRequests ?? 0;
+      const failedTrackCount = result.failedTracks?.length ?? result.stillMissing;
+
       if (result.offline) {
         const msg = `Connect to the internet to recover missing or broken artwork (${result.validPreserved} valid kept).`;
         setArtworkReloadSummary(msg);
         toast("error", msg);
       } else if (result.missingFound === 0) {
+        setShowArtworkDiagnostics(false);
         const msg = `Scanned ${result.totalTracks} track${result.totalTracks === 1 ? "" : "s"}: all ${result.validPreserved} validated and preserved.`;
         setArtworkReloadSummary(msg);
         toast("info", msg);
@@ -117,17 +141,22 @@ export function SettingsPage() {
         if (result.missingDetected > 0) detectedParts.push(`${result.missingDetected} missing`);
         if (invalidCount > 0) detectedParts.push(`${invalidCount} broken/corrupted`);
         const failureSuffix =
-          result.providerFailures > 0
-            ? ` · ${result.providerFailures} provider failure${result.providerFailures === 1 ? "" : "s"}`
+          providerAffected > 0
+            ? failedHttpReqs > 0
+              ? ` · ${providerAffected} track${providerAffected === 1 ? "" : "s"} affected by provider failure (${failedHttpReqs} failed HTTP request${failedHttpReqs === 1 ? "" : "s"})`
+              : ` · ${providerAffected} provider failure${providerAffected === 1 ? "" : "s"}`
             : "";
         const msg = `Scanned ${result.totalTracks}: ${result.validPreserved} valid preserved · Detected ${detectedParts.join(", ")} · Restored ${result.restored}, ${result.stillMissing} still missing${failureSuffix}.`;
         setArtworkReloadSummary(msg);
+        if (failedTrackCount === 0) {
+          setShowArtworkDiagnostics(false);
+        }
         const toastKind =
-          result.restored > 0 && result.providerFailures === 0
+          result.restored > 0 && providerAffected === 0
             ? "success"
             : result.restored > 0
               ? "info"
-              : result.providerFailures > 0
+              : providerAffected > 0
                 ? "error"
                 : "info";
         toast(toastKind, msg);
@@ -387,6 +416,119 @@ export function SettingsPage() {
               : "Reload missing artwork"}
           </button>
         </Row>
+        {artworkHealthResult && artworkHealthResult.missingFound > 0 && (
+          <div
+            className="rounded-xl border px-3 py-2.5"
+            style={{ borderColor: "var(--border-subtle)" }}
+            data-testid="artwork-recovery-diagnostics"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-text-muted">
+                <span>No match: {artworkHealthResult.noMatchCount ?? 0}</span>
+                <span>
+                  Provider/network: {artworkHealthResult.providerFailedTracks ?? artworkHealthResult.providerFailures ?? 0}{" "}
+                  track{(artworkHealthResult.providerFailedTracks ?? artworkHealthResult.providerFailures ?? 0) === 1 ? "" : "s"} (
+                  {artworkHealthResult.failedHttpRequests ?? 0} failed HTTP)
+                </span>
+                <span>Image validation: {artworkHealthResult.imageValidationErrorCount ?? 0}</span>
+                <span>Storage: {artworkHealthResult.storageErrorCount ?? 0}</span>
+              </div>
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-text-secondary hover:bg-surface-hover"
+                aria-expanded={showArtworkDiagnostics}
+                onClick={() => setShowArtworkDiagnostics((prev) => !prev)}
+              >
+                {showArtworkDiagnostics ? <ChevronDownIcon size={14} /> : <ChevronRightIcon size={14} />}
+                <span>
+                  {showArtworkDiagnostics ? "Hide diagnostics" : "View diagnostics"} (
+                  {artworkHealthResult.failedTracks?.length ?? artworkHealthResult.stillMissing})
+                </span>
+              </button>
+            </div>
+            {showArtworkDiagnostics && (
+              <div className="mt-2.5 space-y-2 border-t pt-2.5" style={{ borderColor: "var(--border-subtle)" }}>
+                {(artworkHealthResult.failedTracks && artworkHealthResult.failedTracks.length > 0
+                  ? artworkHealthResult.failedTracks
+                  : artworkHealthResult.diagnostics ?? []
+                ).length === 0 ? (
+                  <p className="text-xs text-text-muted">
+                    No remaining track failures.
+                  </p>
+                ) : (
+                  (artworkHealthResult.failedTracks && artworkHealthResult.failedTracks.length > 0
+                    ? artworkHealthResult.failedTracks
+                    : artworkHealthResult.diagnostics ?? []
+                  ).map((item) => {
+                    const showNormalized =
+                      item.normalizedTitle !== item.originalTitle ||
+                      item.normalizedArtist !== item.originalArtist;
+                    const dlLabel = item.imageDownload.attempted
+                      ? item.imageDownload.httpStatus
+                        ? `${item.imageDownload.classification} (HTTP ${item.imageDownload.httpStatus})`
+                        : item.imageDownload.classification
+                      : "not attempted";
+                    const decodeLabel = item.imageDecode.attempted
+                      ? item.imageDecode.valid
+                        ? "ok"
+                        : item.imageDecode.reason ?? "failed"
+                      : item.imageDecode.reason === "cors-displayable"
+                        ? "cors-displayable"
+                        : "not attempted";
+                    const idbLabel = item.indexedDb.attempted
+                      ? item.indexedDb.ok
+                        ? "saved"
+                        : "write-failed"
+                      : item.indexedDb.reason ?? "not attempted";
+                    return (
+                      <div
+                        key={item.trackId}
+                        className="rounded-lg bg-surface-raised p-2.5 text-xs"
+                        data-testid={`artwork-diagnostic-track-${item.trackId}`}
+                      >
+                        <div className="flex flex-wrap items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <div className="font-medium text-text-primary break-words">
+                              {item.originalTitle || "Untitled"} — {item.originalArtist || "Unknown Artist"}
+                            </div>
+                            {item.originalAlbum && (
+                              <div className="text-text-muted break-words">Album: {item.originalAlbum}</div>
+                            )}
+                            {showNormalized && (
+                              <div className="text-text-muted break-words">
+                                Normalized: {item.normalizedTitle || "(empty)"} — {item.normalizedArtist || "(empty)"}
+                              </div>
+                            )}
+                          </div>
+                          <span
+                            className="shrink-0 rounded border px-1.5 py-0.5 font-mono text-[11px] text-text-secondary"
+                            style={{ borderColor: "var(--border-subtle)" }}
+                          >
+                            Result: {item.primaryReason ?? "RESTORED"}
+                          </span>
+                        </div>
+                        <div className="mt-1.5 grid gap-0.5 text-text-secondary">
+                          <div>MusicBrainz: {formatMusicBrainzStatusLine(item.musicbrainz)}</div>
+                          <div>CAA: {formatCaaStatusLine(item.caa)}</div>
+                          <div>iTunes: {formatItunesStatusLine(item.itunes)}</div>
+                          {(item.imageDownload.attempted || item.imageDecode.attempted || item.indexedDb.attempted) && (
+                            <div>
+                              Download: {dlLabel} · Decode: {decodeLabel} · IndexedDB: {idbLabel}
+                              {item.selectedArtworkHost ? ` · Host: ${item.selectedArtworkHost}` : ""}
+                            </div>
+                          )}
+                          {item.secondaryReasons.length > 0 && (
+                            <div className="text-text-muted">Secondary: {item.secondaryReasons.join(", ")}</div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+        )}
         {storage.persisted === false && navigator.storage?.persist && (
           <button
             type="button"

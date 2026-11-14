@@ -483,7 +483,10 @@ describe("artworkCache", () => {
       expect(clearNegativeArtworkCacheForTrack).toHaveBeenCalledTimes(1);
       expect(clearNegativeArtworkCacheForTrack).toHaveBeenCalledWith(trackMissing);
       expect(resolveArtworkForTrack).toHaveBeenCalledTimes(1);
-      expect(resolveArtworkForTrack).toHaveBeenCalledWith(trackMissing, { forceRefresh: true });
+      expect(resolveArtworkForTrack).toHaveBeenCalledWith(
+        trackMissing,
+        expect.objectContaining({ forceRefresh: true }),
+      );
       expect(repository.putArtwork).toHaveBeenCalledTimes(1);
       expect(repository.putArtwork).toHaveBeenCalledWith("t-missing", imgBlob);
       expect(repository.deleteArtwork).not.toHaveBeenCalled();

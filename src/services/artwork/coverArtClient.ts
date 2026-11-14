@@ -1,3 +1,4 @@
+import { isAbortError, type ProviderStageClassification } from "./artworkDiagnostics";
 import { isValidMbid } from "./musicbrainzClient";
 
 /**
@@ -22,6 +23,9 @@ export interface CoverArtResolution {
   url: string | null;
   releaseGroupMbid: string | null;
   releaseMbid: string | null;
+  httpStatus?: number | null;
+  classification?: ProviderStageClassification;
+  failedRequests?: number;
 }
 
 interface CaaThumbnails {
@@ -162,36 +166,79 @@ function selectPreferredFrontImageUrl(
   return null;
 }
 
+interface FetchCaaOptions {
+  size?: ArtworkThumbnailSize;
+  excludeUrl?: (url: string) => boolean;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  includeDiagnostics?: boolean;
+}
+
+function attachDiagnostics(
+  base: CoverArtResolution,
+  options: FetchCaaOptions | undefined,
+  httpStatus: number | null,
+  classification: ProviderStageClassification,
+  failedRequests: number,
+): CoverArtResolution {
+  if (!options?.includeDiagnostics) return base;
+  return {
+    ...base,
+    httpStatus,
+    classification,
+    failedRequests,
+  };
+}
+
 async function fetchCaaEndpoint(
   entity: "release-group" | "release",
   mbid: string,
   size: ArtworkThumbnailSize = "500",
   excludeUrl?: (url: string) => boolean,
+  options?: FetchCaaOptions,
 ): Promise<CoverArtResolution> {
   if (!isValidMbid(mbid)) {
-    return {
-      status: "invalid-mbid",
-      url: null,
-      releaseGroupMbid: null,
-      releaseMbid: null,
-    };
+    return attachDiagnostics(
+      {
+        status: "invalid-mbid",
+        url: null,
+        releaseGroupMbid: null,
+        releaseMbid: null,
+      },
+      options,
+      null,
+      "skipped",
+      0,
+    );
   }
 
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
-    return {
-      status: "transient-error",
-      url: null,
-      releaseGroupMbid: entity === "release-group" ? mbid.toLowerCase() : null,
-      releaseMbid: entity === "release" ? mbid.toLowerCase() : null,
-    };
+    return attachDiagnostics(
+      {
+        status: "transient-error",
+        url: null,
+        releaseGroupMbid: entity === "release-group" ? mbid.toLowerCase() : null,
+        releaseMbid: entity === "release" ? mbid.toLowerCase() : null,
+      },
+      options,
+      null,
+      "network-error",
+      0,
+    );
   }
   if (import.meta.env.MODE === "test" && typeof fetch === "function" && !("mock" in fetch)) {
-    return {
-      status: "transient-error",
-      url: null,
-      releaseGroupMbid: entity === "release-group" ? mbid.toLowerCase() : null,
-      releaseMbid: entity === "release" ? mbid.toLowerCase() : null,
-    };
+    return attachDiagnostics(
+      {
+        status: "transient-error",
+        url: null,
+        releaseGroupMbid: entity === "release-group" ? mbid.toLowerCase() : null,
+        releaseMbid: entity === "release" ? mbid.toLowerCase() : null,
+      },
+      options,
+      null,
+      "network-error",
+      0,
+    );
   }
 
   const cleanMbid = mbid.trim().toLowerCase();
@@ -201,75 +248,168 @@ async function fetchCaaEndpoint(
       ? buildReleaseGroupFrontUrl(cleanMbid, size)
       : buildReleaseFrontUrl(cleanMbid, size);
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), CAA_FETCH_TIMEOUT_MS);
+  const maxRetries = Math.max(0, options?.maxRetries ?? 0);
+  const retryBaseMs =
+    options?.retryDelayMs ?? (import.meta.env.MODE === "test" ? 0 : 900);
 
-  try {
-    const response = await fetch(metadataUrl, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
+  let failedRequests = 0;
+  let lastHttpStatus: number | null = null;
+  let lastClassification: ProviderStageClassification = "not-queried";
 
-    if (response.status === 404) {
-      return {
-        status: "not-found",
-        url: null,
-        releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
-        releaseMbid: entity === "release" ? cleanMbid : null,
-      };
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0 && retryBaseMs > 0) {
+      await new Promise((r) => setTimeout(r, retryBaseMs * attempt));
     }
 
-    if (response.status === 429 || response.status === 503 || response.status >= 500) {
-      return {
-        status: "transient-error",
-        url: null,
-        releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
-        releaseMbid: entity === "release" ? cleanMbid : null,
-      };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), CAA_FETCH_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(metadataUrl, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      });
+
+      lastHttpStatus = response.status;
+
+      if (response.status === 404) {
+        return attachDiagnostics(
+          {
+            status: "not-found",
+            url: null,
+            releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+            releaseMbid: entity === "release" ? cleanMbid : null,
+          },
+          options,
+          404,
+          "not-found",
+          failedRequests,
+        );
+      }
+
+      if (response.status === 429) {
+        failedRequests += 1;
+        lastClassification = "rate-limited";
+        if (attempt < maxRetries) continue;
+        return attachDiagnostics(
+          {
+            status: "transient-error",
+            url: null,
+            releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+            releaseMbid: entity === "release" ? cleanMbid : null,
+          },
+          options,
+          429,
+          "rate-limited",
+          failedRequests,
+        );
+      }
+
+      if (response.status === 503 || response.status >= 500) {
+        failedRequests += 1;
+        lastClassification = "http-error";
+        if (attempt < maxRetries) continue;
+        return attachDiagnostics(
+          {
+            status: "transient-error",
+            url: null,
+            releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+            releaseMbid: entity === "release" ? cleanMbid : null,
+          },
+          options,
+          response.status,
+          "http-error",
+          failedRequests,
+        );
+      }
+
+      if (!response.ok) {
+        failedRequests += 1;
+        return attachDiagnostics(
+          {
+            status: "not-found",
+            url: null,
+            releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+            releaseMbid: entity === "release" ? cleanMbid : null,
+          },
+          options,
+          response.status,
+          "http-error",
+          failedRequests,
+        );
+      }
+
+      const payload = (await response.json()) as CaaMetadataResponse;
+      const selectedUrl = selectPreferredFrontImageUrl(payload, canonicalThumbUrl, size, excludeUrl);
+      const extractedReleaseMbid =
+        entity === "release" ? cleanMbid : extractMbidFromReleaseUrl(payload.release);
+
+      if (!selectedUrl) {
+        return attachDiagnostics(
+          {
+            status: "not-found",
+            url: null,
+            releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+            releaseMbid: extractedReleaseMbid,
+          },
+          options,
+          response.status,
+          "not-found",
+          failedRequests,
+        );
+      }
+
+      // Prefer the canonical `/front-500` or `/front-1200` endpoint when on coverartarchive.org,
+      // or the validated thumbnail URL returned by CAA metadata.
+      return attachDiagnostics(
+        {
+          status: "ok",
+          url: selectedUrl,
+          releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+          releaseMbid: extractedReleaseMbid,
+        },
+        options,
+        response.status,
+        "ok",
+        failedRequests,
+      );
+    } catch (err) {
+      failedRequests += 1;
+      const isTimeout =
+        controller.signal.aborted || isAbortError(err);
+      lastClassification = isTimeout ? "timeout" : "network-error";
+      lastHttpStatus = null;
+      if (attempt < maxRetries) continue;
+      return attachDiagnostics(
+        {
+          status: "transient-error",
+          url: null,
+          releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
+          releaseMbid: entity === "release" ? cleanMbid : null,
+        },
+        options,
+        null,
+        lastClassification,
+        failedRequests,
+      );
+    } finally {
+      clearTimeout(timeoutId);
     }
+  }
 
-    if (!response.ok) {
-      return {
-        status: "not-found",
-        url: null,
-        releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
-        releaseMbid: entity === "release" ? cleanMbid : null,
-      };
-    }
-
-    const payload = (await response.json()) as CaaMetadataResponse;
-    const selectedUrl = selectPreferredFrontImageUrl(payload, canonicalThumbUrl, size, excludeUrl);
-    const extractedReleaseMbid =
-      entity === "release" ? cleanMbid : extractMbidFromReleaseUrl(payload.release);
-
-    if (!selectedUrl) {
-      return {
-        status: "not-found",
-        url: null,
-        releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
-        releaseMbid: extractedReleaseMbid,
-      };
-    }
-
-    // Prefer the canonical `/front-500` or `/front-1200` endpoint when on coverartarchive.org,
-    // or the validated thumbnail URL returned by CAA metadata.
-    return {
-      status: "ok",
-      url: selectedUrl,
-      releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
-      releaseMbid: extractedReleaseMbid,
-    };
-  } catch {
-    return {
+  return attachDiagnostics(
+    {
       status: "transient-error",
       url: null,
       releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
       releaseMbid: entity === "release" ? cleanMbid : null,
-    };
-  } finally {
-    clearTimeout(timeoutId);
-  }
+    },
+    options,
+    lastHttpStatus,
+    lastClassification,
+    failedRequests,
+  );
 }
 
 /**
@@ -278,9 +418,9 @@ async function fetchCaaEndpoint(
  */
 export async function fetchReleaseGroupCoverArt(
   releaseGroupMbid: string,
-  options?: { size?: ArtworkThumbnailSize; excludeUrl?: (url: string) => boolean },
+  options?: FetchCaaOptions,
 ): Promise<CoverArtResolution> {
-  return fetchCaaEndpoint("release-group", releaseGroupMbid, options?.size ?? "500", options?.excludeUrl);
+  return fetchCaaEndpoint("release-group", releaseGroupMbid, options?.size ?? "500", options?.excludeUrl, options);
 }
 
 /**
@@ -289,7 +429,7 @@ export async function fetchReleaseGroupCoverArt(
  */
 export async function fetchReleaseCoverArt(
   releaseMbid: string,
-  options?: { size?: ArtworkThumbnailSize; excludeUrl?: (url: string) => boolean },
+  options?: FetchCaaOptions,
 ): Promise<CoverArtResolution> {
-  return fetchCaaEndpoint("release", releaseMbid, options?.size ?? "500", options?.excludeUrl);
+  return fetchCaaEndpoint("release", releaseMbid, options?.size ?? "500", options?.excludeUrl, options);
 }

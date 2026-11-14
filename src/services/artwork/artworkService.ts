@@ -1,7 +1,17 @@
 import { repository } from "../indexeddb/LibraryRepository";
-import { cleanNoiseFromText, extractPrimaryArtist, isYearOnly, normalizeTrackMetadata } from "../metadata/normalization";
+import {
+  cleanNoiseFromText,
+  extractPrimaryArtist,
+  isPlaceholderArtist,
+  isYearOnly,
+  normalizeForMatching,
+  normalizeTrackMetadata,
+} from "../metadata/normalization";
 import { normalizeForSearch } from "../../utils/misc";
-import { searchItunesArtworkDetails } from "./itunesClient";
+import {
+  searchItunesArtworkDetails,
+  type ItunesSearchOutcomeDiagnostic,
+} from "./itunesClient";
 import {
   fetchReleaseCoverArt,
   fetchReleaseGroupCoverArt,
@@ -12,9 +22,20 @@ import {
   fetchReleasesForReleaseGroup,
   searchMusicBrainzReleaseGroups,
   searchMusicBrainzReleases,
+  type MusicBrainzDiscoveryResult,
   type MusicBrainzTrackQuery,
   type ScoredReleaseGroupCandidate,
 } from "./musicbrainzClient";
+import {
+  createEmptyCaaDiagnostic,
+  createEmptyItunesDiagnostic,
+  createEmptyMusicBrainzDiagnostic,
+  extractSafeUrlHost,
+  type ArtworkFailureReason,
+  type CaaStageDiagnostic,
+  type MusicBrainzStageDiagnostic,
+  type TrackDiscoveryDiagnostic,
+} from "./artworkDiagnostics";
 
 export type ArtworkProviderSource = "embedded" | "cache" | "musicbrainz-caa" | "itunes" | "none";
 
@@ -28,6 +49,7 @@ export interface ArtworkResolution {
   artist?: string;
   title?: string;
   transientFailure?: boolean;
+  diagnostic?: TrackDiscoveryDiagnostic;
 }
 
 export interface UnifiedArtworkCacheEntry {
@@ -49,6 +71,7 @@ export interface ArtworkTrackInput {
   artist: string;
   album?: string;
   durationMs?: number | null;
+  fileName?: string;
 }
 
 const LEGACY_CACHE_PREFIX = "artwork_cache_v1:";
@@ -139,6 +162,33 @@ export function hasMeaningfulAlbum(album: string | undefined | null): boolean {
   if (isYearOnly(album)) return false;
   const cleaned = normalizeForSearch(cleanNoiseFromText(album).cleaned);
   return Boolean(cleaned && !PLACEHOLDER_ALBUMS.has(cleaned) && !isYearOnly(cleaned));
+}
+
+function isPlaceholderTitle(title: string | undefined | null): boolean {
+  if (!title) return true;
+  if (isYearOnly(title)) return true;
+  const cleaned = normalizeForSearch(cleanNoiseFromText(title).cleaned);
+  if (!cleaned || cleaned.length < 2) return true;
+  if (/^(?:track\s*\d+|audio(?:\s*track)?\s*\d*|untitled|unknown|n\s*a|na|none|null|undefined)$/i.test(cleaned)) {
+    return true;
+  }
+  return false;
+}
+
+function isInsufficientMetadataForDiscovery(track: {
+  title?: string;
+  artist?: string;
+  album?: string;
+}): boolean {
+  const artistMissing = !track.artist?.trim() || isPlaceholderArtist(track.artist);
+  const albumMissing = !hasMeaningfulAlbum(track.album);
+  const titleMissing = isPlaceholderTitle(track.title);
+  if (artistMissing && albumMissing && titleMissing) return true;
+  if (!albumMissing && !artistMissing) return false;
+  if (artistMissing && !cleanNoiseFromText(track.title ?? "").cleaned.trim()) return true;
+  if (titleMissing && albumMissing && artistMissing) return true;
+  if (artistMissing && /^track\s*\d+$/i.test(normalizeForSearch(track.title ?? ""))) return true;
+  return false;
 }
 
 /**
@@ -487,6 +537,75 @@ export function __resetArtworkServiceForTests(): void {
 interface ProviderDiscoveryOutcome {
   resolution: ArtworkResolution;
   transientFailure: boolean;
+  diagnostic: TrackDiscoveryDiagnostic;
+}
+
+function recordCaaOutcome(
+  caaDiag: CaaStageDiagnostic,
+  target: "release-group" | "release",
+  status: string,
+  httpStatus: number | null | undefined,
+  classification: CaaStageDiagnostic["releaseGroupClassification"] | undefined,
+  failedRequests: number | undefined,
+): void {
+  caaDiag.queried = true;
+  const resolvedClass =
+    classification ??
+    (status === "ok"
+      ? "ok"
+      : status === "not-found"
+        ? "not-found"
+        : status === "transient-error"
+          ? "http-error"
+          : "skipped");
+  const resolvedStatus = httpStatus ?? (status === "not-found" ? 404 : status === "ok" ? 200 : null);
+  if (target === "release-group") {
+    caaDiag.releaseGroupHttpStatus = resolvedStatus;
+    caaDiag.releaseGroupClassification = resolvedClass;
+  } else {
+    caaDiag.releaseHttpStatus = resolvedStatus;
+    caaDiag.releaseClassification = resolvedClass;
+  }
+  if (typeof failedRequests === "number") {
+    caaDiag.failedRequests += failedRequests;
+  } else if (status === "transient-error") {
+    caaDiag.failedRequests += 1;
+  }
+}
+
+function recordMbTelemetry(
+  mbDiag: MusicBrainzStageDiagnostic,
+  result: MusicBrainzDiscoveryResult,
+  fallbackSkipReason?: string,
+): void {
+  if (result.status === "skipped") {
+    mbDiag.skipped = true;
+    mbDiag.skipReason = fallbackSkipReason ?? "Incomplete or placeholder artist/title metadata";
+    mbDiag.classification = "skipped";
+    return;
+  }
+  const tel = result.diagnostic;
+  if (tel) {
+    mbDiag.httpStatus = tel.httpStatus;
+    mbDiag.classification = tel.classification;
+    mbDiag.releaseGroupCount = tel.rawCount;
+    mbDiag.acceptedCandidateCount = tel.acceptedCount;
+    mbDiag.rejectedCandidateCount = tel.rejectedCount;
+    mbDiag.candidateScores = tel.candidateScores;
+    mbDiag.failedRequests += tel.failedRequests;
+  } else {
+    mbDiag.classification =
+      result.status === "ok"
+        ? "ok"
+        : result.status === "not-found"
+          ? "not-found"
+          : "network-error";
+    mbDiag.releaseGroupCount = result.candidates.length;
+    mbDiag.acceptedCandidateCount = result.candidates.length;
+    if (result.status === "transient-error") {
+      mbDiag.failedRequests += 1;
+    }
+  }
 }
 
 /**
@@ -497,6 +616,9 @@ async function tryResolveFromReleaseGroupCandidate(
   candidate: ScoredReleaseGroupCandidate,
   query: MusicBrainzTrackQuery,
   size: ArtworkThumbnailSize,
+  caaDiag: CaaStageDiagnostic,
+  isExcludedUrl: (url: string) => boolean,
+  discoveryOptions?: { includeDiagnostics?: boolean; maxRetries?: number },
 ): Promise<{
   url: string | null;
   releaseGroupMbid: string;
@@ -507,9 +629,19 @@ async function tryResolveFromReleaseGroupCandidate(
   // Step 4: Cover Art Archive Release Group lookup
   const rgArt = await fetchReleaseGroupCoverArt(candidate.mbid, {
     size,
-    excludeUrl: isArtworkUrlFailed,
+    excludeUrl: isExcludedUrl,
+    includeDiagnostics: discoveryOptions?.includeDiagnostics,
+    maxRetries: discoveryOptions?.maxRetries,
   });
-  if (rgArt.status === "ok" && rgArt.url && !isArtworkUrlFailed(rgArt.url)) {
+  recordCaaOutcome(
+    caaDiag,
+    "release-group",
+    rgArt.status,
+    rgArt.httpStatus,
+    rgArt.classification,
+    rgArt.failedRequests,
+  );
+  if (rgArt.status === "ok" && rgArt.url && !isExcludedUrl(rgArt.url)) {
     return {
       url: rgArt.url,
       releaseGroupMbid: candidate.mbid,
@@ -524,7 +656,7 @@ async function tryResolveFromReleaseGroupCandidate(
   // Step 5a: Inspect individual releases belonging to that Release Group before falling back
   const releaseMbidsToTry: string[] = [...candidate.releaseMbids];
   if (releaseMbidsToTry.length === 0) {
-    const releaseLookup = await fetchReleasesForReleaseGroup(candidate.mbid, query);
+    const releaseLookup = await fetchReleasesForReleaseGroup(candidate.mbid, query, undefined, discoveryOptions);
     if (releaseLookup.status === "transient-error") {
       sawTransientError = true;
     }
@@ -539,9 +671,19 @@ async function tryResolveFromReleaseGroupCandidate(
   for (const releaseMbid of releaseMbidsToTry.slice(0, 3)) {
     const relArt = await fetchReleaseCoverArt(releaseMbid, {
       size,
-      excludeUrl: isArtworkUrlFailed,
+      excludeUrl: isExcludedUrl,
+      includeDiagnostics: discoveryOptions?.includeDiagnostics,
+      maxRetries: discoveryOptions?.maxRetries,
     });
-    if (relArt.status === "ok" && relArt.url && !isArtworkUrlFailed(relArt.url)) {
+    recordCaaOutcome(
+      caaDiag,
+      "release",
+      relArt.status,
+      relArt.httpStatus,
+      relArt.classification,
+      relArt.failedRequests,
+    );
+    if (relArt.status === "ok" && relArt.url && !isExcludedUrl(relArt.url)) {
       return {
         url: relArt.url,
         releaseGroupMbid: candidate.mbid,
@@ -575,8 +717,52 @@ async function tryResolveFromReleaseGroupCandidate(
 async function discoverOnlineArtwork(
   track: ArtworkTrackInput,
   size: ArtworkThumbnailSize = "500",
-  alternateQueries?: Array<{ trackName: string; artistName: string }>,
+  alternateQueries?: Array<{ trackName: string; artistName: string; q?: string }>,
+  options?: {
+    includeDiagnostics?: boolean;
+    excludeUrls?: string[];
+    maxRetries?: number;
+    originalTrack?: ArtworkTrackInput;
+    forceRefresh?: boolean;
+  },
 ): Promise<ProviderDiscoveryOutcome> {
+  const original = options?.originalTrack ?? track;
+  const mbDiag = createEmptyMusicBrainzDiagnostic();
+  const caaDiag = createEmptyCaaDiagnostic();
+  const itunesDiag = createEmptyItunesDiagnostic();
+  const observedFailures: ArtworkFailureReason[] = [];
+
+  const isExcludedUrl = (url: string): boolean => {
+    if (isArtworkUrlFailed(url)) return true;
+    if (!options?.excludeUrls || options.excludeUrls.length === 0) return false;
+    const norm = sanitizeArtworkUrl(url) ?? url.trim();
+    return options.excludeUrls.some((ex) => ex === url || (sanitizeArtworkUrl(ex) ?? ex.trim()) === norm);
+  };
+
+  const buildDiagnostic = (
+    selectedProvider: "musicbrainz-caa" | "itunes" | "none",
+    selectedUrl: string | undefined,
+  ): TrackDiscoveryDiagnostic => ({
+    originalTitle: original.title,
+    originalArtist: original.artist,
+    originalAlbum: original.album ?? "",
+    normalizedTitle: track.title,
+    normalizedArtist: track.artist,
+    normalizedAlbum: track.album,
+    musicbrainz: mbDiag,
+    caa: caaDiag,
+    itunes: itunesDiag,
+    selectedProvider,
+    selectedArtworkHost: extractSafeUrlHost(selectedUrl),
+    failedHttpRequests: mbDiag.failedRequests + caaDiag.failedRequests + itunesDiag.failedRequests,
+    observedFailures: Array.from(new Set(observedFailures)),
+  });
+
+  const discoveryOpts = {
+    includeDiagnostics: options?.includeDiagnostics,
+    maxRetries: options?.maxRetries,
+  };
+
   const query: MusicBrainzTrackQuery = {
     artist: track.artist,
     album: track.album,
@@ -587,25 +773,73 @@ async function discoverOnlineArtwork(
   let sawTransientError = false;
 
   // Step 3: MusicBrainz Release Group discovery
-  // Step 3: MusicBrainz Release Group discovery
-  let mbDiscovery = await searchMusicBrainzReleaseGroups(query);
+  let mbDiscovery = await searchMusicBrainzReleaseGroups(query, undefined, discoveryOpts);
+  recordMbTelemetry(mbDiag, mbDiscovery);
+
   if (mbDiscovery.status === "skipped" && alternateQueries && alternateQueries.length > 0) {
     for (const alt of alternateQueries.slice(0, 2)) {
       if (!alt.artistName) continue;
-      const altDiscovery = await searchMusicBrainzReleaseGroups({
-        artist: alt.artistName,
-        album: track.album,
-        title: alt.trackName,
-        durationMs: track.durationMs,
-      });
+      const altDiscovery = await searchMusicBrainzReleaseGroups(
+        {
+          artist: alt.artistName,
+          album: track.album,
+          title: alt.trackName,
+          durationMs: track.durationMs,
+        },
+        undefined,
+        discoveryOpts,
+      );
       if (altDiscovery.status !== "skipped") {
         mbDiscovery = altDiscovery;
+        mbDiag.skipped = false;
+        mbDiag.skipReason = undefined;
+        recordMbTelemetry(mbDiag, altDiscovery);
         break;
       }
     }
   }
+
+  // Wrong/custom album ID3 fallback during recovery: if artist + album had 0 release groups
+  // and track has a distinct meaningful title, try artist + track title without the album tag.
+  if (
+    options?.forceRefresh &&
+    mbDiscovery.status === "not-found" &&
+    mbDiag.releaseGroupCount === 0 &&
+    hasMeaningfulAlbum(track.album) &&
+    track.title &&
+    normalizeForMatching(track.title) !== normalizeForMatching(track.album!)
+  ) {
+    const titleOnlyMb = await searchMusicBrainzReleaseGroups(
+      {
+        artist: track.artist,
+        title: track.title,
+        durationMs: track.durationMs,
+      },
+      undefined,
+      discoveryOpts,
+    );
+    if (titleOnlyMb.status === "ok" && titleOnlyMb.bestCandidate) {
+      mbDiscovery = titleOnlyMb;
+      recordMbTelemetry(mbDiag, titleOnlyMb);
+    } else if (titleOnlyMb.status === "transient-error") {
+      sawTransientError = true;
+      mbDiag.failedRequests += titleOnlyMb.diagnostic?.failedRequests ?? 1;
+    }
+  }
+
   if (mbDiscovery.status === "transient-error") {
     sawTransientError = true;
+    observedFailures.push(
+      mbDiag.classification === "rate-limited"
+        ? "PROVIDER_RATE_LIMITED"
+        : mbDiag.classification === "timeout"
+          ? "PROVIDER_TIMEOUT"
+          : "NETWORK_ERROR",
+    );
+  } else if (mbDiag.classification === "candidates-rejected") {
+    observedFailures.push("CANDIDATE_REJECTED");
+  } else if (mbDiscovery.status === "not-found") {
+    observedFailures.push("MUSICBRAINZ_NOT_FOUND");
   }
 
   if (mbDiscovery.bestCandidate) {
@@ -613,6 +847,9 @@ async function discoverOnlineArtwork(
       mbDiscovery.bestCandidate,
       query,
       size,
+      caaDiag,
+      isExcludedUrl,
+      discoveryOpts,
     );
     if (primaryAttempt.url) {
       return {
@@ -625,6 +862,7 @@ async function discoverOnlineArtwork(
           album: mbDiscovery.bestCandidate.releaseGroup.title,
         },
         transientFailure: false,
+        diagnostic: buildDiagnostic("musicbrainz-caa", primaryAttempt.url),
       };
     }
     if (primaryAttempt.transientError) {
@@ -633,7 +871,14 @@ async function discoverOnlineArtwork(
 
     // If primary candidate had no CAA artwork (or was medium confidence), try up to 2 secondary candidates
     for (const secondary of mbDiscovery.secondaryCandidates.slice(0, 2)) {
-      const secondaryAttempt = await tryResolveFromReleaseGroupCandidate(secondary, query, size);
+      const secondaryAttempt = await tryResolveFromReleaseGroupCandidate(
+        secondary,
+        query,
+        size,
+        caaDiag,
+        isExcludedUrl,
+        discoveryOpts,
+      );
       if (secondaryAttempt.url) {
         return {
           resolution: {
@@ -645,26 +890,76 @@ async function discoverOnlineArtwork(
             album: secondary.releaseGroup.title,
           },
           transientFailure: false,
+          diagnostic: buildDiagnostic("musicbrainz-caa", secondaryAttempt.url),
         };
       }
       if (secondaryAttempt.transientError) {
         sawTransientError = true;
       }
     }
+
+    if (caaDiag.queried && !sawTransientError) {
+      observedFailures.push("CAA_ARTWORK_NOT_FOUND");
+    }
   }
 
   // Step 5b: Direct MusicBrainz Release search fallback (when Release Group search had no CAA hit)
   if (mbDiscovery.status !== "skipped" && mbDiscovery.status !== "transient-error") {
-    const directReleases = await searchMusicBrainzReleases(query);
+    const directReleases = await searchMusicBrainzReleases(query, undefined, {
+      ...discoveryOpts,
+      verifyTracksIfAlbumMissing: !hasMeaningfulAlbum(track.album),
+    });
+    mbDiag.directReleaseFallback.queried = true;
+    if (directReleases.diagnostic) {
+      mbDiag.directReleaseFallback.httpStatus = directReleases.diagnostic.httpStatus;
+      mbDiag.directReleaseFallback.classification = directReleases.diagnostic.classification;
+      mbDiag.directReleaseFallback.releaseCount = directReleases.diagnostic.rawCount;
+      mbDiag.directReleaseFallback.acceptedCount = directReleases.diagnostic.acceptedCount;
+      mbDiag.directReleaseFallback.rejectedCount = directReleases.diagnostic.rejectedCount;
+      mbDiag.directReleaseFallback.topScore = directReleases.diagnostic.candidateScores[0]?.confidence;
+      mbDiag.directReleaseFallback.rejectionReason =
+        directReleases.diagnostic.candidateScores.find((c) => !c.accepted)?.rejectionReason;
+      mbDiag.failedRequests += directReleases.diagnostic.failedRequests;
+    } else {
+      mbDiag.directReleaseFallback.classification =
+        directReleases.status === "ok"
+          ? "ok"
+          : directReleases.status === "not-found"
+            ? "not-found"
+            : "network-error";
+      mbDiag.directReleaseFallback.releaseCount = directReleases.releases.length;
+      mbDiag.directReleaseFallback.acceptedCount = directReleases.releases.length;
+    }
+
     if (directReleases.status === "transient-error") {
       sawTransientError = true;
+      if (mbDiag.directReleaseFallback.classification === "rate-limited") {
+        observedFailures.push("PROVIDER_RATE_LIMITED");
+      } else if (mbDiag.directReleaseFallback.classification === "timeout") {
+        observedFailures.push("PROVIDER_TIMEOUT");
+      } else {
+        observedFailures.push("NETWORK_ERROR");
+      }
+    } else if (mbDiag.directReleaseFallback.classification === "candidates-rejected") {
+      observedFailures.push("CANDIDATE_REJECTED");
     }
+
     for (const candidateRel of directReleases.releases.slice(0, 2)) {
       const relArt = await fetchReleaseCoverArt(candidateRel.mbid, {
         size,
-        excludeUrl: isArtworkUrlFailed,
+        excludeUrl: isExcludedUrl,
+        includeDiagnostics: discoveryOpts.includeDiagnostics,
+        maxRetries: discoveryOpts.maxRetries,
       });
-      if (relArt.status === "ok" && relArt.url && !isArtworkUrlFailed(relArt.url)) {
+      recordCaaOutcome(
+        caaDiag,
+        "release",
+        relArt.status,
+        relArt.httpStatus,
+        relArt.classification,
+        relArt.failedRequests,
+      );
+      if (relArt.status === "ok" && relArt.url && !isExcludedUrl(relArt.url)) {
         return {
           resolution: {
             url: relArt.url,
@@ -675,6 +970,7 @@ async function discoverOnlineArtwork(
             album: candidateRel.release.title,
           },
           transientFailure: false,
+          diagnostic: buildDiagnostic("musicbrainz-caa", relArt.url),
         };
       }
       if (relArt.status === "transient-error") {
@@ -684,75 +980,223 @@ async function discoverOnlineArtwork(
   }
 
   // Step 6: Existing iTunes Search API fallback
-  const markItunesTransientError = () => {
-    sawTransientError = true;
-  };
-  try {
-    const itunesMatch = await searchItunesArtworkDetails(
-      {
-        title: track.title,
-        artist: track.artist,
-        album: track.album,
-        durationMs: track.durationMs,
-      },
-      {
-        excludeUrl: isArtworkUrlFailed,
-        onTransientError: markItunesTransientError,
-      },
-    );
-    if (itunesMatch) {
-      const validated = sanitizeArtworkUrl(itunesMatch.artworkUrl) ?? itunesMatch.artworkUrl;
-      if (!isArtworkUrlFailed(validated)) {
-        return {
-          resolution: {
-            url: validated,
-            source: "itunes",
-            releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
-            releaseMbid: null,
-            confidence: itunesMatch.score,
-            album: itunesMatch.collectionName,
-            artist: itunesMatch.artistName,
-          },
-          transientFailure: false,
-        };
-      }
-    }
+  const artistPresent = Boolean(track.artist?.trim() && !isPlaceholderArtist(track.artist));
+  const hasUsableItunesMetadata =
+    !isInsufficientMetadataForDiscovery(track) &&
+    (!isPlaceholderTitle(track.title) || (artistPresent && hasMeaningfulAlbum(track.album)));
 
-    if (alternateQueries && alternateQueries.length > 0) {
-      for (const alt of alternateQueries.slice(0, 3)) {
-        const altMatch = await searchItunesArtworkDetails(
+  if (!hasUsableItunesMetadata) {
+    itunesDiag.queried = false;
+    itunesDiag.classification = "skipped";
+    if (mbDiag.skipped) {
+      observedFailures.push("METADATA_INSUFFICIENT");
+    }
+  } else {
+    let itunesAbortRestOfQueries = false;
+    const applyItunesOutcome = (outcome: ItunesSearchOutcomeDiagnostic) => {
+      itunesDiag.queried = true;
+      itunesDiag.queriesAttempted += 1;
+      itunesDiag.httpStatus = outcome.httpStatus;
+      itunesDiag.failedRequests += outcome.failedRequests;
+      if (outcome.searchType === "album") {
+        itunesDiag.usedAlbumFallback = true;
+      }
+      if (outcome.classification === "ok") {
+        itunesDiag.classification = "ok";
+        itunesDiag.resultCount += outcome.resultCount;
+        itunesDiag.acceptedCount += outcome.acceptedCount;
+        itunesDiag.rejectedCount += outcome.rejectedCount;
+        itunesDiag.candidateScores = outcome.candidateScores;
+      } else if (
+        outcome.classification === "rate-limited" ||
+        outcome.classification === "timeout" ||
+        outcome.classification === "network-error" ||
+        outcome.classification === "http-error"
+      ) {
+        itunesDiag.classification = outcome.classification;
+        itunesAbortRestOfQueries = true;
+        if (outcome.classification === "rate-limited") {
+          observedFailures.push("PROVIDER_RATE_LIMITED");
+        } else if (outcome.classification === "timeout") {
+          observedFailures.push("PROVIDER_TIMEOUT");
+        } else {
+          observedFailures.push("NETWORK_ERROR");
+        }
+      } else if (outcome.classification === "candidates-rejected") {
+        if (itunesDiag.classification !== "ok") {
+          itunesDiag.classification = "candidates-rejected";
+        }
+        itunesDiag.resultCount += outcome.resultCount;
+        itunesDiag.rejectedCount += outcome.rejectedCount;
+        if (itunesDiag.candidateScores.length === 0) {
+          itunesDiag.candidateScores = outcome.candidateScores;
+        }
+        observedFailures.push("CANDIDATE_REJECTED");
+      } else if (outcome.classification === "no-results") {
+        if (
+          itunesDiag.classification === "not-queried" ||
+          itunesDiag.classification === "skipped"
+        ) {
+          itunesDiag.classification = "no-results";
+        }
+      }
+    };
+
+    const runItunesQuery = async (
+      queryTrack: { title: string; artist?: string; album?: string; durationMs?: number | null },
+      searchType: "song" | "album" = "song",
+    ) => {
+      let receivedOutcome = false;
+      let sawLocalTransient = false;
+      const match = await searchItunesArtworkDetails(queryTrack, {
+        excludeUrl: isExcludedUrl,
+        searchType,
+        maxRetries: options?.maxRetries,
+        onTransientError: () => {
+          sawLocalTransient = true;
+          sawTransientError = true;
+        },
+        onSearchOutcome: (outcome) => {
+          receivedOutcome = true;
+          applyItunesOutcome(outcome);
+        },
+      });
+      // Fallback telemetry when searchItunesArtworkDetails is module-mocked in unit tests
+      if (!receivedOutcome) {
+        itunesDiag.queried = true;
+        itunesDiag.queriesAttempted += 1;
+        if (searchType === "album") itunesDiag.usedAlbumFallback = true;
+        if (match) {
+          itunesDiag.classification = "ok";
+          itunesDiag.acceptedCount += 1;
+          itunesDiag.resultCount += 1;
+        } else if (sawLocalTransient) {
+          itunesDiag.classification = "network-error";
+          itunesDiag.failedRequests += 1;
+          observedFailures.push("NETWORK_ERROR");
+        } else if (itunesDiag.classification === "not-queried") {
+          itunesDiag.classification = "no-results";
+        }
+      }
+      return match;
+    };
+
+    try {
+      const itunesMatch = await runItunesQuery(
+        {
+          title: track.title,
+          artist: track.artist,
+          album: track.album,
+          durationMs: track.durationMs,
+        },
+        "song",
+      );
+      if (itunesMatch) {
+        const validated = sanitizeArtworkUrl(itunesMatch.artworkUrl) ?? itunesMatch.artworkUrl;
+        if (!isExcludedUrl(validated)) {
+          return {
+            resolution: {
+              url: validated,
+              source: "itunes",
+              releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
+              releaseMbid: null,
+              confidence: itunesMatch.score,
+              album: itunesMatch.collectionName,
+              artist: itunesMatch.artistName,
+            },
+            transientFailure: false,
+            diagnostic: buildDiagnostic("itunes", validated),
+          };
+        }
+      }
+
+      // iTunes Album entity fallback when artist + meaningful album are known and song search missed
+      if (
+        !itunesAbortRestOfQueries &&
+        hasMeaningfulAlbum(track.album) &&
+        track.artist?.trim() &&
+        !isPlaceholderArtist(track.artist)
+      ) {
+        const albumMatch = await runItunesQuery(
           {
-            title: alt.trackName,
-            artist: alt.artistName,
+            title: track.title,
+            artist: track.artist,
             album: track.album,
             durationMs: track.durationMs,
           },
-          {
-            excludeUrl: isArtworkUrlFailed,
-            onTransientError: markItunesTransientError,
-          },
+          "album",
         );
-        if (altMatch) {
-          const validated = sanitizeArtworkUrl(altMatch.artworkUrl) ?? altMatch.artworkUrl;
-          if (!isArtworkUrlFailed(validated)) {
+        if (albumMatch) {
+          const validated = sanitizeArtworkUrl(albumMatch.artworkUrl) ?? albumMatch.artworkUrl;
+          if (!isExcludedUrl(validated)) {
             return {
               resolution: {
                 url: validated,
                 source: "itunes",
                 releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
                 releaseMbid: null,
-                confidence: Math.min(altMatch.score, 75),
-                album: altMatch.collectionName,
-                artist: altMatch.artistName,
+                confidence: Math.min(albumMatch.score, 85),
+                album: albumMatch.collectionName,
+                artist: albumMatch.artistName,
               },
               transientFailure: false,
+              diagnostic: buildDiagnostic("itunes", validated),
             };
           }
         }
       }
+
+      if (!itunesAbortRestOfQueries && alternateQueries && alternateQueries.length > 0) {
+        const primaryTrackNorm = normalizeForMatching(track.title);
+        const primaryArtistNorm = normalizeForMatching(track.artist);
+        const dedupedAlts = alternateQueries.filter(
+          (alt) =>
+            normalizeForMatching(alt.trackName) !== primaryTrackNorm ||
+            normalizeForMatching(alt.artistName) !== primaryArtistNorm,
+        );
+
+        for (const alt of dedupedAlts.slice(0, 3)) {
+          if (itunesAbortRestOfQueries) break;
+          const altMatch = await runItunesQuery(
+            {
+              title: alt.trackName,
+              artist: alt.artistName,
+              album: track.album,
+              durationMs: track.durationMs,
+            },
+            "song",
+          );
+          if (altMatch) {
+            const validated = sanitizeArtworkUrl(altMatch.artworkUrl) ?? altMatch.artworkUrl;
+            if (!isExcludedUrl(validated)) {
+              return {
+                resolution: {
+                  url: validated,
+                  source: "itunes",
+                  releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
+                  releaseMbid: null,
+                  confidence: Math.min(altMatch.score, 75),
+                  album: altMatch.collectionName,
+                  artist: altMatch.artistName,
+                },
+                transientFailure: false,
+                diagnostic: buildDiagnostic("itunes", validated),
+              };
+            }
+          }
+        }
+      }
+    } catch {
+      sawTransientError = true;
+      itunesDiag.queried = true;
+      itunesDiag.classification = "network-error";
+      itunesDiag.failedRequests += 1;
+      observedFailures.push("NETWORK_ERROR");
     }
-  } catch {
-    sawTransientError = true;
+
+    if (itunesDiag.classification === "no-results") {
+      observedFailures.push("ITUNES_NO_MATCH");
+    }
   }
 
   // Step 7: Neutral fallback
@@ -765,6 +1209,7 @@ async function discoverOnlineArtwork(
       confidence: 0,
     },
     transientFailure: sawTransientError,
+    diagnostic: buildDiagnostic("none", undefined),
   };
 }
 
@@ -780,9 +1225,16 @@ async function discoverOnlineArtwork(
  */
 export async function resolveArtworkForTrack(
   track: ArtworkTrackInput,
-  options?: { size?: ArtworkThumbnailSize; forceRefresh?: boolean },
+  options?: {
+    size?: ArtworkThumbnailSize;
+    forceRefresh?: boolean;
+    includeDiagnostics?: boolean;
+    excludeUrls?: string[];
+    maxRetries?: number;
+  },
 ): Promise<ArtworkResolution> {
   const forceRefresh = Boolean(options?.forceRefresh);
+  const includeDiagnostics = Boolean(options?.includeDiagnostics);
 
   // 1. Check local IndexedDB for embedded artwork (always highest priority unless caller already validated/evicted)
   if (!forceRefresh) {
@@ -802,7 +1254,32 @@ export async function resolveArtworkForTrack(
   const primaryKey = albumKey || trackKey;
 
   if (!primaryKey) {
-    return { url: undefined, source: "none" };
+    if (!includeDiagnostics) {
+      return { url: undefined, source: "none" };
+    }
+    const mbSkipped = createEmptyMusicBrainzDiagnostic();
+    mbSkipped.skipped = true;
+    mbSkipped.skipReason = "Empty track artist and title";
+    mbSkipped.classification = "skipped";
+    return {
+      url: undefined,
+      source: "none",
+      diagnostic: {
+        originalTitle: track.title,
+        originalArtist: track.artist,
+        originalAlbum: track.album ?? "",
+        normalizedTitle: "",
+        normalizedArtist: "",
+        normalizedAlbum: undefined,
+        musicbrainz: mbSkipped,
+        caa: createEmptyCaaDiagnostic(),
+        itunes: { ...createEmptyItunesDiagnostic(), classification: "skipped" },
+        selectedProvider: "none",
+        selectedArtworkHost: null,
+        failedHttpRequests: 0,
+        observedFailures: ["METADATA_INSUFFICIENT"],
+      },
+    };
   }
 
   // 2. Check unified artwork cache unless performing explicit force-refresh recovery
@@ -826,11 +1303,15 @@ export async function resolveArtworkForTrack(
   }
 
   // 3. Deduplicate concurrent requests for the same album or track
-  const inFlightPrimaryKey = forceRefresh ? `force::${primaryKey}` : primaryKey;
-  const inFlightTrackKey = trackKey ? (forceRefresh ? `force::${trackKey}` : trackKey) : "";
+  // Include excludeUrls count/signature on forceRefresh so excluded retries don't reuse stale promise
+  const excludeSig = options?.excludeUrls?.length ? `:ex${options.excludeUrls.length}` : "";
+  const inFlightPrimaryKey = forceRefresh ? `force${excludeSig}::${primaryKey}` : primaryKey;
+  const inFlightTrackKey = trackKey ? (forceRefresh ? `force${excludeSig}::${trackKey}` : trackKey) : "";
   const existingInFlight =
-    inFlightRequests.get(inFlightPrimaryKey) ??
-    (inFlightTrackKey ? inFlightRequests.get(inFlightTrackKey) : undefined);
+    !includeDiagnostics
+      ? (inFlightRequests.get(inFlightPrimaryKey) ??
+        (inFlightTrackKey ? inFlightRequests.get(inFlightTrackKey) : undefined))
+      : undefined;
   if (existingInFlight) {
     return existingInFlight;
   }
@@ -845,22 +1326,67 @@ export async function resolveArtworkForTrack(
     artist: track.artist,
     album: track.album ?? "",
     durationMs: track.durationMs ?? null,
-    fileName: "",
+    fileName: track.fileName ?? "",
   });
+
+  // Note: norm.artist can legitimately become "" when rawArtist was "Unknown Artist"
+  // and no delimiter existed in title/fileName — keep "" instead of falling back to "Unknown Artist".
+  const resolvedArtist =
+    norm.artist !== undefined && isPlaceholderArtist(norm.artist)
+      ? ""
+      : isPlaceholderArtist(track.artist) && !norm.artist
+        ? ""
+        : (norm.artist || track.artist);
 
   const normalizedTrack: ArtworkTrackInput = {
     ...track,
     title: norm.title || track.title,
-    artist: norm.artist || track.artist,
-    album: norm.album || track.album,
+    artist: resolvedArtist,
+    album: norm.album || (isYearOnly(track.album) ? undefined : track.album),
   };
+
+  if (isInsufficientMetadataForDiscovery(normalizedTrack)) {
+    if (!includeDiagnostics) {
+      return { url: undefined, source: "none" };
+    }
+    const mbSkipped = createEmptyMusicBrainzDiagnostic();
+    mbSkipped.skipped = true;
+    mbSkipped.skipReason = "Incomplete or placeholder metadata";
+    mbSkipped.classification = "skipped";
+    return {
+      url: undefined,
+      source: "none",
+      diagnostic: {
+        originalTitle: track.title,
+        originalArtist: track.artist,
+        originalAlbum: track.album ?? "",
+        normalizedTitle: normalizedTrack.title,
+        normalizedArtist: normalizedTrack.artist,
+        normalizedAlbum: normalizedTrack.album,
+        musicbrainz: mbSkipped,
+        caa: createEmptyCaaDiagnostic(),
+        itunes: { ...createEmptyItunesDiagnostic(), classification: "skipped" },
+        selectedProvider: "none",
+        selectedArtworkHost: null,
+        failedHttpRequests: 0,
+        observedFailures: ["METADATA_INSUFFICIENT"],
+      },
+    };
+  }
 
   const promise = (async (): Promise<ArtworkResolution> => {
     try {
-      const { resolution, transientFailure } = await discoverOnlineArtwork(
+      const { resolution, transientFailure, diagnostic } = await discoverOnlineArtwork(
         normalizedTrack,
         options?.size ?? "500",
         norm.alternateQueries,
+        {
+          includeDiagnostics,
+          excludeUrls: options?.excludeUrls,
+          maxRetries: options?.maxRetries ?? (forceRefresh ? 1 : 0),
+          originalTrack: track,
+          forceRefresh,
+        },
       );
       const verifiedAlbum = resolution.album || norm.album || track.album || "";
       const verifiedArtist = resolution.artist || extractPrimaryArtist(norm.artist || track.artist);
@@ -917,16 +1443,21 @@ export async function resolveArtworkForTrack(
         });
       }
 
-      return transientFailure ? { ...resolution, transientFailure: true } : resolution;
+      const baseResolution = transientFailure
+        ? { ...resolution, transientFailure: true }
+        : resolution;
+      return includeDiagnostics ? { ...baseResolution, diagnostic } : baseResolution;
     } finally {
       inFlightRequests.delete(inFlightPrimaryKey);
       if (inFlightTrackKey) inFlightRequests.delete(inFlightTrackKey);
     }
   })();
 
-  inFlightRequests.set(inFlightPrimaryKey, promise);
-  if (inFlightTrackKey && inFlightTrackKey !== inFlightPrimaryKey) {
-    inFlightRequests.set(inFlightTrackKey, promise);
+  if (!includeDiagnostics) {
+    inFlightRequests.set(inFlightPrimaryKey, promise);
+    if (inFlightTrackKey && inFlightTrackKey !== inFlightPrimaryKey) {
+      inFlightRequests.set(inFlightTrackKey, promise);
+    }
   }
   return promise;
 }

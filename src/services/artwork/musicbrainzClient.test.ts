@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as cloudAuthService from "../cloud/cloudAuthService";
 import {
   __configureMusicBrainzForTests,
   buildReleaseGroupSearchQuery,
@@ -245,5 +246,45 @@ describe("musicbrainzClient", () => {
     expect(result.status).toBe("ok");
     expect(result.bestCandidate?.mbid).toBe("88888888-8888-8888-8888-888888888888");
     expect(result.bestCandidate?.tier).toBe("high");
+  });
+
+  it("falls through to direct MusicBrainz WS/2 when Worker proxy returns 404", async () => {
+    vi.spyOn(cloudAuthService, "workerConfigured").mockReturnValue(true);
+    vi.spyOn(cloudAuthService, "workerUrl").mockReturnValue("https://worker.example.com");
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("https://worker.example.com/api/musicbrainz/")) {
+        return { ok: false, status: 404, json: async () => ({ error: "not-found" }) } as unknown as Response;
+      }
+      if (url.startsWith("https://musicbrainz.org/ws/2/release-group")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            "release-groups": [
+              {
+                id: "99999999-9999-4999-8999-999999999999",
+                title: "Random Access Memories",
+                "primary-type": "Album",
+                "artist-credit": [{ name: "Daft Punk" }],
+              },
+            ],
+          }),
+        } as unknown as Response;
+      }
+      return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await searchMusicBrainzReleaseGroups({
+      artist: "Daft Punk",
+      album: "Random Access Memories",
+      title: "Get Lucky",
+    });
+
+    expect(result.status).toBe("ok");
+    expect(result.bestCandidate?.mbid).toBe("99999999-9999-4999-8999-999999999999");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
