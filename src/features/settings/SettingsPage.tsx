@@ -16,7 +16,8 @@ import { resetPlaybackState } from "../../stores/libraryStore";
 import { fileSystemAccessSupported } from "../../services/file-access/FileAccessService";
 import { humanBytes } from "../../utils/misc";
 import { APP_VERSION } from "../../types";
-import { ImportIcon, InfoIcon, OfflineIcon } from "../../components/Icons";
+import { ImportIcon, InfoIcon, OfflineIcon, RefreshIcon } from "../../components/Icons";
+import { reloadMissingArtwork, type ReloadMissingArtworkProgress } from "../../services/artwork/artworkCache";
 import { SegmentedControl } from "../../components/SegmentedControl";
 import { Select, type SelectOption } from "../../components/Select";
 import { CloudAccountSection } from "./CloudAccountSection";
@@ -71,6 +72,9 @@ export function SettingsPage() {
   const clearLibrary = useLibraryStore((state) => state.clearLibrary);
   const [confirmClearLibrary, setConfirmClearLibrary] = useState(false);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [reloadingArtwork, setReloadingArtwork] = useState(false);
+  const [artworkProgress, setArtworkProgress] = useState<ReloadMissingArtworkProgress | null>(null);
+  const [artworkReloadSummary, setArtworkReloadSummary] = useState<string | null>(null);
   const [restore, setRestore] = useState<RestoreState>({ phase: "idle" });
   const [storage, setStorage] = useState<{ usage: number | null; quota: number | null; persisted: boolean | null }>({
     usage: null,
@@ -90,6 +94,43 @@ export function SettingsPage() {
       }
     })();
   }, [tracks.length]);
+
+  const handleReloadMissingArtwork = async () => {
+    if (reloadingArtwork || tracks.length === 0) return;
+    setReloadingArtwork(true);
+    setArtworkProgress(null);
+    try {
+      const result = await reloadMissingArtwork(tracks, {
+        onProgress: (progress) => setArtworkProgress(progress),
+      });
+      if (result.offline) {
+        const msg = "Connect to the internet to reload missing artwork.";
+        setArtworkReloadSummary(msg);
+        toast("error", msg);
+      } else if (result.missingFound === 0) {
+        const msg = "All tracks already have artwork.";
+        setArtworkReloadSummary(msg);
+        toast("info", msg);
+      } else if (result.restored > 0 && result.stillMissing === 0) {
+        const msg = `Restored artwork for ${result.restored} track${result.restored === 1 ? "" : "s"}.`;
+        setArtworkReloadSummary(msg);
+        toast("success", msg);
+      } else if (result.restored > 0) {
+        const msg = `Restored artwork for ${result.restored} of ${result.missingFound} missing track${result.missingFound === 1 ? "" : "s"} (${result.stillMissing} not found).`;
+        setArtworkReloadSummary(msg);
+        toast("success", msg);
+      } else {
+        const msg = `No new artwork found for ${result.missingFound} missing track${result.missingFound === 1 ? "" : "s"}.`;
+        setArtworkReloadSummary(msg);
+        toast("info", msg);
+      }
+    } catch {
+      toast("error", "Could not reload missing artwork.");
+    } finally {
+      setReloadingArtwork(false);
+      setArtworkProgress(null);
+    }
+  };
 
   const handleExport = async () => {
     try {
@@ -313,6 +354,28 @@ export function SettingsPage() {
           }
         >
           <Toggle checked={prefs.storeAudioCopies} onChange={(value) => update({ storeAudioCopies: value })} label="Store audio copies" />
+        </Row>
+        <Row
+          label="Reload missing artwork"
+          hint={
+            artworkReloadSummary ??
+            "Fetches artwork only for tracks that do not have cover art yet. Existing artwork is kept untouched."
+          }
+        >
+          <button
+            type="button"
+            className="inline-flex items-center gap-2 rounded-lg border px-3.5 py-1.5 text-sm font-medium text-text-primary transition-colors hover:bg-surface-hover disabled:cursor-not-allowed disabled:opacity-50"
+            style={{ borderColor: "var(--border-strong)" }}
+            disabled={reloadingArtwork || tracks.length === 0}
+            onClick={() => void handleReloadMissingArtwork()}
+          >
+            <RefreshIcon size={15} className={reloadingArtwork ? "animate-spin" : undefined} />
+            {reloadingArtwork
+              ? artworkProgress && artworkProgress.total > 0
+                ? `Reloading (${artworkProgress.done}/${artworkProgress.total})…`
+                : "Checking…"
+              : "Reload missing artwork"}
+          </button>
         </Row>
         {storage.persisted === false && navigator.storage?.persist && (
           <button

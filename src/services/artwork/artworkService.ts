@@ -412,6 +412,70 @@ export function invalidateArtworkCacheForTrack(track: {
 /**
  * Clears all in-memory artwork caches and in-flight state (used in unit tests).
  */
+/**
+ * Clears only negative/expired retry cache entries for a track so a manual
+ * "Reload missing artwork" action can re-query providers without disturbing any
+ * track that already has positive artwork cached.
+ */
+export function clearNegativeArtworkCacheForTrack(track: {
+  title: string;
+  artist: string;
+  album?: string;
+}): void {
+  const norm = normalizeTrackMetadata({
+    title: track.title,
+    artist: track.artist,
+    album: track.album ?? "",
+    durationMs: null,
+    fileName: "",
+  });
+
+  const keys = new Set<string>([
+    getAlbumArtworkCacheKey(track),
+    getArtworkCacheKey(track),
+    getAlbumArtworkCacheKey({ title: norm.title, artist: norm.artist, album: norm.album }),
+    getArtworkCacheKey({ title: norm.title, artist: norm.artist }),
+  ]);
+
+  for (const key of keys) {
+    if (!key) continue;
+    transientBackoffUntil.delete(key);
+
+    const mem = memoryCache.get(key);
+    if (mem && (mem.negative || !mem.url)) {
+      memoryCache.delete(key);
+    }
+
+    try {
+      const rawV2 = localStorage.getItem(`${UNIFIED_CACHE_PREFIX}${key}`);
+      if (rawV2) {
+        try {
+          const parsed = JSON.parse(rawV2) as { url?: string | null; negative?: boolean };
+          if (parsed?.negative || !parsed?.url) {
+            localStorage.removeItem(`${UNIFIED_CACHE_PREFIX}${key}`);
+          }
+        } catch {
+          localStorage.removeItem(`${UNIFIED_CACHE_PREFIX}${key}`);
+        }
+      }
+
+      const rawV1 = localStorage.getItem(`${LEGACY_CACHE_PREFIX}${key}`);
+      if (rawV1) {
+        try {
+          const parsed = JSON.parse(rawV1) as { url?: string | null };
+          if (!parsed?.url) {
+            localStorage.removeItem(`${LEGACY_CACHE_PREFIX}${key}`);
+          }
+        } catch {
+          localStorage.removeItem(`${LEGACY_CACHE_PREFIX}${key}`);
+        }
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }
+}
+
 export function __resetArtworkServiceForTests(): void {
   memoryCache.clear();
   transientBackoffUntil.clear();

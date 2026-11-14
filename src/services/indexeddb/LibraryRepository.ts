@@ -139,6 +139,14 @@ export class LibraryRepository {
     });
   }
 
+  /** Lists track IDs that already have a persisted artwork record in IndexedDB. */
+  async listArtworkTrackIds(): Promise<Set<string>> {
+    return withTransaction([STORES.artwork], "readonly", async (tx) => {
+      const keys = await requestToPromise(tx.objectStore(STORES.artwork).getAllKeys());
+      return new Set(keys.map((key) => String(key)));
+    });
+  }
+
   async getAudioBlob(trackId: string): Promise<Blob | undefined> {
     return withTransaction([STORES.audio], "readonly", async (tx) => {
       const record = await requestToPromise(

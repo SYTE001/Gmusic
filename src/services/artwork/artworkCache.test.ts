@@ -5,6 +5,7 @@ import {
   getArtworkUrl,
   handleArtworkImageError,
   loadArtworkUrl,
+  reloadMissingArtwork,
   setCachedArtworkForTrack,
   subscribeArtwork,
   upgradeArtworkToPersisted,
@@ -13,6 +14,7 @@ import {
 import { repository } from "../indexeddb/LibraryRepository";
 import { getPlayUrl } from "../cloud/r2StorageService";
 import {
+  clearNegativeArtworkCacheForTrack,
   invalidateArtworkCacheForTrack,
   markArtworkUrlFailed,
   resolveArtworkForTrack,
@@ -25,6 +27,7 @@ vi.mock("../indexeddb/LibraryRepository", () => ({
     putArtwork: vi.fn(),
     deleteArtwork: vi.fn(),
     getTrack: vi.fn(),
+    listArtworkTrackIds: vi.fn(),
   },
 }));
 
@@ -35,6 +38,7 @@ vi.mock("../cloud/r2StorageService", () => ({
 vi.mock("./artworkService", () => ({
   resolveArtworkForTrack: vi.fn(),
   invalidateArtworkCacheForTrack: vi.fn(),
+  clearNegativeArtworkCacheForTrack: vi.fn(),
   markArtworkUrlFailed: vi.fn(),
 }));
 
@@ -78,7 +82,9 @@ describe("artworkCache", () => {
     vi.mocked(repository.putArtwork).mockResolvedValue(undefined);
     vi.mocked(repository.deleteArtwork).mockResolvedValue(undefined);
     vi.mocked(repository.getTrack).mockResolvedValue(undefined);
+    vi.mocked(repository.listArtworkTrackIds).mockResolvedValue(new Set());
     vi.mocked(invalidateArtworkCacheForTrack).mockReturnValue(undefined);
+    vi.mocked(clearNegativeArtworkCacheForTrack).mockReturnValue(undefined);
     vi.mocked(markArtworkUrlFailed).mockReturnValue(undefined);
     vi.mocked(getPlayUrl).mockRejectedValue(new Error("not configured"));
   });
@@ -405,6 +411,145 @@ describe("artworkCache", () => {
       const urlA = await promiseA;
       expect(urlA).toBeUndefined();
       expect(urlB).toBe("blob:mock-1");
+    });
+  });
+
+  describe("reloadMissingArtwork", () => {
+    it("skips tracks with persisted IndexedDB blobs and memory-cached artwork untouched", async () => {
+      const trackPersisted = makeTrack("t-persisted", { title: "Has IDB Blob", artist: "Artist 1" });
+      const trackMem = makeTrack("t-mem", { title: "Has Memory URL", artist: "Artist 2" });
+      const trackMissing = makeTrack("t-missing", { title: "Missing Art", artist: "Artist 3" });
+
+      setCachedArtworkForTrack("t-mem", "blob:existing-mem");
+      vi.mocked(repository.listArtworkTrackIds).mockResolvedValue(new Set(["t-persisted"]));
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({
+        url: "https://cdn.example/restored.jpg",
+        source: "itunes",
+      });
+
+      const imgBlob = makeImageBlob();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string) => {
+          if (input === "https://cdn.example/restored.jpg") {
+            return { ok: true, blob: async () => imgBlob } as unknown as Response;
+          }
+          return { ok: false, blob: async () => new Blob() } as unknown as Response;
+        }),
+      );
+
+      const listenerMissing = vi.fn();
+      const listenerMem = vi.fn();
+      const unsubMissing = subscribeArtwork("t-missing", listenerMissing);
+      const unsubMem = subscribeArtwork("t-mem", listenerMem);
+
+      const progressEvents: Array<{ done: number; total: number; restored: number }> = [];
+      const result = await reloadMissingArtwork([trackPersisted, trackMem, trackMissing], {
+        onProgress: (p) => progressEvents.push(p),
+      });
+
+      expect(result).toEqual({
+        totalTracks: 3,
+        alreadyHaveArtwork: 2,
+        missingFound: 1,
+        restored: 1,
+        stillMissing: 0,
+        offline: false,
+      });
+
+      // Only the missing track was cleared/resolved/persisted
+      expect(clearNegativeArtworkCacheForTrack).toHaveBeenCalledTimes(1);
+      expect(clearNegativeArtworkCacheForTrack).toHaveBeenCalledWith(trackMissing);
+      expect(resolveArtworkForTrack).toHaveBeenCalledTimes(1);
+      expect(resolveArtworkForTrack).toHaveBeenCalledWith(trackMissing);
+      expect(repository.putArtwork).toHaveBeenCalledTimes(1);
+      expect(repository.putArtwork).toHaveBeenCalledWith("t-missing", imgBlob);
+      expect(repository.deleteArtwork).not.toHaveBeenCalled();
+
+      // Existing memory-cached artwork remains untouched; missing track gets local blob URL
+      expect(getArtworkUrl("t-mem")).toBe("blob:existing-mem");
+      expect(getArtworkUrl("t-missing")).toBe("blob:mock-1");
+      expect(listenerMem).not.toHaveBeenCalled();
+      expect(listenerMissing).toHaveBeenCalledWith("blob:mock-1");
+      expect(progressEvents).toEqual([{ done: 1, total: 1, restored: 1 }]);
+
+      unsubMissing();
+      unsubMem();
+    });
+
+    it("falls back to a secondary URL if the first candidate image fails download/validation", async () => {
+      const trackMissing = makeTrack("t-retry", { title: "Retry Track", artist: "Artist" });
+
+      vi.mocked(repository.listArtworkTrackIds).mockResolvedValue(new Set());
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(resolveArtworkForTrack)
+        .mockResolvedValueOnce({ url: "https://cdn.example/broken.jpg", source: "musicbrainz-caa" })
+        .mockResolvedValueOnce({ url: "https://cdn.example/working.jpg", source: "itunes" });
+
+      const goodBlob = makeImageBlob();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string) => {
+          if (input === "https://cdn.example/working.jpg") {
+            return { ok: true, blob: async () => goodBlob } as unknown as Response;
+          }
+          return { ok: false, blob: async () => new Blob() } as unknown as Response;
+        }),
+      );
+
+      const result = await reloadMissingArtwork([trackMissing]);
+
+      expect(result).toEqual({
+        totalTracks: 1,
+        alreadyHaveArtwork: 0,
+        missingFound: 1,
+        restored: 1,
+        stillMissing: 0,
+        offline: false,
+      });
+      expect(markArtworkUrlFailed).toHaveBeenCalledWith("https://cdn.example/broken.jpg");
+      expect(repository.putArtwork).toHaveBeenCalledWith("t-retry", goodBlob);
+      expect(getArtworkUrl("t-retry")).toBe("blob:mock-1");
+    });
+
+    it("does nothing and returns offline: true when disconnected", async () => {
+      Object.defineProperty(navigator, "onLine", { value: false, configurable: true });
+      const trackMissing = makeTrack("t-offline");
+      vi.mocked(repository.listArtworkTrackIds).mockResolvedValue(new Set());
+
+      const result = await reloadMissingArtwork([trackMissing]);
+
+      expect(result).toEqual({
+        totalTracks: 1,
+        alreadyHaveArtwork: 0,
+        missingFound: 1,
+        restored: 0,
+        stillMissing: 1,
+        offline: true,
+      });
+      expect(clearNegativeArtworkCacheForTrack).not.toHaveBeenCalled();
+      expect(resolveArtworkForTrack).not.toHaveBeenCalled();
+    });
+
+    it("returns immediately without network calls when all tracks already have artwork", async () => {
+      const track1 = makeTrack("t-1");
+      const track2 = makeTrack("t-2");
+      setCachedArtworkForTrack("t-1", "blob:mem-1");
+      vi.mocked(repository.listArtworkTrackIds).mockResolvedValue(new Set(["t-2"]));
+
+      const result = await reloadMissingArtwork([track1, track2]);
+
+      expect(result).toEqual({
+        totalTracks: 2,
+        alreadyHaveArtwork: 2,
+        missingFound: 0,
+        restored: 0,
+        stillMissing: 0,
+        offline: false,
+      });
+      expect(resolveArtworkForTrack).not.toHaveBeenCalled();
+      expect(clearNegativeArtworkCacheForTrack).not.toHaveBeenCalled();
     });
   });
 });

@@ -1,6 +1,7 @@
 import { repository } from "../indexeddb/LibraryRepository";
 import { getPlayUrl } from "../cloud/r2StorageService";
 import {
+  clearNegativeArtworkCacheForTrack,
   invalidateArtworkCacheForTrack,
   markArtworkUrlFailed,
   resolveArtworkForTrack,
@@ -182,6 +183,7 @@ const ARTWORK_DOWNLOAD_TIMEOUT_MS = 10_000;
 const FAILED_DOWNLOAD_TTL_MS = 5 * 60_000;
 
 const inFlightBlobDownloads = new Map<string, Promise<Blob | null>>();
+const inFlightPersistBlobs = new Map<string, Promise<Blob | undefined>>();
 const failedDownloadAt = new Map<string, number>();
 
 function pruneMapOldest(map: Map<string, number>, max: number): void {
@@ -275,14 +277,25 @@ async function fetchArtworkBlobDeduped(url: string): Promise<Blob | null> {
  * `undefined` when the artwork could not be materialized.
  */
 async function persistRemoteArtworkBlob(trackId: string, remoteUrl: string): Promise<Blob | undefined> {
-  const blob = await fetchArtworkBlobDeduped(remoteUrl);
-  if (!blob) return undefined;
-  try {
-    await repository.putArtwork(trackId, blob);
-    return blob;
-  } catch {
-    return undefined; // Quota/IDB failure: honest fallback to the remote URL
-  }
+  const key = `${trackId}::${remoteUrl}`;
+  const existing = inFlightPersistBlobs.get(key);
+  if (existing) return existing;
+
+  const promise = (async (): Promise<Blob | undefined> => {
+    const blob = await fetchArtworkBlobDeduped(remoteUrl);
+    if (!blob) return undefined;
+    try {
+      await repository.putArtwork(trackId, blob);
+      return blob;
+    } catch {
+      return undefined; // Quota/IDB failure: honest fallback to the remote URL
+    }
+  })().finally(() => {
+    inFlightPersistBlobs.delete(key);
+  });
+
+  inFlightPersistBlobs.set(key, promise);
+  return promise;
 }
 
 /**
@@ -511,10 +524,176 @@ export function clearArtworkCache(): void {
 /**
  * Clears all in-memory state (used in unit tests). Does not touch IndexedDB.
  */
+// ---- Missing artwork reload ----
+
+export interface ReloadMissingArtworkProgress {
+  done: number;
+  total: number;
+  restored: number;
+}
+
+export interface ReloadMissingArtworkResult {
+  totalTracks: number;
+  alreadyHaveArtwork: number;
+  missingFound: number;
+  restored: number;
+  stillMissing: number;
+  offline: boolean;
+}
+
+function clearAutoRetryForTrack(trackId: string): void {
+  const prefix = `${trackId}::`;
+  for (const key of Array.from(autoRetryLog.keys())) {
+    if (key.startsWith(prefix)) autoRetryLog.delete(key);
+  }
+}
+
+async function reloadSingleMissingTrack(track: Track): Promise<boolean> {
+  if (getArtworkUrl(track.id)) return true;
+
+  clearAutoRetryForTrack(track.id);
+  if (typeof clearNegativeArtworkCacheForTrack === "function") {
+    clearNegativeArtworkCacheForTrack(track);
+  }
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const resolvedUrl = await loadArtworkUrl(track);
+    if (!resolvedUrl) return false;
+    if (resolvedUrl.startsWith("blob:")) return true;
+
+    const blob = await persistRemoteArtworkBlob(track.id, resolvedUrl);
+    if (blob) {
+      const current = urlCache.get(track.id);
+      if (current === resolvedUrl || current === undefined) {
+        try {
+          const blobUrl = URL.createObjectURL(blob);
+          insertUrlCache(track.id, blobUrl);
+          notifyArtworkLoaded(track.id, blobUrl);
+        } catch {
+          // Keep existing resolvedUrl if createObjectURL fails
+        }
+      }
+      return true;
+    }
+
+    if (resolvedUrl.startsWith("http") && typeof markArtworkUrlFailed === "function") {
+      markArtworkUrlFailed(resolvedUrl);
+    }
+    if (urlCache.get(track.id) === resolvedUrl) {
+      urlCache.delete(track.id);
+    }
+    if (typeof invalidateArtworkCacheForTrack === "function") {
+      invalidateArtworkCacheForTrack(track);
+    }
+    if (typeof clearNegativeArtworkCacheForTrack === "function") {
+      clearNegativeArtworkCacheForTrack(track);
+    }
+  }
+
+  notifyArtworkLoaded(track.id, undefined);
+  return false;
+}
+
+/**
+ * Reloads artwork ONLY for tracks that currently have neither a persisted
+ * IndexedDB blob nor a cached in-memory artwork URL. Tracks that already have
+ * artwork are left completely untouched.
+ */
+export async function reloadMissingArtwork(
+  tracks: Track[],
+  options?: { onProgress?: (progress: ReloadMissingArtworkProgress) => void },
+): Promise<ReloadMissingArtworkResult> {
+  if (tracks.length === 0) {
+    return {
+      totalTracks: 0,
+      alreadyHaveArtwork: 0,
+      missingFound: 0,
+      restored: 0,
+      stillMissing: 0,
+      offline: false,
+    };
+  }
+
+  let persistedIds: Set<string> | null = null;
+  if (typeof repository.listArtworkTrackIds === "function") {
+    persistedIds = await repository.listArtworkTrackIds().catch(() => null);
+  }
+
+  const missingTracks: Track[] = [];
+  for (const track of tracks) {
+    if (getArtworkUrl(track.id)) continue;
+
+    if (persistedIds !== null) {
+      if (persistedIds.has(track.id)) continue;
+      missingTracks.push(track);
+      continue;
+    }
+
+    const existingBlob = await repository.getArtwork(track.id).catch(() => undefined);
+    if (existingBlob) continue;
+    missingTracks.push(track);
+  }
+
+  const alreadyHaveArtwork = tracks.length - missingTracks.length;
+  if (missingTracks.length === 0) {
+    return {
+      totalTracks: tracks.length,
+      alreadyHaveArtwork,
+      missingFound: 0,
+      restored: 0,
+      stillMissing: 0,
+      offline: false,
+    };
+  }
+
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return {
+      totalTracks: tracks.length,
+      alreadyHaveArtwork,
+      missingFound: missingTracks.length,
+      restored: 0,
+      stillMissing: missingTracks.length,
+      offline: true,
+    };
+  }
+
+  failedDownloadAt.clear();
+
+  let cursor = 0;
+  let done = 0;
+  let restored = 0;
+  const concurrency = Math.min(2, missingTracks.length);
+
+  const runWorker = async () => {
+    while (cursor < missingTracks.length) {
+      const idx = cursor++;
+      const track = missingTracks[idx];
+      if (!track) continue;
+
+      const ok = await reloadSingleMissingTrack(track).catch(() => false);
+      if (ok) restored++;
+      done++;
+      options?.onProgress?.({ done, total: missingTracks.length, restored });
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => runWorker()));
+
+  return {
+    totalTracks: tracks.length,
+    alreadyHaveArtwork,
+    missingFound: missingTracks.length,
+    restored,
+    stillMissing: missingTracks.length - restored,
+    offline: false,
+  };
+}
+
 export function __resetArtworkCacheForTests(): void {
   urlCache.clear();
   inFlightLoads.clear();
   inFlightBlobDownloads.clear();
+  inFlightPersistBlobs.clear();
   failedDownloadAt.clear();
   autoRetryLog.clear();
   revokedBlobUrls.clear();

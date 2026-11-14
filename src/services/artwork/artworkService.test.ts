@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetArtworkServiceForTests,
+  clearNegativeArtworkCacheForTrack,
   getAlbumArtworkCacheKey,
   getArtworkCacheKey,
   getCachedArtworkEntry,
@@ -694,6 +695,28 @@ describe("artworkService", () => {
       expect(parsed.artwork).toBeDefined();
       expect(parsed.artwork?.size).toBe(imagePayload.length);
       expect(parsed.artwork?.type).toBe("image/png");
+    });
+  });
+
+  describe("clearNegativeArtworkCacheForTrack", () => {
+    it("clears cached negative entries while leaving positive entries intact", async () => {
+      vi.mocked(searchItunesArtwork).mockResolvedValueOnce(null);
+      const missingTrack = { id: "m1", title: "No Cover", artist: "Unknown", album: "Lost" };
+      expect(await resolveArtworkForTrack(missingTrack)).toMatchObject({ url: undefined, source: "none" });
+      expect(getCachedArtworkEntry(missingTrack)?.negative).toBe(true);
+
+      vi.mocked(searchItunesArtwork).mockResolvedValueOnce("https://is1-ssl.mzstatic.com/found.jpg");
+      const existingTrack = { id: "e1", title: "Has Cover", artist: "Known", album: "Found" };
+      expect(await resolveArtworkForTrack(existingTrack)).toMatchObject({
+        url: "https://is1-ssl.mzstatic.com/found.jpg",
+        source: "itunes",
+      });
+
+      clearNegativeArtworkCacheForTrack(missingTrack);
+      clearNegativeArtworkCacheForTrack(existingTrack);
+
+      expect(getCachedArtworkEntry(missingTrack)).toBeUndefined();
+      expect(getCachedArtworkEntry(existingTrack)?.url).toBe("https://is1-ssl.mzstatic.com/found.jpg");
     });
   });
 });
