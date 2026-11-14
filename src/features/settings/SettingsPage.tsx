@@ -104,25 +104,33 @@ export function SettingsPage() {
         onProgress: (progress) => setArtworkProgress(progress),
       });
       if (result.offline) {
-        const msg = "Connect to the internet to reload missing artwork.";
+        const msg = `Connect to the internet to recover missing or broken artwork (${result.validPreserved} valid kept).`;
         setArtworkReloadSummary(msg);
         toast("error", msg);
       } else if (result.missingFound === 0) {
-        const msg = "All tracks already have artwork.";
+        const msg = `Scanned ${result.totalTracks} track${result.totalTracks === 1 ? "" : "s"}: all ${result.validPreserved} validated and preserved.`;
         setArtworkReloadSummary(msg);
         toast("info", msg);
-      } else if (result.restored > 0 && result.stillMissing === 0) {
-        const msg = `Restored artwork for ${result.restored} track${result.restored === 1 ? "" : "s"}.`;
-        setArtworkReloadSummary(msg);
-        toast("success", msg);
-      } else if (result.restored > 0) {
-        const msg = `Restored artwork for ${result.restored} of ${result.missingFound} missing track${result.missingFound === 1 ? "" : "s"} (${result.stillMissing} not found).`;
-        setArtworkReloadSummary(msg);
-        toast("success", msg);
       } else {
-        const msg = `No new artwork found for ${result.missingFound} missing track${result.missingFound === 1 ? "" : "s"}.`;
+        const invalidCount = result.corruptedDetected + result.brokenUrlDetected + result.staleDetected;
+        const detectedParts: string[] = [];
+        if (result.missingDetected > 0) detectedParts.push(`${result.missingDetected} missing`);
+        if (invalidCount > 0) detectedParts.push(`${invalidCount} broken/corrupted`);
+        const failureSuffix =
+          result.providerFailures > 0
+            ? ` · ${result.providerFailures} provider failure${result.providerFailures === 1 ? "" : "s"}`
+            : "";
+        const msg = `Scanned ${result.totalTracks}: ${result.validPreserved} valid preserved · Detected ${detectedParts.join(", ")} · Restored ${result.restored}, ${result.stillMissing} still missing${failureSuffix}.`;
         setArtworkReloadSummary(msg);
-        toast("info", msg);
+        const toastKind =
+          result.restored > 0 && result.providerFailures === 0
+            ? "success"
+            : result.restored > 0
+              ? "info"
+              : result.providerFailures > 0
+                ? "error"
+                : "info";
+        toast(toastKind, msg);
       }
     } catch {
       toast("error", "Could not reload missing artwork.");
@@ -359,7 +367,7 @@ export function SettingsPage() {
           label="Reload missing artwork"
           hint={
             artworkReloadSummary ??
-            "Fetches artwork only for tracks that do not have cover art yet. Existing artwork is kept untouched."
+            "Validates artwork and recovers only tracks with missing, broken, or corrupted cover art. Valid artwork is preserved."
           }
         >
           <button
@@ -372,8 +380,10 @@ export function SettingsPage() {
             <RefreshIcon size={15} className={reloadingArtwork ? "animate-spin" : undefined} />
             {reloadingArtwork
               ? artworkProgress && artworkProgress.total > 0
-                ? `Reloading (${artworkProgress.done}/${artworkProgress.total})…`
-                : "Checking…"
+                ? artworkProgress.phase === "scanning"
+                  ? `Scanning (${artworkProgress.done}/${artworkProgress.total})…`
+                  : `Recovering (${artworkProgress.done}/${artworkProgress.total})…`
+                : "Scanning…"
               : "Reload missing artwork"}
           </button>
         </Row>

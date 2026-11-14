@@ -425,6 +425,10 @@ describe("artworkService", () => {
           title: "Smooth Operator",
           artist: "Sade",
         }),
+        expect.objectContaining({
+          excludeUrl: expect.any(Function),
+          onTransientError: expect.any(Function),
+        }),
       );
 
       // Verify cached entry has verified album
@@ -700,6 +704,11 @@ describe("artworkService", () => {
 
   describe("clearNegativeArtworkCacheForTrack", () => {
     it("clears cached negative entries while leaving positive entries intact", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ "release-groups": [], releases: [] }) }) as unknown as Response),
+      );
       vi.mocked(searchItunesArtwork).mockResolvedValueOnce(null);
       const missingTrack = { id: "m1", title: "No Cover", artist: "Unknown", album: "Lost" };
       expect(await resolveArtworkForTrack(missingTrack)).toMatchObject({ url: undefined, source: "none" });

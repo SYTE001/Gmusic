@@ -58,6 +58,12 @@ export interface ItunesArtworkDetails {
   score: number;
 }
 
+export interface ItunesSearchOptions {
+  signal?: AbortSignal;
+  excludeUrl?: (url: string) => boolean;
+  onTransientError?: () => void;
+}
+
 /**
  * Validates and ranks search results from the iTunes Search API against
  * the track title and artist. Rejects mismatched songs or remixes when an
@@ -155,8 +161,12 @@ export function validateAndRankItunesResults(
  */
 export async function searchItunesArtworkDetails(
   track: { title: string; artist?: string; album?: string; durationMs?: number | null },
-  signal?: AbortSignal,
+  signalOrOptions?: AbortSignal | ItunesSearchOptions,
 ): Promise<ItunesArtworkDetails | null> {
+  const options: ItunesSearchOptions =
+    signalOrOptions instanceof AbortSignal ? { signal: signalOrOptions } : (signalOrOptions ?? {});
+  const { signal, excludeUrl, onTransientError } = options;
+
   const cleanTitle = track.title?.trim();
   if (!cleanTitle) return null;
 
@@ -184,6 +194,11 @@ export async function searchItunesArtworkDetails(
       headers: { Accept: "application/json" },
     });
 
+    if (response.status === 429 || response.status === 503 || response.status >= 500) {
+      onTransientError?.();
+      return null;
+    }
+
     if (!response.ok) {
       return null;
     }
@@ -198,7 +213,11 @@ export async function searchItunesArtworkDetails(
       return null;
     }
 
-    const best = candidates[0];
+    const best = candidates.find((c) => !excludeUrl?.(c.artworkUrl));
+    if (!best) {
+      return null;
+    }
+
     return {
       artworkUrl: best.artworkUrl,
       collectionName: best.result.collectionName,
@@ -206,6 +225,9 @@ export async function searchItunesArtworkDetails(
       score: best.score,
     };
   } catch {
+    if (!signal?.aborted) {
+      onTransientError?.();
+    }
     // Network errors, aborts, JSON errors fail gracefully with null
     return null;
   } finally {
@@ -223,8 +245,8 @@ export async function searchItunesArtworkDetails(
  */
 export async function searchItunesArtwork(
   track: { title: string; artist?: string; album?: string; durationMs?: number | null },
-  signal?: AbortSignal,
+  signalOrOptions?: AbortSignal | ItunesSearchOptions,
 ): Promise<string | null> {
-  const details = await searchItunesArtworkDetails(track, signal);
+  const details = await searchItunesArtworkDetails(track, signalOrOptions);
   return details?.artworkUrl ?? null;
 }

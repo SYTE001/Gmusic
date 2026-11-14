@@ -27,6 +27,7 @@ export interface ArtworkResolution {
   album?: string;
   artist?: string;
   title?: string;
+  transientFailure?: boolean;
 }
 
 export interface UnifiedArtworkCacheEntry {
@@ -133,7 +134,7 @@ const PLACEHOLDER_ALBUMS = new Set([
   "lyrics",
 ]);
 
-function hasMeaningfulAlbum(album: string | undefined | null): boolean {
+export function hasMeaningfulAlbum(album: string | undefined | null): boolean {
   if (!album) return false;
   if (isYearOnly(album)) return false;
   const cleaned = normalizeForSearch(cleanNoiseFromText(album).cleaned);
@@ -586,7 +587,23 @@ async function discoverOnlineArtwork(
   let sawTransientError = false;
 
   // Step 3: MusicBrainz Release Group discovery
-  const mbDiscovery = await searchMusicBrainzReleaseGroups(query);
+  // Step 3: MusicBrainz Release Group discovery
+  let mbDiscovery = await searchMusicBrainzReleaseGroups(query);
+  if (mbDiscovery.status === "skipped" && alternateQueries && alternateQueries.length > 0) {
+    for (const alt of alternateQueries.slice(0, 2)) {
+      if (!alt.artistName) continue;
+      const altDiscovery = await searchMusicBrainzReleaseGroups({
+        artist: alt.artistName,
+        album: track.album,
+        title: alt.trackName,
+        durationMs: track.durationMs,
+      });
+      if (altDiscovery.status !== "skipped") {
+        mbDiscovery = altDiscovery;
+        break;
+      }
+    }
+  }
   if (mbDiscovery.status === "transient-error") {
     sawTransientError = true;
   }
@@ -667,13 +684,22 @@ async function discoverOnlineArtwork(
   }
 
   // Step 6: Existing iTunes Search API fallback
+  const markItunesTransientError = () => {
+    sawTransientError = true;
+  };
   try {
-    const itunesMatch = await searchItunesArtworkDetails({
-      title: track.title,
-      artist: track.artist,
-      album: track.album,
-      durationMs: track.durationMs,
-    });
+    const itunesMatch = await searchItunesArtworkDetails(
+      {
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        durationMs: track.durationMs,
+      },
+      {
+        excludeUrl: isArtworkUrlFailed,
+        onTransientError: markItunesTransientError,
+      },
+    );
     if (itunesMatch) {
       const validated = sanitizeArtworkUrl(itunesMatch.artworkUrl) ?? itunesMatch.artworkUrl;
       if (!isArtworkUrlFailed(validated)) {
@@ -694,12 +720,18 @@ async function discoverOnlineArtwork(
 
     if (alternateQueries && alternateQueries.length > 0) {
       for (const alt of alternateQueries.slice(0, 3)) {
-        const altMatch = await searchItunesArtworkDetails({
-          title: alt.trackName,
-          artist: alt.artistName,
-          album: track.album,
-          durationMs: track.durationMs,
-        });
+        const altMatch = await searchItunesArtworkDetails(
+          {
+            title: alt.trackName,
+            artist: alt.artistName,
+            album: track.album,
+            durationMs: track.durationMs,
+          },
+          {
+            excludeUrl: isArtworkUrlFailed,
+            onTransientError: markItunesTransientError,
+          },
+        );
         if (altMatch) {
           const validated = sanitizeArtworkUrl(altMatch.artworkUrl) ?? altMatch.artworkUrl;
           if (!isArtworkUrlFailed(validated)) {
@@ -748,17 +780,21 @@ async function discoverOnlineArtwork(
  */
 export async function resolveArtworkForTrack(
   track: ArtworkTrackInput,
-  options?: { size?: ArtworkThumbnailSize },
+  options?: { size?: ArtworkThumbnailSize; forceRefresh?: boolean },
 ): Promise<ArtworkResolution> {
-  // 1. Check local IndexedDB for embedded artwork (always highest priority)
-  try {
-    const localBlob = await repository.getArtwork(track.id);
-    if (localBlob) {
-      const url = URL.createObjectURL(localBlob);
-      return { url, source: "embedded" };
+  const forceRefresh = Boolean(options?.forceRefresh);
+
+  // 1. Check local IndexedDB for embedded artwork (always highest priority unless caller already validated/evicted)
+  if (!forceRefresh) {
+    try {
+      const localBlob = await repository.getArtwork(track.id);
+      if (localBlob) {
+        const url = URL.createObjectURL(localBlob);
+        return { url, source: "embedded" };
+      }
+    } catch {
+      // Proceed to cache and online providers
     }
-  } catch {
-    // Proceed to cache and online providers
   }
 
   const albumKey = getAlbumArtworkCacheKey(track);
@@ -769,27 +805,32 @@ export async function resolveArtworkForTrack(
     return { url: undefined, source: "none" };
   }
 
-  // 2. Check unified artwork cache
-  const cached = getCachedArtworkEntry(track);
-  if (cached !== undefined) {
-    return {
-      url: cached.url ?? undefined,
-      source: cached.url ? "cache" : "none",
-      releaseGroupMbid: cached.releaseGroupMbid,
-      releaseMbid: cached.releaseMbid,
-      confidence: cached.confidence,
-    };
-  }
+  // 2. Check unified artwork cache unless performing explicit force-refresh recovery
+  if (!forceRefresh) {
+    const cached = getCachedArtworkEntry(track);
+    if (cached !== undefined) {
+      return {
+        url: cached.url ?? undefined,
+        source: cached.url ? "cache" : "none",
+        releaseGroupMbid: cached.releaseGroupMbid,
+        releaseMbid: cached.releaseMbid,
+        confidence: cached.confidence,
+      };
+    }
 
-  // Check short transient failure backoff so offline/503 storms don't hammer APIs
-  const backoffUntil = transientBackoffUntil.get(primaryKey);
-  if (backoffUntil && Date.now() < backoffUntil) {
-    return { url: undefined, source: "none" };
+    // Check short transient failure backoff so offline/503 storms don't hammer APIs
+    const backoffUntil = transientBackoffUntil.get(primaryKey);
+    if (backoffUntil && Date.now() < backoffUntil) {
+      return { url: undefined, source: "none" };
+    }
   }
 
   // 3. Deduplicate concurrent requests for the same album or track
+  const inFlightPrimaryKey = forceRefresh ? `force::${primaryKey}` : primaryKey;
+  const inFlightTrackKey = trackKey ? (forceRefresh ? `force::${trackKey}` : trackKey) : "";
   const existingInFlight =
-    inFlightRequests.get(primaryKey) ?? (trackKey ? inFlightRequests.get(trackKey) : undefined);
+    inFlightRequests.get(inFlightPrimaryKey) ??
+    (inFlightTrackKey ? inFlightRequests.get(inFlightTrackKey) : undefined);
   if (existingInFlight) {
     return existingInFlight;
   }
@@ -876,16 +917,16 @@ export async function resolveArtworkForTrack(
         });
       }
 
-      return resolution;
+      return transientFailure ? { ...resolution, transientFailure: true } : resolution;
     } finally {
-      inFlightRequests.delete(primaryKey);
-      if (trackKey) inFlightRequests.delete(trackKey);
+      inFlightRequests.delete(inFlightPrimaryKey);
+      if (inFlightTrackKey) inFlightRequests.delete(inFlightTrackKey);
     }
   })();
 
-  inFlightRequests.set(primaryKey, promise);
-  if (trackKey && trackKey !== primaryKey) {
-    inFlightRequests.set(trackKey, promise);
+  inFlightRequests.set(inFlightPrimaryKey, promise);
+  if (inFlightTrackKey && inFlightTrackKey !== inFlightPrimaryKey) {
+    inFlightRequests.set(inFlightTrackKey, promise);
   }
   return promise;
 }
