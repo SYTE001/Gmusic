@@ -5,6 +5,7 @@ import {
   getArtworkCacheKey,
   getCachedArtworkEntry,
   invalidateArtworkCacheForTrack,
+  markArtworkUrlFailed,
   NEGATIVE_CACHE_TTL_MS,
   POSITIVE_CACHE_TTL_MS,
   resolveArtworkForAlbumBatch,
@@ -14,6 +15,7 @@ import { __configureMusicBrainzForTests } from "./musicbrainzClient";
 import { repository } from "../indexeddb/LibraryRepository";
 import { searchItunesArtwork, searchItunesArtworkDetails } from "./itunesClient";
 import { notifyArtworkLoaded, subscribeArtwork } from "./artworkCache";
+import { parseFlacTags } from "../metadata/flac";
 
 vi.mock("../indexeddb/LibraryRepository", () => ({
   repository: {
@@ -79,6 +81,22 @@ describe("artworkService", () => {
       });
       expect(a1).toBe(a2);
       expect(a1).toBe("album::daft punk::random access memories");
+    });
+
+    it("treats generic placeholder album names ('Single', 'Downloads', 'EP') as track-scoped to prevent cross-song collisions", () => {
+      const kSingle1 = getAlbumArtworkCacheKey({
+        title: "Song One",
+        artist: "Indie Artist",
+        album: "Single",
+      });
+      const kSingle2 = getAlbumArtworkCacheKey({
+        title: "Song Two",
+        artist: "Indie Artist",
+        album: "Single",
+      });
+      expect(kSingle1).toBe("indie artist::song one");
+      expect(kSingle2).toBe("indie artist::song two");
+      expect(kSingle1).not.toBe(kSingle2);
     });
   });
 
@@ -234,6 +252,61 @@ describe("artworkService", () => {
       expect(res.releaseGroupMbid).toBe(RG_MBID);
       expect(res.releaseMbid).toBe(REL_MBID);
       expect(searchItunesArtwork).not.toHaveBeenCalled();
+    });
+
+    it("skips a broken Cover Art Archive URL marked as failed and falls back to iTunes Search API", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const brokenCaaUrl = `https://coverartarchive.org/release-group/${RG_MBID}/front-500`;
+      markArtworkUrlFailed(brokenCaaUrl);
+
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/release-group?")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              "release-groups": [
+                {
+                  id: RG_MBID,
+                  title: "Discovery",
+                  "primary-type": "Album",
+                  "artist-credit": [{ name: "Daft Punk" }],
+                },
+              ],
+            }),
+          } as Response;
+        }
+        if (url.includes(`coverartarchive.org/release-group/${RG_MBID}`)) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              images: [
+                {
+                  front: true,
+                  thumbnails: {
+                    "500": brokenCaaUrl,
+                  },
+                },
+              ],
+            }),
+          } as Response;
+        }
+        return { ok: true, status: 200, json: async () => ({ releases: [] }) } as Response;
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      vi.mocked(searchItunesArtwork).mockResolvedValue("https://is1-ssl.mzstatic.com/itunes-recovered.jpg");
+
+      const res = await resolveArtworkForTrack({
+        id: "t-caa-broken",
+        title: "One More Time",
+        artist: "Daft Punk",
+        album: "Discovery",
+      });
+
+      expect(res.source).toBe("itunes");
+      expect(res.url).toBe("https://is1-ssl.mzstatic.com/itunes-recovered.jpg");
     });
 
     it("falls back to iTunes Search API when MusicBrainz / CAA has no match", async () => {
@@ -576,6 +649,51 @@ describe("artworkService", () => {
       expect(track1Events).toEqual(["https://img.test/1.jpg"]); // no new event
 
       unsub2();
+    });
+  });
+
+  describe("parseFlacTags embedded PICTURE extraction", () => {
+    it("extracts FLAC PICTURE blocks into an in-memory Blob even when the description exceeds 1024 bytes", async () => {
+      const mimeBytes = new TextEncoder().encode("image/png");
+      const descBytes = new Uint8Array(1500).fill(0x41); // > 1024 byte description
+      const imagePayload = new Uint8Array(256).fill(0x89);
+
+      const pictureBlockLen = 4 + 4 + mimeBytes.length + 4 + descBytes.length + 16 + 4 + imagePayload.length;
+      const totalLen = 4 + 4 + pictureBlockLen;
+      const buf = new ArrayBuffer(totalLen);
+      const bytes = new Uint8Array(buf);
+      const view = new DataView(buf);
+
+      // "fLaC" magic
+      bytes.set([0x66, 0x4c, 0x61, 0x43], 0);
+      // Block header: isLast=1 (0x80) | blockType=6 (0x86), 24-bit big-endian length
+      bytes[4] = 0x86;
+      bytes[5] = (pictureBlockLen >> 16) & 0xff;
+      bytes[6] = (pictureBlockLen >> 8) & 0xff;
+      bytes[7] = pictureBlockLen & 0xff;
+
+      let pos = 8;
+      view.setUint32(pos, 3); // pictureType = 3 (Front Cover)
+      pos += 4;
+      view.setUint32(pos, mimeBytes.length);
+      pos += 4;
+      bytes.set(mimeBytes, pos);
+      pos += mimeBytes.length;
+      view.setUint32(pos, descBytes.length);
+      pos += 4;
+      bytes.set(descBytes, pos);
+      pos += descBytes.length;
+      pos += 16; // width, height, depth, colors
+      view.setUint32(pos, imagePayload.length);
+      pos += 4;
+      bytes.set(imagePayload, pos);
+
+      const file = new File([buf], "sample.flac", { type: "audio/flac" });
+      const parsed = await parseFlacTags(file);
+
+      expect(parsed.artwork).toBeDefined();
+      expect(parsed.artwork?.size).toBe(imagePayload.length);
+      expect(parsed.artwork?.type).toBe("image/png");
     });
   });
 });

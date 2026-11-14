@@ -9,7 +9,14 @@ import {
   revalidateAccess,
   relinkTrackWithFile,
 } from "../services/file-access/FileAccessService";
-import { loadArtworkUrl, setCachedArtworkForTrack, upgradeArtworkToPersisted } from "../services/artwork/artworkCache";
+import {
+  clearArtworkCache,
+  evictArtworkUrlCache,
+  getArtworkUrl,
+  loadArtworkUrl,
+  setCachedArtworkForTrack,
+  upgradeArtworkToPersisted,
+} from "../services/artwork/artworkCache";
 import { resolveArtworkForAlbumBatch } from "../services/artwork/artworkService";
 import { importAudioItems, type ImportItem, type ImportProgress } from "../services/library/importService";
 import {
@@ -368,6 +375,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
           });
         }
         if (outcome.updatedTracks && outcome.updatedTracks.length > 0) {
+          for (const updatedTrack of outcome.updatedTracks) {
+            evictArtworkUrlCache(updatedTrack.id);
+            void loadArtworkUrl(updatedTrack);
+          }
           void resolveArtworkForAlbumBatch(outcome.updatedTracks, {
             onTrackArtworkResolved: (trackId, url) => {
               setCachedArtworkForTrack(trackId, url);
@@ -413,6 +424,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     }
 
     await repository.deleteTracks(ids);
+    for (const id of ids) {
+      evictArtworkUrlCache(id);
+    }
     const nextStats = { ...get().trackStats };
     for (const id of ids) {
       delete nextStats[id];
@@ -566,6 +580,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
 
   clearLibrary: async () => {
     await repository.clearLibrary();
+    clearArtworkCache();
     set({ tracks: [], playlists: [], trackStats: {}, lastImportOutcome: null });
     await resetPlaybackState();
   },
@@ -663,6 +678,13 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       tracks: get().tracks.map((item) => (item.id === trackId ? updatedTrack : item)),
     });
 
+    // If the track title changed and the track does not yet have a persisted local blob URL,
+    // re-trigger artwork lookup under the updated metadata identity.
+    if (track.title !== cleanTitle && !getArtworkUrl(trackId)?.startsWith("blob:")) {
+      evictArtworkUrlCache(trackId);
+      void loadArtworkUrl(updatedTrack);
+    }
+
     // 2. Check cloud sync
     const auth = await currentAuthState().catch(() => ({ status: "anonymous" as const }));
     if (auth.status !== "authenticated") {
@@ -727,6 +749,7 @@ export function useTrackById(trackId: string | null): Track | null {
       prev.availability === found.availability &&
       prev.accessMode === found.accessMode &&
       prev.objectKey === found.objectKey &&
+      prev.artworkObjectKey === found.artworkObjectKey &&
       prev.cloudStatus === found.cloudStatus &&
       prev.description === found.description
     ) {

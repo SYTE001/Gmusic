@@ -1,20 +1,27 @@
 import { repository } from "../indexeddb/LibraryRepository";
-import { invalidateArtworkCacheForTrack, resolveArtworkForTrack } from "./artworkService";
+import { getPlayUrl } from "../cloud/r2StorageService";
+import {
+  invalidateArtworkCacheForTrack,
+  markArtworkUrlFailed,
+  resolveArtworkForTrack,
+} from "./artworkService";
 import type { Track } from "../../types";
 import { perfMark, perfMeasure } from "../../utils/perf";
 
 /**
- * In-memory artwork URL cache keyed by stable track ID, with bounded object
- * URLs and event listeners. Object URLs are revoked when evicted (delayed, so
- * already-painted images never break); external URLs are never revoked.
+ * In-memory artwork URL cache keyed by stable track ID, with bounded LRU object
+ * URLs and event listeners. Object URLs are revoked only when no active listener
+ * or cache entry references them (delayed, so already-painted images never break);
+ * external URLs are never revoked.
  *
- * Remote artwork resolved from providers is additionally materialized into a
- * validated Blob and persisted to IndexedDB (`repository.putArtwork`), so
+ * Remote artwork resolved from providers or cloud R2 storage is materialized into
+ * a validated Blob and persisted to IndexedDB (`repository.putArtwork`), so
  * artwork keeps working offline and across refreshes without re-downloading.
  */
 const urlCache = new Map<string, string>();
 const inFlightLoads = new Map<string, Promise<string | undefined>>();
-const MAX_CACHE = 240;
+const revokedBlobUrls = new Set<string>();
+const MAX_CACHE = 500;
 /** Delay before an evicted blob URL is revoked so in-flight paints finish. */
 const EVICTED_BLOB_REVOKE_DELAY_MS = 60_000;
 
@@ -23,6 +30,27 @@ type TrackArtworkListener = (url: string | undefined) => void;
 
 const globalArtworkListeners = new Set<ArtworkListener>();
 const trackArtworkListeners = new Map<string, Set<TrackArtworkListener>>();
+
+function hasActiveTrackListeners(trackId: string): boolean {
+  const listeners = trackArtworkListeners.get(trackId);
+  return Boolean(listeners && listeners.size > 0);
+}
+
+function isBlobUrlInUse(url: string): boolean {
+  for (const [trackId, activeUrl] of urlCache.entries()) {
+    if (activeUrl === url) return true;
+    if (hasActiveTrackListeners(trackId) && activeUrl === url) return true;
+  }
+  return false;
+}
+
+function rememberRevokedBlobUrl(url: string): void {
+  if (revokedBlobUrls.size >= 500) {
+    const oldest = revokedBlobUrls.values().next().value;
+    if (oldest !== undefined) revokedBlobUrls.delete(oldest);
+  }
+  revokedBlobUrls.add(url);
+}
 
 export function subscribeArtwork(listener: ArtworkListener): () => void;
 export function subscribeArtwork(trackId: string, listener: TrackArtworkListener): () => void;
@@ -80,26 +108,50 @@ export function notifyArtworkLoaded(trackId: string, url: string | undefined): v
   }
 }
 
-function scheduleRevokeObjectUrl(url: string): void {
-  const timer = setTimeout(() => URL.revokeObjectURL(url), EVICTED_BLOB_REVOKE_DELAY_MS);
+function scheduleRevokeObjectUrl(url: string, trackId?: string): void {
+  const timer = setTimeout(() => {
+    if (trackId && (urlCache.get(trackId) === url || hasActiveTrackListeners(trackId))) {
+      return;
+    }
+    if (isBlobUrlInUse(url)) {
+      return;
+    }
+    rememberRevokedBlobUrl(url);
+    URL.revokeObjectURL(url);
+  }, EVICTED_BLOB_REVOKE_DELAY_MS);
   const unref = (timer as unknown as { unref?: () => void }).unref;
   if (typeof unref === "function") unref.call(timer);
 }
 
 function evictOldestUrlCacheEntry(): void {
-  const oldest = urlCache.keys().next().value;
-  if (oldest === undefined) return;
-  const evicted = urlCache.get(oldest);
-  urlCache.delete(oldest);
+  let targetKey: string | undefined;
+  for (const key of urlCache.keys()) {
+    if (!hasActiveTrackListeners(key)) {
+      targetKey = key;
+      break;
+    }
+  }
+  if (targetKey === undefined) {
+    targetKey = urlCache.keys().next().value;
+  }
+  if (targetKey === undefined) return;
+  const evicted = urlCache.get(targetKey);
+  urlCache.delete(targetKey);
   if (evicted && evicted.startsWith("blob:")) {
-    scheduleRevokeObjectUrl(evicted);
+    scheduleRevokeObjectUrl(evicted, targetKey);
   }
 }
 
-/** Bounded insert: evicts (and delayed-revokes) the oldest entry when full. */
+/** Bounded LRU insert: refreshes recency on update and evicts the oldest inactive entry when full. */
 function insertUrlCache(trackId: string, url: string): void {
   if (!trackId || !url) return;
-  if (!urlCache.has(trackId) && urlCache.size >= MAX_CACHE) {
+  const existing = urlCache.get(trackId);
+  if (existing !== undefined) {
+    urlCache.delete(trackId);
+    if (existing !== url && existing.startsWith("blob:")) {
+      scheduleRevokeObjectUrl(existing, trackId);
+    }
+  } else if (urlCache.size >= MAX_CACHE) {
     evictOldestUrlCacheEntry();
   }
   urlCache.set(trackId, url);
@@ -112,7 +164,13 @@ export function setCachedArtworkForTrack(trackId: string, url: string): void {
 }
 
 export function getArtworkUrl(trackId: string): string | undefined {
-  return urlCache.get(trackId);
+  const url = urlCache.get(trackId);
+  if (url !== undefined) {
+    // Refresh LRU order on read
+    urlCache.delete(trackId);
+    urlCache.set(trackId, url);
+  }
+  return url;
 }
 
 // ---- Remote-to-blob materialization (persistent local artwork cache) ----
@@ -213,22 +271,17 @@ async function fetchArtworkBlobDeduped(url: string): Promise<Blob | null> {
 
 /**
  * Downloads a resolved remote artwork URL, validates it, and persists it to
- * IndexedDB for this track ID. Returns a displayable object URL on success,
- * or `undefined` when the artwork could not be materialized (the caller keeps
- * using the remote URL — never blocks or breaks display).
+ * IndexedDB for this track ID. Returns the validated `Blob` on success, or
+ * `undefined` when the artwork could not be materialized.
  */
-async function materializeAndPersistArtwork(trackId: string, remoteUrl: string): Promise<string | undefined> {
+async function persistRemoteArtworkBlob(trackId: string, remoteUrl: string): Promise<Blob | undefined> {
   const blob = await fetchArtworkBlobDeduped(remoteUrl);
   if (!blob) return undefined;
   try {
     await repository.putArtwork(trackId, blob);
+    return blob;
   } catch {
     return undefined; // Quota/IDB failure: honest fallback to the remote URL
-  }
-  try {
-    return URL.createObjectURL(blob);
-  } catch {
-    return undefined;
   }
 }
 
@@ -236,17 +289,26 @@ async function materializeAndPersistArtwork(trackId: string, remoteUrl: string):
  * Schedules background persistence of a resolved remote artwork URL for a
  * track. Non-blocking: display keeps the remote URL and is upgraded to the
  * persisted blob (with a listener notification) once the download succeeds.
+ * Only creates an object URL when the track's cache entry still matches,
+ * preventing orphaned object URL leaks.
  */
 export function upgradeArtworkToPersisted(trackId: string, remoteUrl: string): void {
   if (!trackId || !remoteUrl || !remoteUrl.startsWith("http")) return;
 
-  void materializeAndPersistArtwork(trackId, remoteUrl)
-    .then((blobUrl) => {
-      // Only upgrade if the cache entry still points at the same remote URL
-      // (a newer resolution or invalidation may have happened meanwhile).
-      if (blobUrl && getArtworkUrl(trackId) === remoteUrl) {
-        insertUrlCache(trackId, blobUrl);
-        notifyArtworkLoaded(trackId, blobUrl);
+  void persistRemoteArtworkBlob(trackId, remoteUrl)
+    .then((blob) => {
+      if (!blob) return;
+      const current = urlCache.get(trackId);
+      // Only mint and upgrade a blob URL if the cache still points at the same
+      // remote URL (or was not yet populated for this track).
+      if (current === remoteUrl || current === undefined) {
+        try {
+          const blobUrl = URL.createObjectURL(blob);
+          insertUrlCache(trackId, blobUrl);
+          notifyArtworkLoaded(trackId, blobUrl);
+        } catch {
+          // Keep existing remote URL if createObjectURL fails
+        }
       }
     })
     .catch(() => {
@@ -263,7 +325,7 @@ export async function loadArtworkUrl(
   const trackId = typeof trackOrId === "string" ? trackOrId : trackOrId?.id;
   if (!trackId) return undefined;
 
-  const cached = urlCache.get(trackId);
+  const cached = getArtworkUrl(trackId);
   if (cached) return cached;
 
   const existingPromise = inFlightLoads.get(trackId);
@@ -273,7 +335,7 @@ export async function loadArtworkUrl(
     perfMark(`skip:artwork:start:${trackId}`);
     try {
       // 1. Check persisted artwork blob in IndexedDB (embedded or previously
-      //    materialized from a provider) — always works offline.
+      //    materialized from a provider or cloud) — always works offline.
       try {
         const blob = await repository.getArtwork(trackId);
         if (blob) {
@@ -284,10 +346,9 @@ export async function loadArtworkUrl(
           return url;
         }
       } catch {
-        // IndexedDB error, fall through to online lookup
+        // IndexedDB error, fall through to track lookup
       }
 
-      // 2. Online artwork lookup for tracks without persisted artwork
       const trackObj =
         typeof trackOrId === "object" && trackOrId !== null
           ? trackOrId
@@ -295,6 +356,29 @@ export async function loadArtworkUrl(
             ? customTrackLookup(trackId)
             : await repository.getTrack(trackId).catch(() => undefined);
 
+      // 2. Check stored cloud artwork reference (`artworkObjectKey`) if present.
+      //    Never persist the short-lived signed URL: download, validate, and persist
+      //    the image Blob into IndexedDB, then serve the local blob URL.
+      const isOnline = typeof navigator === "undefined" || navigator.onLine !== false;
+      if (trackObj?.artworkObjectKey && isOnline) {
+        try {
+          const signedUrl = await getPlayUrl(trackObj.artworkObjectKey);
+          if (signedUrl) {
+            const cloudBlob = await persistRemoteArtworkBlob(trackId, signedUrl);
+            if (cloudBlob) {
+              const blobUrl = URL.createObjectURL(cloudBlob);
+              insertUrlCache(trackId, blobUrl);
+              notifyArtworkLoaded(trackId, blobUrl);
+              perfMeasure("skip:artwork-work", `skip:artwork:start:${trackId}`, `skip:artwork:end:${trackId}`);
+              return blobUrl;
+            }
+          }
+        } catch {
+          // Fall through to online provider lookup if cloud artwork fetch fails
+        }
+      }
+
+      // 3. Online artwork lookup for tracks without persisted artwork
       if (trackObj && trackObj.title) {
         try {
           const res = await resolveArtworkForTrack(trackObj);
@@ -333,10 +417,10 @@ const autoRetryLog = new Map<string, number>();
  * Handles a failed `<img>` load without destroying recoverable state:
  * - Offline: keep every cache entry (the failure is connectivity, not data)
  *   and rely on the theme fallback until a remount retries.
- * - Online: if the failed URL is still the current one, invalidate exactly
- *   once (deleting a corrupt persisted blob for blob URLs) and re-resolve.
- *   A cooldown prevents infinite invalidate/retry loops for permanently
- *   broken URLs.
+ * - Stale/evicted blob URL with intact IndexedDB blob: mint a fresh blob URL
+ *   immediately without deleting the valid persisted artwork.
+ * - Online broken remote URL or corrupt blob: mark the broken URL as failed,
+ *   invalidate once, and re-resolve (allowing fallback to the next provider).
  */
 export async function handleArtworkImageError(trackId: string | null | undefined, failedUrl: string): Promise<void> {
   if (!trackId || !failedUrl) return;
@@ -345,9 +429,28 @@ export async function handleArtworkImageError(trackId: string | null | undefined
     return; // Transient connectivity loss: keep cache, show theme fallback
   }
 
-  const current = getArtworkUrl(trackId);
+  const current = urlCache.get(trackId);
   if (current && current !== failedUrl) {
     return; // A different URL already replaced the failed one
+  }
+
+  if (failedUrl.startsWith("blob:")) {
+    const wasRevokedOrEvicted = revokedBlobUrls.has(failedUrl) || !current;
+    try {
+      const existingBlob = await repository.getArtwork(trackId);
+      if (existingBlob && (await validateArtworkBlob(existingBlob))) {
+        const freshUrl = URL.createObjectURL(existingBlob);
+        insertUrlCache(trackId, freshUrl);
+        notifyArtworkLoaded(trackId, freshUrl);
+        return;
+      }
+    } catch {
+      // Fall through if IndexedDB read failed
+    }
+    if (wasRevokedOrEvicted) {
+      void loadArtworkUrl(trackId);
+      return;
+    }
   }
 
   const retryKey = `${trackId}::${failedUrl}`;
@@ -358,6 +461,10 @@ export async function handleArtworkImageError(trackId: string | null | undefined
   }
   autoRetryLog.set(retryKey, now);
   pruneMapOldest(autoRetryLog, 300);
+
+  if (failedUrl.startsWith("http") && typeof markArtworkUrlFailed === "function") {
+    markArtworkUrlFailed(failedUrl);
+  }
 
   await invalidateArtworkForTrackId(trackId, { deletePersistedBlob: failedUrl.startsWith("blob:") });
   void loadArtworkUrl(trackId);
@@ -370,7 +477,7 @@ export async function invalidateArtworkForTrackId(
   const evicted = urlCache.get(trackId);
   urlCache.delete(trackId);
   if (evicted && evicted.startsWith("blob:")) {
-    scheduleRevokeObjectUrl(evicted);
+    scheduleRevokeObjectUrl(evicted, trackId);
   }
   if (options?.deletePersistedBlob) {
     await repository.deleteArtwork(trackId).catch(() => undefined);
@@ -382,9 +489,20 @@ export async function invalidateArtworkForTrackId(
   notifyArtworkLoaded(trackId, undefined);
 }
 
+export function evictArtworkUrlCache(trackId: string): void {
+  const evicted = urlCache.get(trackId);
+  urlCache.delete(trackId);
+  if (evicted && evicted.startsWith("blob:")) {
+    scheduleRevokeObjectUrl(evicted, trackId);
+  }
+}
+
 export function clearArtworkCache(): void {
   for (const url of urlCache.values()) {
-    if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+    if (url.startsWith("blob:")) {
+      rememberRevokedBlobUrl(url);
+      URL.revokeObjectURL(url);
+    }
   }
   urlCache.clear();
   inFlightLoads.clear();
@@ -399,6 +517,7 @@ export function __resetArtworkCacheForTests(): void {
   inFlightBlobDownloads.clear();
   failedDownloadAt.clear();
   autoRetryLog.clear();
+  revokedBlobUrls.clear();
   globalArtworkListeners.clear();
   trackArtworkListeners.clear();
 }

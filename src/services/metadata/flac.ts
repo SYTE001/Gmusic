@@ -6,8 +6,21 @@ import { cleanTagText, parseTrackPair, type ParsedTags } from "./types";
  * huge embedded picture never loads the whole file.
  */
 
+async function readSliceBuffer(file: Blob, start: number, end: number): Promise<ArrayBuffer> {
+  const slice = file.slice(start, end);
+  if (typeof slice.arrayBuffer === "function") {
+    return slice.arrayBuffer();
+  }
+  return new Promise<ArrayBuffer>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as ArrayBuffer);
+    reader.onerror = () => reject(reader.error ?? new Error("Failed to read Blob slice"));
+    reader.readAsArrayBuffer(slice);
+  });
+}
+
 export async function parseFlacTags(file: File): Promise<ParsedTags> {
-  const header = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+  const header = new Uint8Array(await readSliceBuffer(file, 0, 4));
   if (header[0] !== 0x66 || header[1] !== 0x4c || header[2] !== 0x61 || header[3] !== 0x43) return {}; // "fLaC"
 
   const tags: ParsedTags = {};
@@ -15,7 +28,7 @@ export async function parseFlacTags(file: File): Promise<ParsedTags> {
   let offset = 4;
 
   for (let blockIndex = 0; blockIndex < 64; blockIndex += 1) {
-    const blockHeader = new Uint8Array(await file.slice(offset, offset + 4).arrayBuffer());
+    const blockHeader = new Uint8Array(await readSliceBuffer(file, offset, offset + 4));
     if (blockHeader.length < 4) break;
     const isLast = (blockHeader[0] & 0x80) !== 0;
     const blockType = blockHeader[0] & 0x7f;
@@ -23,7 +36,7 @@ export async function parseFlacTags(file: File): Promise<ParsedTags> {
     const dataStart = offset + 4;
 
     if (blockType === 0 && blockLength >= 34) {
-      const data = new Uint8Array(await file.slice(dataStart, dataStart + 34).arrayBuffer());
+      const data = new Uint8Array(await readSliceBuffer(file, dataStart, dataStart + 34));
       if (data.length >= 34) {
         const b10 = data[10];
         const b11 = data[11];
@@ -47,7 +60,7 @@ export async function parseFlacTags(file: File): Promise<ParsedTags> {
         }
       }
     } else if (blockType === 4 && blockLength < 4 * 1024 * 1024) {
-      const data = new Uint8Array(await file.slice(dataStart, dataStart + blockLength).arrayBuffer());
+      const data = new Uint8Array(await readSliceBuffer(file, dataStart, dataStart + blockLength));
       const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
       let pos = 0;
       const vendorLength = view.getUint32(pos, true);
@@ -77,23 +90,37 @@ export async function parseFlacTags(file: File): Promise<ParsedTags> {
         }
       }
     } else if (blockType === 6 && !tags.artwork && blockLength < 24 * 1024 * 1024) {
-      const data = new Uint8Array(await file.slice(dataStart, dataStart + Math.min(blockLength, 1024)).arrayBuffer());
+      const headerLimit = Math.min(blockLength, 65536);
+      const data = new Uint8Array(await readSliceBuffer(file, dataStart, dataStart + headerLimit));
       const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
       // pictureType(4) + mimeLen(4) + mime + descLen(4) + desc + w(4) h(4) depth(4) colors(4) + dataLen(4)
-      let pos = 4;
-      const mimeLength = view.getUint32(pos);
-      pos += 4;
-      if (pos + mimeLength + 4 > data.length) break;
-      const mime = decoder.decode(data.subarray(pos, pos + mimeLength)) || "image/jpeg";
-      pos += mimeLength;
-      const descLength = view.getUint32(pos);
-      pos += 4 + descLength + 16; // skip description and w/h/depth/colors
-      if (pos + 4 <= data.length) {
-        const imageLength = view.getUint32(pos);
+      if (data.length >= 32) {
+        let pos = 4;
+        const mimeLength = view.getUint32(pos);
         pos += 4;
-        if (imageLength >= 100) {
-          const blob = file.slice(dataStart + pos, dataStart + pos + imageLength, mime.includes("/") ? mime : `image/${mime}`);
-          tags.artwork = blob;
+        if (pos + mimeLength + 4 <= data.length) {
+          const rawMime = decoder.decode(data.subarray(pos, pos + mimeLength)).trim() || "image/jpeg";
+          const mime = rawMime.includes("/") ? rawMime : `image/${rawMime}`;
+          pos += mimeLength;
+          const descLength = view.getUint32(pos);
+          pos += 4 + descLength + 16; // skip description and w/h/depth/colors
+          let imageLength = 0;
+          if (pos + 4 <= data.length) {
+            imageLength = view.getUint32(pos);
+            pos += 4;
+          } else if (pos + 4 <= blockLength) {
+            const lenBytes = new Uint8Array(await readSliceBuffer(file, dataStart + pos, dataStart + pos + 4));
+            if (lenBytes.length === 4) {
+              imageLength = new DataView(lenBytes.buffer, lenBytes.byteOffset, 4).getUint32(0);
+              pos += 4;
+            }
+          }
+          if (imageLength >= 100 && pos + imageLength <= blockLength && dataStart + pos + imageLength <= file.size) {
+            const imageBytes = await readSliceBuffer(file, dataStart + pos, dataStart + pos + imageLength);
+            if (imageBytes.byteLength === imageLength) {
+              tags.artwork = new Blob([imageBytes], { type: mime });
+            }
+          }
         }
       }
     }

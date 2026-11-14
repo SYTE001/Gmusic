@@ -14,6 +14,7 @@ import { normalizeForSearch } from "../../utils/misc";
 
 export const MUSICBRAINZ_WS_BASE = "https://musicbrainz.org/ws/2";
 export const GMUSIC_USER_AGENT = "Gmusic/1.1.0 ( https://github.com/SYTE001/Gmusic )";
+const MUSICBRAINZ_FETCH_TIMEOUT_MS = 8_000;
 
 const MBID_UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -161,6 +162,7 @@ const PLACEHOLDER_VALUES = new Set([
   "unknown artist",
   "unknown album",
   "various",
+  "various artists",
   "untitled",
   "none",
   "n a",
@@ -169,6 +171,15 @@ const PLACEHOLDER_VALUES = new Set([
   "undefined",
   "audio",
   "track",
+  "single",
+  "singles",
+  "ep",
+  "album",
+  "music",
+  "downloads",
+  "youtube",
+  "official audio",
+  "lyrics",
 ]);
 
 function isPlaceholderMetadata(value: string | undefined | null): boolean {
@@ -653,6 +664,16 @@ interface RawMusicBrainzResponse<T> {
   data: T | null;
 }
 
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), MUSICBRAINZ_FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function fetchMusicBrainzJson<T>(
   entity: "release-group" | "release",
   params: Record<string, string>,
@@ -674,7 +695,7 @@ async function fetchMusicBrainzJson<T>(
   if (proxyBase) {
     const proxyUrl = `${proxyBase}/api/musicbrainz/${entity}?${searchParams.toString()}`;
     try {
-      const response = await fetch(proxyUrl, {
+      const response = await fetchWithTimeout(proxyUrl, {
         method: "GET",
         headers: { Accept: "application/json" },
       });
@@ -698,7 +719,7 @@ async function fetchMusicBrainzJson<T>(
   // 2. Direct MusicBrainz WS/2 request (with identifiable User-Agent header)
   const directUrl = `${MUSICBRAINZ_WS_BASE}/${entity}?${searchParams.toString()}`;
   try {
-    const response = await fetch(directUrl, {
+    const response = await fetchWithTimeout(directUrl, {
       method: "GET",
       headers: {
         Accept: "application/json",

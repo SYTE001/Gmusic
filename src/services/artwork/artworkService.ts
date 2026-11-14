@@ -59,11 +59,54 @@ export const POSITIVE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const NEGATIVE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 /** Transient network errors use a short in-memory retry backoff (never persisted as 24h negative cache). */
 export const TRANSIENT_BACKOFF_MS = 30 * 1000;
+/** Broken remote image URLs are remembered in-memory for 30 minutes so retries fall back to the next provider. */
+const FAILED_URL_TTL_MS = 30 * 60 * 1000;
 
 const MAX_MEMORY_CACHE_SIZE = 500;
 const memoryCache = new Map<string, UnifiedArtworkCacheEntry>();
 const transientBackoffUntil = new Map<string, number>();
 const inFlightRequests = new Map<string, Promise<ArtworkResolution>>();
+const failedArtworkUrls = new Map<string, number>();
+
+/**
+ * Records a remote artwork URL that failed image loading or validation so subsequent
+ * resolution attempts skip it and fall through to alternate releases or providers.
+ */
+export function markArtworkUrlFailed(url: string | null | undefined): void {
+  if (!url || typeof url !== "string") return;
+  const trimmed = url.trim();
+  if (!trimmed || trimmed.startsWith("blob:")) return;
+  const now = Date.now();
+  if (failedArtworkUrls.size >= 500) {
+    for (const [k, ts] of failedArtworkUrls) {
+      if (now - ts > FAILED_URL_TTL_MS) failedArtworkUrls.delete(k);
+    }
+    if (failedArtworkUrls.size >= 500) {
+      const oldest = failedArtworkUrls.keys().next().value;
+      if (oldest !== undefined) failedArtworkUrls.delete(oldest);
+    }
+  }
+  failedArtworkUrls.set(trimmed, now);
+  const sanitized = sanitizeArtworkUrl(trimmed);
+  if (sanitized) {
+    failedArtworkUrls.set(sanitized, now);
+  }
+}
+
+export function isArtworkUrlFailed(url: string | null | undefined): boolean {
+  if (!url || typeof url !== "string") return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  const sanitized = sanitizeArtworkUrl(trimmed);
+  const ts = failedArtworkUrls.get(trimmed) ?? (sanitized ? failedArtworkUrls.get(sanitized) : undefined);
+  if (ts === undefined) return false;
+  if (Date.now() - ts > FAILED_URL_TTL_MS) {
+    failedArtworkUrls.delete(trimmed);
+    if (sanitized) failedArtworkUrls.delete(sanitized);
+    return false;
+  }
+  return true;
+}
 
 const PLACEHOLDER_ALBUMS = new Set([
   "",
@@ -75,6 +118,19 @@ const PLACEHOLDER_ALBUMS = new Set([
   "na",
   "null",
   "undefined",
+  "single",
+  "singles",
+  "ep",
+  "album",
+  "music",
+  "downloads",
+  "audio",
+  "tracks",
+  "various",
+  "various artists",
+  "youtube",
+  "official audio",
+  "lyrics",
 ]);
 
 function hasMeaningfulAlbum(album: string | undefined | null): boolean {
@@ -157,7 +213,10 @@ function readSingleKeyFromCache(key: string): UnifiedArtworkCacheEntry | undefin
 
   const mem = memoryCache.get(key);
   if (mem) {
-    if (!isEntryExpired(mem, nowMs)) {
+    if (!isEntryExpired(mem, nowMs) && (!mem.url || !isArtworkUrlFailed(mem.url))) {
+      // Refresh LRU order
+      memoryCache.delete(key);
+      memoryCache.set(key, mem);
       return mem;
     }
     memoryCache.delete(key);
@@ -181,7 +240,7 @@ function readSingleKeyFromCache(key: string): UnifiedArtworkCacheEntry | undefin
           timestamp: parsed.timestamp,
           negative: Boolean(parsed.negative ?? !parsed.url),
         };
-        if (!isEntryExpired(entry, nowMs)) {
+        if (!isEntryExpired(entry, nowMs) && (!entry.url || !isArtworkUrlFailed(entry.url))) {
           setMemoryCacheEntry(key, entry);
           return entry;
         }
@@ -207,7 +266,7 @@ function readSingleKeyFromCache(key: string): UnifiedArtworkCacheEntry | undefin
           timestamp: parsedV1.timestamp,
           negative: !sanitizedUrl,
         };
-        if (!isEntryExpired(entry, nowMs)) {
+        if (!isEntryExpired(entry, nowMs) && (!entry.url || !isArtworkUrlFailed(entry.url))) {
           setMemoryCacheEntry(key, entry);
           return entry;
         }
@@ -326,9 +385,22 @@ export function invalidateArtworkCacheForTrack(track: {
 
   for (const key of keys) {
     if (!key) continue;
+    const mem = memoryCache.get(key);
+    if (mem?.url) {
+      markArtworkUrlFailed(mem.url);
+    }
     memoryCache.delete(key);
     transientBackoffUntil.delete(key);
     try {
+      const rawV2 = localStorage.getItem(`${UNIFIED_CACHE_PREFIX}${key}`);
+      if (rawV2) {
+        try {
+          const parsed = JSON.parse(rawV2) as { url?: string | null };
+          if (parsed?.url) markArtworkUrlFailed(parsed.url);
+        } catch {
+          // Ignore parse errors
+        }
+      }
       localStorage.removeItem(`${UNIFIED_CACHE_PREFIX}${key}`);
       localStorage.removeItem(`${LEGACY_CACHE_PREFIX}${key}`);
     } catch {
@@ -344,6 +416,7 @@ export function __resetArtworkServiceForTests(): void {
   memoryCache.clear();
   transientBackoffUntil.clear();
   inFlightRequests.clear();
+  failedArtworkUrls.clear();
 }
 
 interface ProviderDiscoveryOutcome {
@@ -367,8 +440,11 @@ async function tryResolveFromReleaseGroupCandidate(
   transientError: boolean;
 }> {
   // Step 4: Cover Art Archive Release Group lookup
-  const rgArt = await fetchReleaseGroupCoverArt(candidate.mbid, { size });
-  if (rgArt.status === "ok" && rgArt.url) {
+  const rgArt = await fetchReleaseGroupCoverArt(candidate.mbid, {
+    size,
+    excludeUrl: isArtworkUrlFailed,
+  });
+  if (rgArt.status === "ok" && rgArt.url && !isArtworkUrlFailed(rgArt.url)) {
     return {
       url: rgArt.url,
       releaseGroupMbid: candidate.mbid,
@@ -396,8 +472,11 @@ async function tryResolveFromReleaseGroupCandidate(
 
   // Probe up to 3 top official releases in the release group
   for (const releaseMbid of releaseMbidsToTry.slice(0, 3)) {
-    const relArt = await fetchReleaseCoverArt(releaseMbid, { size });
-    if (relArt.status === "ok" && relArt.url) {
+    const relArt = await fetchReleaseCoverArt(releaseMbid, {
+      size,
+      excludeUrl: isArtworkUrlFailed,
+    });
+    if (relArt.status === "ok" && relArt.url && !isArtworkUrlFailed(relArt.url)) {
       return {
         url: relArt.url,
         releaseGroupMbid: candidate.mbid,
@@ -500,8 +579,11 @@ async function discoverOnlineArtwork(
       sawTransientError = true;
     }
     for (const candidateRel of directReleases.releases.slice(0, 2)) {
-      const relArt = await fetchReleaseCoverArt(candidateRel.mbid, { size });
-      if (relArt.status === "ok" && relArt.url) {
+      const relArt = await fetchReleaseCoverArt(candidateRel.mbid, {
+        size,
+        excludeUrl: isArtworkUrlFailed,
+      });
+      if (relArt.status === "ok" && relArt.url && !isArtworkUrlFailed(relArt.url)) {
         return {
           resolution: {
             url: relArt.url,
@@ -530,21 +612,23 @@ async function discoverOnlineArtwork(
     });
     if (itunesMatch) {
       const validated = sanitizeArtworkUrl(itunesMatch.artworkUrl) ?? itunesMatch.artworkUrl;
-      return {
-        resolution: {
-          url: validated,
-          source: "itunes",
-          releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
-          releaseMbid: null,
-          confidence: itunesMatch.score,
-          album: itunesMatch.collectionName,
-          artist: itunesMatch.artistName,
-        },
-        transientFailure: false,
-      };
+      if (!isArtworkUrlFailed(validated)) {
+        return {
+          resolution: {
+            url: validated,
+            source: "itunes",
+            releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
+            releaseMbid: null,
+            confidence: itunesMatch.score,
+            album: itunesMatch.collectionName,
+            artist: itunesMatch.artistName,
+          },
+          transientFailure: false,
+        };
+      }
     }
 
-    if (!itunesMatch && alternateQueries && alternateQueries.length > 0) {
+    if (alternateQueries && alternateQueries.length > 0) {
       for (const alt of alternateQueries.slice(0, 3)) {
         const altMatch = await searchItunesArtworkDetails({
           title: alt.trackName,
@@ -554,18 +638,20 @@ async function discoverOnlineArtwork(
         });
         if (altMatch) {
           const validated = sanitizeArtworkUrl(altMatch.artworkUrl) ?? altMatch.artworkUrl;
-          return {
-            resolution: {
-              url: validated,
-              source: "itunes",
-              releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
-              releaseMbid: null,
-              confidence: Math.min(altMatch.score, 75),
-              album: altMatch.collectionName,
-              artist: altMatch.artistName,
-            },
-            transientFailure: false,
-          };
+          if (!isArtworkUrlFailed(validated)) {
+            return {
+              resolution: {
+                url: validated,
+                source: "itunes",
+                releaseGroupMbid: mbDiscovery.bestCandidate?.mbid ?? null,
+                releaseMbid: null,
+                confidence: Math.min(altMatch.score, 75),
+                album: altMatch.collectionName,
+                artist: altMatch.artistName,
+              },
+              transientFailure: false,
+            };
+          }
         }
       }
     }

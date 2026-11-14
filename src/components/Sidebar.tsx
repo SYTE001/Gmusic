@@ -1,4 +1,4 @@
-import { memo, useState, type ReactNode } from "react";
+import { memo, useEffect, useState, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useLibraryStore } from "../stores/libraryStore";
 import { SearchField } from "./TopBar";
@@ -6,7 +6,7 @@ import { Menu, type MenuItemSpec } from "./Menu";
 import { Modal } from "./Modal";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { CreatePlaylistModal } from "../features/playlists/CreatePlaylistModal";
-import { useArtworkUrl } from "./Artwork";
+import { handleArtworkImageError, useArtworkUrl } from "./Artwork";
 import {
   ClockIcon,
   EditIcon,
@@ -296,7 +296,13 @@ function PlaylistThumb({ playlist, className }: { playlist: Playlist; className?
     (state) => playlist.trackIds.find((id) => state.tracks.some((track) => track.id === id)) ?? null,
   );
   const url = useArtworkUrl(firstTrackId);
-  if (!url) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    setFailedUrl(null);
+  }, [url]);
+
+  if (!url || failedUrl === url) {
     return (
       <span
         className={`flex items-center justify-center rounded-md bg-surface-raised text-text-muted ${className ?? ""}`}
@@ -306,7 +312,21 @@ function PlaylistThumb({ playlist, className }: { playlist: Playlist; className?
       </span>
     );
   }
-  return <img src={url} alt="" loading="lazy" decoding="async" className={`rounded-md object-cover ${className ?? ""}`} />;
+  return (
+    <img
+      src={url}
+      alt=""
+      loading="lazy"
+      decoding="async"
+      onError={() => {
+        setFailedUrl(url);
+        if (firstTrackId) {
+          void handleArtworkImageError(firstTrackId, url);
+        }
+      }}
+      className={`rounded-md object-cover ${className ?? ""}`}
+    />
+  );
 }
 
 /** Collapsed-rail playlist shortcut: artwork square with tooltip. */

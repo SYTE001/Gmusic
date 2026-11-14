@@ -11,6 +11,7 @@ import { isValidMbid } from "./musicbrainzClient";
  */
 
 export const CAA_BASE_URL = "https://coverartarchive.org";
+const CAA_FETCH_TIMEOUT_MS = 8_000;
 
 export type ArtworkThumbnailSize = "500" | "1200";
 
@@ -132,6 +133,7 @@ function selectPreferredFrontImageUrl(
   payload: CaaMetadataResponse,
   fallbackFrontUrl: string | null,
   size: ArtworkThumbnailSize,
+  excludeUrl?: (url: string) => boolean,
 ): string | null {
   const images = Array.isArray(payload.images) ? payload.images : [];
   if (images.length === 0) return null;
@@ -152,7 +154,9 @@ function selectPreferredFrontImageUrl(
 
   for (const candidate of candidates) {
     const sanitized = sanitizeArtworkUrl(candidate);
-    if (sanitized) return sanitized;
+    if (sanitized && (!excludeUrl || !excludeUrl(sanitized))) {
+      return sanitized;
+    }
   }
 
   return null;
@@ -162,6 +166,7 @@ async function fetchCaaEndpoint(
   entity: "release-group" | "release",
   mbid: string,
   size: ArtworkThumbnailSize = "500",
+  excludeUrl?: (url: string) => boolean,
 ): Promise<CoverArtResolution> {
   if (!isValidMbid(mbid)) {
     return {
@@ -196,10 +201,14 @@ async function fetchCaaEndpoint(
       ? buildReleaseGroupFrontUrl(cleanMbid, size)
       : buildReleaseFrontUrl(cleanMbid, size);
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), CAA_FETCH_TIMEOUT_MS);
+
   try {
     const response = await fetch(metadataUrl, {
       method: "GET",
       headers: { Accept: "application/json" },
+      signal: controller.signal,
     });
 
     if (response.status === 404) {
@@ -230,7 +239,7 @@ async function fetchCaaEndpoint(
     }
 
     const payload = (await response.json()) as CaaMetadataResponse;
-    const selectedUrl = selectPreferredFrontImageUrl(payload, canonicalThumbUrl, size);
+    const selectedUrl = selectPreferredFrontImageUrl(payload, canonicalThumbUrl, size, excludeUrl);
     const extractedReleaseMbid =
       entity === "release" ? cleanMbid : extractMbidFromReleaseUrl(payload.release);
 
@@ -258,6 +267,8 @@ async function fetchCaaEndpoint(
       releaseGroupMbid: entity === "release-group" ? cleanMbid : null,
       releaseMbid: entity === "release" ? cleanMbid : null,
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
@@ -267,9 +278,9 @@ async function fetchCaaEndpoint(
  */
 export async function fetchReleaseGroupCoverArt(
   releaseGroupMbid: string,
-  options?: { size?: ArtworkThumbnailSize },
+  options?: { size?: ArtworkThumbnailSize; excludeUrl?: (url: string) => boolean },
 ): Promise<CoverArtResolution> {
-  return fetchCaaEndpoint("release-group", releaseGroupMbid, options?.size ?? "500");
+  return fetchCaaEndpoint("release-group", releaseGroupMbid, options?.size ?? "500", options?.excludeUrl);
 }
 
 /**
@@ -278,7 +289,7 @@ export async function fetchReleaseGroupCoverArt(
  */
 export async function fetchReleaseCoverArt(
   releaseMbid: string,
-  options?: { size?: ArtworkThumbnailSize },
+  options?: { size?: ArtworkThumbnailSize; excludeUrl?: (url: string) => boolean },
 ): Promise<CoverArtResolution> {
-  return fetchCaaEndpoint("release", releaseMbid, options?.size ?? "500");
+  return fetchCaaEndpoint("release", releaseMbid, options?.size ?? "500", options?.excludeUrl);
 }

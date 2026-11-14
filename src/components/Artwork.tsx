@@ -14,6 +14,7 @@ import {
 export {
   clearArtworkCache,
   getArtworkUrl,
+  handleArtworkImageError,
   loadArtworkUrl,
   notifyArtworkLoaded,
   setCachedArtworkForTrack,
@@ -43,19 +44,20 @@ export function useArtworkUrl(trackOrId: Track | string | null | undefined): str
       return;
     }
 
-    const existing = getArtworkUrl(trackId);
-    if (existing) {
-      setLoaded({ trackId, url: existing });
-      return;
-    }
-
-    setLoaded({ trackId, url: undefined });
-
+    // Always subscribe first so background blob upgrades, invalidations, and
+    // error-recovery retries update mounted components even when an initial URL
+    // was already cached at mount time.
     const unsubscribe = subscribeArtwork(trackId, (loadedUrl) => {
       setLoaded({ trackId, url: loadedUrl });
     });
 
-    void loadArtworkUrl(currentInput);
+    const existing = getArtworkUrl(trackId);
+    if (existing) {
+      setLoaded({ trackId, url: existing });
+    } else {
+      setLoaded({ trackId, url: undefined });
+      void loadArtworkUrl(currentInput);
+    }
 
     return () => {
       unsubscribe();

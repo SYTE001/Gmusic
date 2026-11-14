@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   __resetArtworkCacheForTests,
+  clearArtworkCache,
   getArtworkUrl,
   handleArtworkImageError,
   loadArtworkUrl,
@@ -10,7 +11,12 @@ import {
   validateArtworkBlob,
 } from "./artworkCache";
 import { repository } from "../indexeddb/LibraryRepository";
-import { invalidateArtworkCacheForTrack, resolveArtworkForTrack } from "./artworkService";
+import { getPlayUrl } from "../cloud/r2StorageService";
+import {
+  invalidateArtworkCacheForTrack,
+  markArtworkUrlFailed,
+  resolveArtworkForTrack,
+} from "./artworkService";
 import type { Track } from "../../types";
 
 vi.mock("../indexeddb/LibraryRepository", () => ({
@@ -22,15 +28,20 @@ vi.mock("../indexeddb/LibraryRepository", () => ({
   },
 }));
 
+vi.mock("../cloud/r2StorageService", () => ({
+  getPlayUrl: vi.fn(),
+}));
+
 vi.mock("./artworkService", () => ({
   resolveArtworkForTrack: vi.fn(),
   invalidateArtworkCacheForTrack: vi.fn(),
+  markArtworkUrlFailed: vi.fn(),
 }));
 
 const makeImageBlob = (): Blob =>
   new Blob([new Uint8Array(128).fill(1)], { type: "image/jpeg" });
 
-const makeTrack = (id: string): Track => ({
+const makeTrack = (id: string, overrides?: Partial<Track>): Track => ({
   id,
   title: "Song",
   artist: "Artist",
@@ -42,6 +53,7 @@ const makeTrack = (id: string): Track => ({
   liked: false,
   playCount: 0,
   lastPlayedAt: null,
+  ...overrides,
 } as unknown as Track);
 
 let objectUrlCounter = 0;
@@ -67,6 +79,8 @@ describe("artworkCache", () => {
     vi.mocked(repository.deleteArtwork).mockResolvedValue(undefined);
     vi.mocked(repository.getTrack).mockResolvedValue(undefined);
     vi.mocked(invalidateArtworkCacheForTrack).mockReturnValue(undefined);
+    vi.mocked(markArtworkUrlFailed).mockReturnValue(undefined);
+    vi.mocked(getPlayUrl).mockRejectedValue(new Error("not configured"));
   });
 
   describe("validateArtworkBlob", () => {
@@ -110,6 +124,23 @@ describe("artworkCache", () => {
       const url = await loadArtworkUrl("t1");
       expect(url).toBe("blob:mock-1");
       expect(repository.getArtwork).toHaveBeenCalledTimes(1);
+    });
+
+    it("resolves and persists cloud artwork via artworkObjectKey before querying external providers", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      const cloudTrack = makeTrack("t-cloud", {
+        artworkObjectKey: "users/u1/tracks/t-cloud/artwork.jpg",
+      });
+      vi.mocked(repository.getTrack).mockResolvedValue(cloudTrack);
+      vi.mocked(getPlayUrl).mockResolvedValue("https://r2.signed.example/artwork.jpg?sig=123");
+      const blob = makeImageBlob();
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => blob }) as unknown as Response));
+
+      const url = await loadArtworkUrl("t-cloud");
+      expect(url).toBe("blob:mock-1");
+      expect(getPlayUrl).toHaveBeenCalledWith("users/u1/tracks/t-cloud/artwork.jpg");
+      expect(repository.putArtwork).toHaveBeenCalledWith("t-cloud", blob);
+      expect(resolveArtworkForTrack).not.toHaveBeenCalled();
     });
 
     it("downloads, validates and persists remote provider artwork for the stable track ID", async () => {
@@ -195,6 +226,59 @@ describe("artworkCache", () => {
       await flushAsync();
       expect(fetchMock.mock.calls.length).toBe(downloadsAfterFirst);
     });
+
+    it("correctly loads and caches artwork when switching across 20 tracks and replaying", async () => {
+      vi.mocked(repository.getArtwork).mockImplementation(async (id: string) => {
+        if (id.startsWith("track-")) return makeImageBlob();
+        return undefined;
+      });
+
+      const resolvedUrls = new Map<string, string | undefined>();
+      for (let i = 1; i <= 20; i++) {
+        const id = `track-${i}`;
+        const url = await loadArtworkUrl(id);
+        expect(url).toBe(`blob:mock-${i}`);
+        resolvedUrls.set(id, url);
+      }
+
+      // Replay tracks 1..20: served from memory cache without extra IndexedDB reads
+      expect(repository.getArtwork).toHaveBeenCalledTimes(20);
+      for (let i = 1; i <= 20; i++) {
+        const id = `track-${i}`;
+        const replayUrl = await loadArtworkUrl(id);
+        expect(replayUrl).toBe(resolvedUrls.get(id));
+      }
+      expect(repository.getArtwork).toHaveBeenCalledTimes(20);
+    });
+
+    it("survives application refresh / restart by restoring from IndexedDB and works offline", async () => {
+      const persistedStore = new Map<string, Blob>();
+      vi.mocked(repository.getArtwork).mockImplementation(async (id) => persistedStore.get(id));
+      vi.mocked(repository.putArtwork).mockImplementation(async (id, blob) => {
+        persistedStore.set(id, blob);
+      });
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t-persist"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({
+        url: "https://is1-ssl.mzstatic.com/persist.jpg",
+        source: "itunes",
+      });
+      const blob = makeImageBlob();
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => blob }) as unknown as Response));
+
+      // First session: loads remote and persists to IndexedDB
+      await loadArtworkUrl("t-persist");
+      await flushAsync();
+      expect(persistedStore.has("t-persist")).toBe(true);
+
+      // Simulate application refresh / reopen while offline
+      __resetArtworkCacheForTests();
+      Object.defineProperty(navigator, "onLine", { value: false, configurable: true });
+      vi.mocked(resolveArtworkForTrack).mockClear();
+
+      const afterRestartUrl = await loadArtworkUrl("t-persist");
+      expect(afterRestartUrl).toBe("blob:mock-2");
+      expect(resolveArtworkForTrack).not.toHaveBeenCalled();
+    });
   });
 
   describe("handleArtworkImageError", () => {
@@ -209,7 +293,7 @@ describe("artworkCache", () => {
       expect(repository.deleteArtwork).not.toHaveBeenCalled();
     });
 
-    it("invalidates once and retries when online", async () => {
+    it("marks broken remote URL as failed, invalidates once, and retries when online", async () => {
       vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
       vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
       vi.mocked(resolveArtworkForTrack).mockResolvedValue({ url: "https://cdn.example/better.jpg", source: "itunes" });
@@ -218,6 +302,7 @@ describe("artworkCache", () => {
       await handleArtworkImageError("t1", "https://cdn.example/broken.jpg");
       await flushAsync();
 
+      expect(markArtworkUrlFailed).toHaveBeenCalledWith("https://cdn.example/broken.jpg");
       expect(invalidateArtworkCacheForTrack).toHaveBeenCalledTimes(1);
       expect(getArtworkUrl("t1")).toBe("https://cdn.example/better.jpg");
     });
@@ -245,6 +330,7 @@ describe("artworkCache", () => {
 
     it("deletes a corrupt persisted blob before retrying, but keeps it for remote-URL failures", async () => {
       vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
 
       setCachedArtworkForTrack("t1", "blob:mock-corrupt");
       await handleArtworkImageError("t1", "blob:mock-corrupt");
@@ -254,6 +340,23 @@ describe("artworkCache", () => {
       setCachedArtworkForTrack("t2", "https://cdn.example/cover.jpg");
       await handleArtworkImageError("t2", "https://cdn.example/cover.jpg");
       expect(repository.deleteArtwork).not.toHaveBeenCalled();
+    });
+
+    it("never deletes a valid persisted IndexedDB blob when a revoked or evicted blob URL errors", async () => {
+      const validBlob = makeImageBlob();
+      vi.mocked(repository.getArtwork).mockResolvedValue(validBlob);
+
+      // Load initial blob URL (blob:mock-1), then clear in-memory cache (revoking blob:mock-1)
+      const initialUrl = await loadArtworkUrl("t1");
+      expect(initialUrl).toBe("blob:mock-1");
+      clearArtworkCache();
+
+      // Stale <img> fires onError with the revoked blob:mock-1 URL
+      await handleArtworkImageError("t1", "blob:mock-1");
+
+      // Valid persisted blob in IndexedDB must NEVER be deleted; a fresh blob URL is minted instead
+      expect(repository.deleteArtwork).not.toHaveBeenCalled();
+      expect(getArtworkUrl("t1")).toBe("blob:mock-2");
     });
   });
 

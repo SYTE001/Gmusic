@@ -3,7 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { NowPlayingPage } from "./NowPlayingPage";
 import { MiniPlayer } from "../../components/MiniPlayer";
-import { clearArtworkCache, setCachedArtworkForTrack } from "../../components/Artwork";
+import { clearArtworkCache, notifyArtworkLoaded, setCachedArtworkForTrack } from "../../components/Artwork";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { usePlaybackStore } from "../../stores/playbackStore";
 import { DEFAULT_PREFERENCES, useSettingsStore } from "../../stores/settingsStore";
@@ -591,5 +591,68 @@ describe("NowPlayingPage component", () => {
     expect(screen.queryByRole("img")).toBeNull();
     expect(container.querySelector('[data-has-artwork="false"]')).toBeTruthy();
     expect(container.querySelector(".mobile-player-overlay")).toBeNull();
+  });
+
+  it("updates mounted artwork when an initial cached URL upgrades to a persisted blob or recovers from error", () => {
+    setViewport(390, 844);
+    setCachedArtworkForTrack("track-1", "https://remote.example/initial.jpg");
+
+    render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const initialImg = screen.getByAltText("Test Song artwork") as HTMLImageElement;
+    expect(initialImg.src).toBe("https://remote.example/initial.jpg");
+
+    // Simulate background persistence upgrade or error recovery setting a new blob URL
+    act(() => {
+      setCachedArtworkForTrack("track-1", "blob:upgraded-local-1");
+    });
+
+    const upgradedImg = screen.getByAltText("Test Song artwork") as HTMLImageElement;
+    expect(upgradedImg.src).toContain("blob:upgraded-local-1");
+  });
+
+  it("prevents stale artwork when rapidly skipping across 15 tracks and ignores late async resolutions for old tracks", () => {
+    setViewport(1366, 768);
+    const tracks = Array.from({ length: 15 }, (_, i) =>
+      createTrack(`track-${i + 1}`, { title: `Song ${i + 1}`, artist: `Artist ${i + 1}` }),
+    );
+    const trackIds = tracks.map((t) => t.id);
+    useLibraryStore.setState({ tracks, playlists: [], status: "ready", loadError: null });
+    usePlaybackStore.setState({ currentTrackId: "track-1", queueTrackIds: trackIds, queueIndex: 0 });
+    setCachedArtworkForTrack("track-1", "blob:cover-1");
+    setCachedArtworkForTrack("track-15", "blob:cover-15");
+
+    const { rerender } = render(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    // Rapidly skip from track-1 through track-15
+    for (let i = 1; i < 15; i++) {
+      act(() => {
+        usePlaybackStore.setState({ currentTrackId: `track-${i + 1}`, queueIndex: i });
+      });
+    }
+    rerender(
+      <MemoryRouter initialEntries={["/now-playing"]}>
+        <NowPlayingPage />
+      </MemoryRouter>,
+    );
+
+    const finalImg = screen.getByAltText("Song 15 artwork") as HTMLImageElement;
+    expect(finalImg.src).toContain("blob:cover-15");
+
+    // Late async notification for an old skipped track (track-4) must never overwrite track-15's artwork
+    act(() => {
+      notifyArtworkLoaded("track-4", "blob:late-stale-cover-4");
+    });
+
+    const currentImg = screen.getByAltText("Song 15 artwork") as HTMLImageElement;
+    expect(currentImg.src).toContain("blob:cover-15");
   });
 });
