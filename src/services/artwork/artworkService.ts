@@ -703,6 +703,12 @@ export async function resolveArtworkForTrack(
       } else if (transientFailure) {
         // Transient network/rate-limit failure: apply short in-memory backoff, do NOT write 24h negative cache
         const retryAt = Date.now() + TRANSIENT_BACKOFF_MS;
+        if (transientBackoffUntil.size >= 500) {
+          const nowMs = Date.now();
+          for (const [k, until] of transientBackoffUntil) {
+            if (until < nowMs) transientBackoffUntil.delete(k);
+          }
+        }
         for (const k of keysList) {
           if (k) transientBackoffUntil.set(k, retryAt);
         }

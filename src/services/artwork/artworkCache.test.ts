@@ -1,0 +1,307 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  __resetArtworkCacheForTests,
+  getArtworkUrl,
+  handleArtworkImageError,
+  loadArtworkUrl,
+  setCachedArtworkForTrack,
+  subscribeArtwork,
+  upgradeArtworkToPersisted,
+  validateArtworkBlob,
+} from "./artworkCache";
+import { repository } from "../indexeddb/LibraryRepository";
+import { invalidateArtworkCacheForTrack, resolveArtworkForTrack } from "./artworkService";
+import type { Track } from "../../types";
+
+vi.mock("../indexeddb/LibraryRepository", () => ({
+  repository: {
+    getArtwork: vi.fn(),
+    putArtwork: vi.fn(),
+    deleteArtwork: vi.fn(),
+    getTrack: vi.fn(),
+  },
+}));
+
+vi.mock("./artworkService", () => ({
+  resolveArtworkForTrack: vi.fn(),
+  invalidateArtworkCacheForTrack: vi.fn(),
+}));
+
+const makeImageBlob = (): Blob =>
+  new Blob([new Uint8Array(128).fill(1)], { type: "image/jpeg" });
+
+const makeTrack = (id: string): Track => ({
+  id,
+  title: "Song",
+  artist: "Artist",
+  album: "",
+  fileName: `${id}.mp3`,
+  addedAt: 0,
+  availability: "available",
+  broken: null,
+  liked: false,
+  playCount: 0,
+  lastPlayedAt: null,
+} as unknown as Track);
+
+let objectUrlCounter = 0;
+
+async function flushAsync(times = 12): Promise<void> {
+  for (let i = 0; i < times; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+}
+
+describe("artworkCache", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.localStorage.clear();
+    __resetArtworkCacheForTests();
+    objectUrlCounter = 0;
+    URL.createObjectURL = vi.fn(() => `blob:mock-${++objectUrlCounter}`) as unknown as typeof URL.createObjectURL;
+    URL.revokeObjectURL = vi.fn() as unknown as typeof URL.revokeObjectURL;
+    Object.defineProperty(navigator, "onLine", { value: true, configurable: true });
+    vi.stubGlobal("createImageBitmap", vi.fn(async () => ({ close: vi.fn() })));
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, blob: async () => new Blob() }) as unknown as Response));
+    vi.mocked(repository.putArtwork).mockResolvedValue(undefined);
+    vi.mocked(repository.deleteArtwork).mockResolvedValue(undefined);
+    vi.mocked(repository.getTrack).mockResolvedValue(undefined);
+    vi.mocked(invalidateArtworkCacheForTrack).mockReturnValue(undefined);
+  });
+
+  describe("validateArtworkBlob", () => {
+    it("accepts a decodable image blob", async () => {
+      expect(await validateArtworkBlob(makeImageBlob())).toBe(true);
+    });
+
+    it("rejects non-image content types", async () => {
+      const blob = new Blob([new Uint8Array(128).fill(1)], { type: "text/html" });
+      expect(await validateArtworkBlob(blob)).toBe(false);
+      expect(createImageBitmap).not.toHaveBeenCalled();
+    });
+
+    it("rejects blobs that fail to decode", async () => {
+      vi.stubGlobal("createImageBitmap", vi.fn(async () => {
+        throw new Error("decode failed");
+      }));
+      expect(await validateArtworkBlob(makeImageBlob())).toBe(false);
+    });
+
+    it("rejects undersized and oversized blobs", async () => {
+      expect(await validateArtworkBlob(new Blob([new Uint8Array(4)], { type: "image/png" }))).toBe(false);
+      expect(await validateArtworkBlob(new Blob([new Uint8Array(6 * 1024 * 1024)], { type: "image/png" }))).toBe(false);
+    });
+  });
+
+  describe("loadArtworkUrl", () => {
+    it("serves persisted embedded artwork from IndexedDB without going online", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(makeImageBlob());
+
+      const url = await loadArtworkUrl("t1");
+      expect(url).toBe("blob:mock-1");
+      expect(resolveArtworkForTrack).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
+    it("uses the memory cache on replay without re-reading IndexedDB", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(makeImageBlob());
+
+      await loadArtworkUrl("t1");
+      const url = await loadArtworkUrl("t1");
+      expect(url).toBe("blob:mock-1");
+      expect(repository.getArtwork).toHaveBeenCalledTimes(1);
+    });
+
+    it("downloads, validates and persists remote provider artwork for the stable track ID", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({
+        url: "https://is1-ssl.mzstatic.com/cover.jpg",
+        source: "itunes",
+        confidence: 80,
+      });
+      const blob = makeImageBlob();
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => blob }) as unknown as Response));
+
+      const url = await loadArtworkUrl("t1");
+      expect(url).toBe("https://is1-ssl.mzstatic.com/cover.jpg");
+      expect(resolveArtworkForTrack).toHaveBeenCalledWith(makeTrack("t1"));
+
+      // Background persistence upgrades the cache to a local blob URL
+      await flushAsync();
+      expect(repository.putArtwork).toHaveBeenCalledWith("t1", blob);
+      expect(getArtworkUrl("t1")).toBe("blob:mock-1");
+    });
+
+    it("keeps the remote URL when the download fails, without persisting anything", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({ url: "https://cdn.example/cover.jpg", source: "itunes" });
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, blob: async () => new Blob() }) as unknown as Response));
+
+      const url = await loadArtworkUrl("t1");
+      expect(url).toBe("https://cdn.example/cover.jpg");
+      await flushAsync();
+      expect(repository.putArtwork).not.toHaveBeenCalled();
+      expect(getArtworkUrl("t1")).toBe("https://cdn.example/cover.jpg");
+    });
+
+    it("never persists content that is not a valid image", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({ url: "https://cdn.example/cover.jpg", source: "itunes" });
+      const htmlBlob = new Blob([new Uint8Array(128).fill(2)], { type: "text/html" });
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => htmlBlob }) as unknown as Response));
+
+      const url = await loadArtworkUrl("t1");
+      expect(url).toBe("https://cdn.example/cover.jpg");
+      await flushAsync();
+      expect(repository.putArtwork).not.toHaveBeenCalled();
+    });
+
+    it("keeps display responsive when persistence fails (quota/IDB error)", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({ url: "https://cdn.example/cover.jpg", source: "itunes" });
+      const blob = makeImageBlob();
+      vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => blob }) as unknown as Response));
+      vi.mocked(repository.putArtwork).mockRejectedValue(new Error("quota"));
+
+      const url = await loadArtworkUrl("t1");
+      expect(url).toBe("https://cdn.example/cover.jpg");
+      await flushAsync();
+      expect(getArtworkUrl("t1")).toBe("https://cdn.example/cover.jpg");
+    });
+
+    it("does not re-download a URL that failed recently (negative download cache)", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({ url: "https://cdn.example/cover.jpg", source: "itunes" });
+      const fetchMock = vi.fn(async () => ({ ok: false, blob: async () => new Blob() }) as unknown as Response);
+      vi.stubGlobal("fetch", fetchMock);
+
+      await loadArtworkUrl("t1");
+      await flushAsync();
+      const downloadsAfterFirst = fetchMock.mock.calls.length;
+
+      // Simulate a remount: memory cache still holds the remote URL, so no new download
+      await loadArtworkUrl("t1");
+      await flushAsync();
+      expect(fetchMock.mock.calls.length).toBe(downloadsAfterFirst);
+
+      // Even after invalidation, the failed URL is not retried within the TTL
+      setCachedArtworkForTrack("t1", "https://cdn.example/cover.jpg");
+      upgradeArtworkToPersisted("t1", "https://cdn.example/cover.jpg");
+      await flushAsync();
+      expect(fetchMock.mock.calls.length).toBe(downloadsAfterFirst);
+    });
+  });
+
+  describe("handleArtworkImageError", () => {
+    it("keeps cached artwork when offline (transient connectivity loss)", async () => {
+      setCachedArtworkForTrack("t1", "https://cdn.example/cover.jpg");
+      Object.defineProperty(navigator, "onLine", { value: false, configurable: true });
+
+      await handleArtworkImageError("t1", "https://cdn.example/cover.jpg");
+
+      expect(getArtworkUrl("t1")).toBe("https://cdn.example/cover.jpg");
+      expect(invalidateArtworkCacheForTrack).not.toHaveBeenCalled();
+      expect(repository.deleteArtwork).not.toHaveBeenCalled();
+    });
+
+    it("invalidates once and retries when online", async () => {
+      vi.mocked(repository.getArtwork).mockResolvedValue(undefined);
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      vi.mocked(resolveArtworkForTrack).mockResolvedValue({ url: "https://cdn.example/better.jpg", source: "itunes" });
+      setCachedArtworkForTrack("t1", "https://cdn.example/broken.jpg");
+
+      await handleArtworkImageError("t1", "https://cdn.example/broken.jpg");
+      await flushAsync();
+
+      expect(invalidateArtworkCacheForTrack).toHaveBeenCalledTimes(1);
+      expect(getArtworkUrl("t1")).toBe("https://cdn.example/better.jpg");
+    });
+
+    it("does not loop retries for a permanently broken URL (cooldown)", async () => {
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+      setCachedArtworkForTrack("t1", "https://cdn.example/broken.jpg");
+
+      await handleArtworkImageError("t1", "https://cdn.example/broken.jpg");
+      const callsAfterFirst = vi.mocked(invalidateArtworkCacheForTrack).mock.calls.length;
+
+      await handleArtworkImageError("t1", "https://cdn.example/broken.jpg");
+      await handleArtworkImageError("t1", "https://cdn.example/broken.jpg");
+      expect(vi.mocked(invalidateArtworkCacheForTrack).mock.calls.length).toBe(callsAfterFirst);
+    });
+
+    it("skips recovery when a different URL already replaced the failed one", async () => {
+      setCachedArtworkForTrack("t1", "https://cdn.example/new.jpg");
+
+      await handleArtworkImageError("t1", "https://cdn.example/old.jpg");
+
+      expect(invalidateArtworkCacheForTrack).not.toHaveBeenCalled();
+      expect(getArtworkUrl("t1")).toBe("https://cdn.example/new.jpg");
+    });
+
+    it("deletes a corrupt persisted blob before retrying, but keeps it for remote-URL failures", async () => {
+      vi.mocked(repository.getTrack).mockResolvedValue(makeTrack("t1"));
+
+      setCachedArtworkForTrack("t1", "blob:mock-corrupt");
+      await handleArtworkImageError("t1", "blob:mock-corrupt");
+      expect(repository.deleteArtwork).toHaveBeenCalledWith("t1");
+
+      vi.mocked(repository.deleteArtwork).mockClear();
+      setCachedArtworkForTrack("t2", "https://cdn.example/cover.jpg");
+      await handleArtworkImageError("t2", "https://cdn.example/cover.jpg");
+      expect(repository.deleteArtwork).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("listener isolation (no stale cross-track updates)", () => {
+    it("only delivers notifications for the subscribed track", async () => {
+      const listenerA = vi.fn();
+      const listenerB = vi.fn();
+      const unsubA = subscribeArtwork("track-a", listenerA);
+      const unsubB = subscribeArtwork("track-b", listenerB);
+
+      setCachedArtworkForTrack("track-a", "blob:mock-a");
+      setCachedArtworkForTrack("track-b", "https://cdn.example/b.jpg");
+
+      expect(listenerA).toHaveBeenCalledWith("blob:mock-a");
+      expect(listenerA).not.toHaveBeenCalledWith("https://cdn.example/b.jpg");
+      expect(listenerB).toHaveBeenCalledWith("https://cdn.example/b.jpg");
+      expect(listenerB).not.toHaveBeenCalledWith("blob:mock-a");
+
+      unsubA();
+      unsubB();
+    });
+
+    it("stops delivering after unsubscribe (no leaks)", () => {
+      const listener = vi.fn();
+      const unsubscribe = subscribeArtwork("track-a", listener);
+      unsubscribe();
+
+      setCachedArtworkForTrack("track-a", "blob:mock-a");
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it("resolves concurrent loads for different tracks independently", async () => {
+      const deferred: Array<(value: Blob | undefined) => void> = [];
+      vi.mocked(repository.getArtwork).mockImplementation(
+        () => new Promise<Blob | undefined>((resolve) => deferred.push(resolve)),
+      );
+
+      const promiseA = loadArtworkUrl("track-a");
+      const promiseB = loadArtworkUrl("track-b");
+      expect(deferred.length).toBe(2);
+
+      deferred[1](makeImageBlob());
+      deferred[0](undefined);
+
+      const urlB = await promiseB;
+      const urlA = await promiseA;
+      expect(urlA).toBeUndefined();
+      expect(urlB).toBe("blob:mock-1");
+    });
+  });
+});

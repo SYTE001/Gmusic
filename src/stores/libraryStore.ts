@@ -9,7 +9,7 @@ import {
   revalidateAccess,
   relinkTrackWithFile,
 } from "../services/file-access/FileAccessService";
-import { loadArtworkUrl, setCachedArtworkForTrack } from "../services/artwork/artworkCache";
+import { loadArtworkUrl, setCachedArtworkForTrack, upgradeArtworkToPersisted } from "../services/artwork/artworkCache";
 import { resolveArtworkForAlbumBatch } from "../services/artwork/artworkService";
 import { importAudioItems, type ImportItem, type ImportProgress } from "../services/library/importService";
 import {
@@ -360,12 +360,19 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
         set({ tracks: fresh });
         if (outcome.newTracks && outcome.newTracks.length > 0) {
           void resolveArtworkForAlbumBatch(outcome.newTracks, {
-            onTrackArtworkResolved: setCachedArtworkForTrack,
+            onTrackArtworkResolved: (trackId, url) => {
+              setCachedArtworkForTrack(trackId, url);
+              // Persist a local copy so artwork survives refreshes and works offline.
+              upgradeArtworkToPersisted(trackId, url);
+            },
           });
         }
         if (outcome.updatedTracks && outcome.updatedTracks.length > 0) {
           void resolveArtworkForAlbumBatch(outcome.updatedTracks, {
-            onTrackArtworkResolved: setCachedArtworkForTrack,
+            onTrackArtworkResolved: (trackId, url) => {
+              setCachedArtworkForTrack(trackId, url);
+              upgradeArtworkToPersisted(trackId, url);
+            },
           });
         }
         if (prefs.autoFetchLyrics && outcome.newTracks) {

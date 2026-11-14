@@ -4,7 +4,7 @@ import { MusicNoteIcon } from "./Icons";
 import {
   clearArtworkCache,
   getArtworkUrl,
-  invalidateArtworkForTrackId,
+  handleArtworkImageError,
   loadArtworkUrl,
   notifyArtworkLoaded,
   setCachedArtworkForTrack,
@@ -71,6 +71,12 @@ export function Artwork({ trackId, alt, className, rounded = "rounded-lg" }: Art
   const url = useArtworkUrl(trackId);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
+  // A failure only applies to the URL that failed; never suppress a new URL
+  // (including a retry of the same track through a different source).
+  useEffect(() => {
+    setFailedUrl(null);
+  }, [url]);
+
   if (!url || failedUrl === url) {
     return (
       <div
@@ -91,7 +97,7 @@ export function Artwork({ trackId, alt, className, rounded = "rounded-lg" }: Art
       onError={() => {
         setFailedUrl(url);
         if (trackId) {
-          void invalidateArtworkForTrackId(trackId);
+          void handleArtworkImageError(trackId, url);
         }
       }}
       className={`object-cover ${rounded} ${className ?? ""}`}

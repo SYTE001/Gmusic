@@ -5,7 +5,7 @@ import { usePlaybackStore } from "../../stores/playbackStore";
 import { toast } from "../../stores/toastStore";
 import { recordComponentRender } from "../../utils/perf";
 import { Artwork, useArtworkUrl } from "../../components/Artwork";
-import { invalidateArtworkForTrackId } from "../../services/artwork/artworkCache";
+import { handleArtworkImageError } from "../../services/artwork/artworkCache";
 import { Menu, type MenuItemSpec } from "../../components/Menu";
 import { QueuePanel } from "../../components/QueuePanel";
 import { SeekBar } from "../../components/SeekBar";
@@ -304,6 +304,11 @@ export function MobilePlayer({
 }) {
   const artworkUrl = useArtworkUrl(track.id);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
+  // A failure only applies to the URL that failed; reset when a new URL
+  // arrives so retrying the same track through another source can recover.
+  useEffect(() => {
+    setFailedUrl(null);
+  }, [artworkUrl]);
   const hasArtwork = Boolean(artworkUrl && failedUrl !== artworkUrl);
 
   const artworkThemeVars: CSSProperties | undefined = hasArtwork
@@ -385,7 +390,7 @@ export function MobilePlayer({
               decoding="async"
               onError={() => {
                 setFailedUrl(artworkUrl);
-                void invalidateArtworkForTrackId(track.id);
+                void handleArtworkImageError(track.id, artworkUrl);
               }}
               className="size-full object-cover object-center transition-opacity duration-200"
             />

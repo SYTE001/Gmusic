@@ -132,6 +132,13 @@ export class LibraryRepository {
     });
   }
 
+  /** Removes a persisted artwork blob (used when a cached image proves corrupt). */
+  async deleteArtwork(trackId: string): Promise<void> {
+    await withTransaction([STORES.artwork], "readwrite", (tx) => {
+      tx.objectStore(STORES.artwork).delete(trackId);
+    });
+  }
+
   async getAudioBlob(trackId: string): Promise<Blob | undefined> {
     return withTransaction([STORES.audio], "readonly", async (tx) => {
       const record = await requestToPromise(
