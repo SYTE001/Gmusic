@@ -1,13 +1,13 @@
-import { Component, useEffect, useRef, type ReactNode } from "react";
+import { Component, useEffect, useRef, useState, type ReactNode } from "react";
 import { BrowserRouter } from "react-router-dom";
 import { AppRoutes } from "./router";
+import { IntroSplash, INTRO_SPLASH_STORAGE_KEY } from "../components/IntroSplash";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useLibraryStore, flushPlaybackSessionNow } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { useCloudStore } from "../stores/cloudStore";
 import { startLyricsPrefetch } from "../stores/lyricsStore";
 import { registerServiceWorker } from "../services/offline/offlineService";
-import { IntroSplash } from "../components/IntroSplash";
 
 /** Top-level error boundary: a crash shows a recoverable message, not a blank page. */
 export class AppErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
@@ -45,6 +45,13 @@ export class AppErrorBoundary extends Component<{ children: ReactNode }, { error
 
 export function App() {
   const startedRef = useRef(false);
+  const [showSplash, setShowSplash] = useState(() => {
+    try {
+      return window.sessionStorage.getItem(INTRO_SPLASH_STORAGE_KEY) !== "1";
+    } catch {
+      return true;
+    }
+  });
 
   useEffect(() => {
     if (startedRef.current) return; // one-time async init only; listeners live in their own effect
@@ -115,12 +122,10 @@ export function App() {
 
   return (
     <>
-      {/* One-shot intro above the router: route changes never replay it, and
-          it is purely presentational so app initialization runs in parallel. */}
-      <IntroSplash />
       <BrowserRouter>
         <AppRoutes />
       </BrowserRouter>
+      {showSplash && <IntroSplash onComplete={() => setShowSplash(false)} />}
     </>
   );
 }

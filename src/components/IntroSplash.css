@@ -1,50 +1,419 @@
-/*
- * IntroSplash — masked logo reveal on a solid black screen.
- * Only clip-path (reveal) and opacity (handoff) are animated; the mark itself
- * never moves, scales or distorts. No gradients, glow, blur, shadows or
- * decorative motion.
- */
+/* Native 60fps GPU-accelerated Intro Splash choreography */
 
 .intro-splash {
   position: fixed;
   inset: 0;
-  z-index: 60; /* above the modal layer (z-50): the splash owns the screen */
-  display: grid;
-  place-items: center;
+  width: 100vw;
+  height: 100vh;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: #0b0b0f;
+  color: #f4f4f8;
   overflow: hidden;
-  background: #000000;
+  user-select: none;
+  will-change: transform, opacity;
+  transform: scale(1) translateZ(0);
+  opacity: 1;
+  transition:
+    opacity 600ms cubic-bezier(0.22, 1, 0.36, 1),
+    transform 600ms cubic-bezier(0.22, 1, 0.36, 1);
 }
 
-.intro-splash[data-phase="exit"] {
-  pointer-events: none; /* clicks pass through the moment the handoff starts */
-  animation: intro-exit 250ms cubic-bezier(0.4, 0, 1, 1) both;
+.intro-splash--exiting {
+  opacity: 0;
+  transform: scale(1.04) translateZ(0);
+  pointer-events: none;
 }
 
-/* Tight viewBox around the official mark geometry (icon.svg mark bounds). */
-.intro-mark {
-  height: clamp(128px, 30vmin, 172px);
-  aspect-ratio: 206 / 258;
-  /* Left→right reveal: the right inset opens from 100% to 0 over the mark's
-     own width. fill both keeps the mark fully hidden during the black
-     lead-in and holds the fully revealed state through the static hold. */
-  clip-path: inset(0 100% 0 0);
-  animation: intro-reveal 875ms 375ms cubic-bezier(0.25, 0, 0.1, 1) both;
+/* Subtle ambient radial stage lighting (GPU opacity/transform only) */
+.intro-splash__ambient {
+  position: absolute;
+  width: 440px;
+  height: 440px;
+  border-radius: 9999px;
+  background: radial-gradient(
+    circle,
+    rgba(141, 168, 255, 0.16) 0%,
+    rgba(212, 168, 83, 0.08) 44%,
+    rgba(11, 11, 15, 0) 72%
+  );
+  pointer-events: none;
+  opacity: 0;
+  transform: scale(0.75) translateZ(0);
+  animation: intro-ambient-bloom 2100ms cubic-bezier(0.16, 1, 0.3, 1) 80ms forwards;
 }
 
-@keyframes intro-reveal {
-  from {
-    clip-path: inset(0 100% 0 0);
+/* Core center stage container */
+.intro-splash__stage {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+}
+
+/* 0.0s - 0.4s: Stage Entrance (scale 0.85 -> 1, opacity 0 -> 1) */
+.intro-splash__mark-wrap {
+  position: relative;
+  width: 120px;
+  height: 120px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transform: scale(0.85) translateZ(0);
+  will-change: transform, opacity;
+  animation: intro-stage-entrance 400ms cubic-bezier(0.16, 1, 0.3, 1) 0ms forwards;
+}
+
+.intro-splash__svg {
+  width: 120px;
+  height: 120px;
+  overflow: visible;
+}
+
+/* 0.4s - 1.6s: Hero Motion — SVG stroke draw & vinyl harmonic rings */
+.intro-splash__ring-outer {
+  stroke-dasharray: 326;
+  stroke-dashoffset: 326;
+  animation: intro-stroke-draw 950ms cubic-bezier(0.16, 1, 0.3, 1) 260ms forwards;
+}
+
+.intro-splash__ring-groove {
+  stroke-dasharray: 226;
+  stroke-dashoffset: 226;
+  opacity: 0;
+  animation:
+    intro-stroke-draw 850ms cubic-bezier(0.16, 1, 0.3, 1) 400ms forwards,
+    intro-fade-in 400ms cubic-bezier(0.16, 1, 0.3, 1) 400ms forwards;
+}
+
+.intro-splash__ring-inner {
+  stroke-dasharray: 120;
+  stroke-dashoffset: 120;
+  opacity: 0;
+  animation:
+    intro-stroke-draw 720ms cubic-bezier(0.16, 1, 0.3, 1) 520ms forwards,
+    intro-fade-in 360ms cubic-bezier(0.16, 1, 0.3, 1) 520ms forwards;
+}
+
+.intro-splash__core-disc {
+  transform-origin: 60px 60px;
+  opacity: 0;
+  transform: scale(0.72);
+  animation: intro-disc-settle 680ms cubic-bezier(0.16, 1, 0.3, 1) 340ms forwards;
+}
+
+/* Equalizer bars inside mark — staggered harmonic pulse (0.4s - 1.6s, then settle) */
+.intro-splash__eq-bar {
+  transform-origin: 60px 60px;
+  transform: scaleY(0.22);
+  opacity: 0;
+  will-change: transform, opacity;
+}
+
+.intro-splash__eq-bar--1 {
+  animation: intro-eq-pulse-side 1150ms cubic-bezier(0.16, 1, 0.3, 1) 420ms forwards;
+}
+
+.intro-splash__eq-bar--2 {
+  animation: intro-eq-pulse-mid 1150ms cubic-bezier(0.16, 1, 0.3, 1) 500ms forwards;
+}
+
+.intro-splash__eq-bar--3 {
+  animation: intro-eq-pulse-center 1150ms cubic-bezier(0.16, 1, 0.3, 1) 580ms forwards;
+}
+
+.intro-splash__eq-bar--4 {
+  animation: intro-eq-pulse-mid 1150ms cubic-bezier(0.16, 1, 0.3, 1) 660ms forwards;
+}
+
+.intro-splash__eq-bar--5 {
+  animation: intro-eq-pulse-side 1150ms cubic-bezier(0.16, 1, 0.3, 1) 740ms forwards;
+}
+
+/* Subtle light sweep across mark */
+.intro-splash__sheen {
+  position: absolute;
+  inset: -8px;
+  border-radius: 9999px;
+  background: linear-gradient(
+    115deg,
+    rgba(255, 255, 255, 0) 30%,
+    rgba(255, 244, 214, 0.16) 50%,
+    rgba(255, 255, 255, 0) 70%
+  );
+  pointer-events: none;
+  opacity: 0;
+  transform: translateX(-48%) rotate(-12deg) translateZ(0);
+  animation: intro-sheen-sweep 1100ms cubic-bezier(0.22, 1, 0.36, 1) 520ms forwards;
+}
+
+/* Wordmark & staggered character reveal */
+.intro-splash__wordmark-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.intro-splash__title {
+  margin: 0;
+  display: inline-flex;
+  align-items: baseline;
+  font-size: 1.875rem;
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: #f6f6fa;
+}
+
+.intro-splash__char {
+  display: inline-block;
+  opacity: 0;
+  transform: translateY(10px) scale(0.94) translateZ(0);
+  will-change: transform, opacity;
+  animation: intro-char-reveal 620ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.intro-splash__char--accent {
+  color: #8da8ff;
+}
+
+.intro-splash__tagline {
+  margin: 0;
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: rgba(244, 244, 248, 0.54);
+  opacity: 0;
+  transform: translateY(6px) translateZ(0);
+  animation: intro-tagline-reveal 680ms cubic-bezier(0.16, 1, 0.3, 1) 920ms forwards;
+}
+
+/* Minimal corner Skip button */
+.intro-splash__skip {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  z-index: 2;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  border: 1px solid rgba(244, 244, 248, 0.14);
+  background: rgba(22, 22, 30, 0.72);
+  color: rgba(244, 244, 248, 0.72);
+  font-size: 0.75rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(4px) translateZ(0);
+  animation: intro-skip-appear 400ms cubic-bezier(0.16, 1, 0.3, 1) 200ms forwards;
+  transition:
+    color 160ms ease,
+    border-color 160ms ease,
+    background-color 160ms ease,
+    transform 160ms ease;
+}
+
+.intro-splash__skip:hover,
+.intro-splash__skip:focus-visible {
+  color: #f6f6fa;
+  border-color: rgba(141, 168, 255, 0.48);
+  background: rgba(32, 32, 44, 0.92);
+  outline: none;
+}
+
+/* Keyframes */
+@keyframes intro-stage-entrance {
+  0% {
+    opacity: 0;
+    transform: scale(0.85) translateZ(0);
   }
-  to {
-    clip-path: inset(0 0 0 0);
+  100% {
+    opacity: 1;
+    transform: scale(1) translateZ(0);
   }
 }
 
-@keyframes intro-exit {
-  from {
+@keyframes intro-ambient-bloom {
+  0% {
+    opacity: 0;
+    transform: scale(0.75) translateZ(0);
+  }
+  45% {
+    opacity: 1;
+    transform: scale(1.03) translateZ(0);
+  }
+  100% {
+    opacity: 0.85;
+    transform: scale(1) translateZ(0);
+  }
+}
+
+@keyframes intro-stroke-draw {
+  0% {
+    stroke-dashoffset: var(--dash-length, 326);
+  }
+  100% {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes intro-fade-in {
+  0% {
+    opacity: 0;
+  }
+  100% {
     opacity: 1;
   }
-  to {
+}
+
+@keyframes intro-disc-settle {
+  0% {
     opacity: 0;
+    transform: scale(0.72);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes intro-eq-pulse-center {
+  0% {
+    opacity: 0;
+    transform: scaleY(0.2);
+  }
+  45% {
+    opacity: 1;
+    transform: scaleY(1.18);
+  }
+  75% {
+    opacity: 1;
+    transform: scaleY(0.86);
+  }
+  100% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
+@keyframes intro-eq-pulse-mid {
+  0% {
+    opacity: 0;
+    transform: scaleY(0.2);
+  }
+  50% {
+    opacity: 1;
+    transform: scaleY(1.14);
+  }
+  80% {
+    opacity: 1;
+    transform: scaleY(0.9);
+  }
+  100% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
+@keyframes intro-eq-pulse-side {
+  0% {
+    opacity: 0;
+    transform: scaleY(0.2);
+  }
+  55% {
+    opacity: 1;
+    transform: scaleY(1.1);
+  }
+  100% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
+@keyframes intro-sheen-sweep {
+  0% {
+    opacity: 0;
+    transform: translateX(-48%) rotate(-12deg) translateZ(0);
+  }
+  35% {
+    opacity: 0.9;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(48%) rotate(-12deg) translateZ(0);
+  }
+}
+
+@keyframes intro-char-reveal {
+  0% {
+    opacity: 0;
+    transform: translateY(10px) scale(0.94) translateZ(0);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1) translateZ(0);
+  }
+}
+
+@keyframes intro-tagline-reveal {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) translateZ(0);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) translateZ(0);
+  }
+}
+
+@keyframes intro-skip-appear {
+  0% {
+    opacity: 0;
+    transform: translateY(4px) translateZ(0);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) translateZ(0);
+  }
+}
+
+/* Accessibility: Reduced motion simplifies and accelerates transitions */
+@media (prefers-reduced-motion: reduce) {
+  .intro-splash {
+    transition: opacity 200ms ease-out;
+    transform: none;
+  }
+
+  .intro-splash--exiting {
+    opacity: 0;
+    transform: none;
+  }
+
+  .intro-splash__ambient,
+  .intro-splash__mark-wrap,
+  .intro-splash__ring-outer,
+  .intro-splash__ring-groove,
+  .intro-splash__ring-inner,
+  .intro-splash__core-disc,
+  .intro-splash__eq-bar,
+  .intro-splash__char,
+  .intro-splash__tagline,
+  .intro-splash__skip {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+    stroke-dashoffset: 0 !important;
+  }
+
+  .intro-splash__sheen {
+    display: none;
   }
 }

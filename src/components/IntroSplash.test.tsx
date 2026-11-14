@@ -1,101 +1,150 @@
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
-import { IntroSplash } from "./IntroSplash";
+import {
+  INTRO_EXIT_DURATION_MS,
+  INTRO_EXIT_START_MS,
+  INTRO_REDUCED_MOTION_EXIT_MS,
+  INTRO_REDUCED_MOTION_HOLD_MS,
+  INTRO_SPLASH_STORAGE_KEY,
+  IntroSplash,
+} from "./IntroSplash";
+
+function mockMatchMedia(reduceMotion: boolean) {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    configurable: true,
+    value: vi.fn().mockImplementation((query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)" ? reduceMotion : false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    })),
+  });
+}
 
 describe("IntroSplash", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    window.sessionStorage.clear();
     delete document.documentElement.dataset.motion;
+    mockMatchMedia(false);
   });
 
   afterEach(() => {
     cleanup();
-    vi.clearAllTimers();
     vi.useRealTimers();
+    window.sessionStorage.clear();
     delete document.documentElement.dataset.motion;
   });
 
-  it("renders the official mark geometry on a black decorative overlay", () => {
-    const { container } = render(<IntroSplash />);
-    const splash = container.firstElementChild as HTMLElement;
+  it("renders native SVG mark, staggered brand title, and Skip button during active choreography", () => {
+    render(<IntroSplash />);
 
-    expect(splash.getAttribute("aria-hidden")).toBe("true");
-    expect(splash.getAttribute("role")).toBe("presentation");
-    expect(splash.getAttribute("data-phase")).toBe("play");
+    const splash = screen.getByTestId("intro-splash");
+    expect(splash).toBeTruthy();
+    expect(splash.getAttribute("data-phase")).toBe("active");
+    expect(splash.style.pointerEvents).toBe("auto");
 
-    // The svg frames the official mark bounds and reuses its exact shapes.
-    const svg = splash.querySelector("svg");
-    expect(svg?.getAttribute("viewBox")).toBe("196 112 206 258");
-    expect(svg?.querySelectorAll("path")).toHaveLength(1);
-    expect(svg?.querySelector("path")?.getAttribute("d")).toBe("M322 118l-118 26v40l118-26z");
-    expect(svg?.querySelectorAll("rect")).toHaveLength(1);
-    expect(svg?.querySelectorAll("circle")).toHaveLength(2);
-
-    // No text in the intro composition.
-    expect(splash.textContent?.trim()).toBe("");
+    expect(screen.getByRole("heading", { name: "Gmusic" })).toBeTruthy();
+    expect(screen.getByText("Personal Audio Studio")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Skip intro" })).toBeTruthy();
+    expect(splash.querySelector("svg.intro-splash__svg")).not.toBeNull();
   });
 
-  it("unmounts itself after the hold (3.75s) and handoff fade (250ms)", () => {
-    const { container } = render(<IntroSplash />);
+  it("follows the 2.1s -> 2.7s exit transition timeline and disables pointer-events on exit start", () => {
+    const onExitStart = vi.fn();
+    const onComplete = vi.fn();
 
-    act(() => {
-      vi.advanceTimersByTime(3749);
-    });
-    expect(container.firstElementChild?.getAttribute("data-phase")).toBe("play");
+    render(<IntroSplash onExitStart={onExitStart} onComplete={onComplete} />);
+    const splash = screen.getByTestId("intro-splash");
 
+    // Still active during Stage Entrance (0.4s), Hero Motion (1.6s), and Hold & Settle (< 2.1s)
     act(() => {
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(INTRO_EXIT_START_MS - 10);
     });
-    expect(container.firstElementChild?.getAttribute("data-phase")).toBe("exit");
+    expect(splash.getAttribute("data-phase")).toBe("active");
+    expect(onExitStart).not.toHaveBeenCalled();
+    expect(onComplete).not.toHaveBeenCalled();
 
+    // At 2.1s (2100ms), enters Smooth Exit Transition and sets pointer-events: none immediately
     act(() => {
-      vi.advanceTimersByTime(249);
+      vi.advanceTimersByTime(10);
     });
-    expect(container.firstElementChild).not.toBeNull();
+    expect(onExitStart).toHaveBeenCalledTimes(1);
+    expect(splash.getAttribute("data-phase")).toBe("exiting");
+    expect(splash.classList.contains("intro-splash--exiting")).toBe(true);
+    expect(splash.style.pointerEvents).toBe("none");
+    expect(onComplete).not.toHaveBeenCalled();
 
+    // Completes 600ms exit transition at 2.7s (2700ms) and unmounts
     act(() => {
-      vi.advanceTimersByTime(1);
+      vi.advanceTimersByTime(INTRO_EXIT_DURATION_MS);
     });
-    expect(container.firstElementChild).toBeNull();
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("intro-splash")).toBeNull();
   });
 
-  it("skips ahead to the handoff on pointer press", () => {
-    const { container } = render(<IntroSplash />);
-    const splash = container.firstElementChild as HTMLElement;
+  it("immediately enters the smooth exit phase when the Skip button is clicked", () => {
+    const onExitStart = vi.fn();
+    const onComplete = vi.fn();
+
+    render(<IntroSplash onExitStart={onExitStart} onComplete={onComplete} />);
+    const skipBtn = screen.getByRole("button", { name: "Skip intro" });
+
+    fireEvent.click(skipBtn);
+
+    const splash = screen.getByTestId("intro-splash");
+    expect(onExitStart).toHaveBeenCalledTimes(1);
+    expect(splash.getAttribute("data-phase")).toBe("exiting");
+    expect(splash.classList.contains("intro-splash--exiting")).toBe(true);
+    expect(splash.style.pointerEvents).toBe("none");
 
     act(() => {
-      vi.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(INTRO_EXIT_DURATION_MS);
     });
-    fireEvent.pointerDown(splash);
-
-    expect(splash.getAttribute("data-phase")).toBe("exit");
-    act(() => {
-      vi.advanceTimersByTime(250);
-    });
-    expect(container.firstElementChild).toBeNull();
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("intro-splash")).toBeNull();
   });
 
-  it("skips ahead to the handoff on Escape", () => {
-    const { container } = render(<IntroSplash />);
+  it("plays only once per session unless forceShow is enabled", () => {
+    const firstComplete = vi.fn();
+    const { unmount } = render(<IntroSplash onComplete={firstComplete} />);
 
-    fireEvent.keyDown(window, { key: "Escape" });
+    expect(window.sessionStorage.getItem(INTRO_SPLASH_STORAGE_KEY)).toBe("1");
+    expect(screen.getByTestId("intro-splash")).toBeTruthy();
+    unmount();
 
-    expect(container.firstElementChild?.getAttribute("data-phase")).toBe("exit");
-    act(() => {
-      vi.advanceTimersByTime(250);
-    });
-    expect(container.firstElementChild).toBeNull();
+    // Subsequent mount in same session skips immediately
+    const secondComplete = vi.fn();
+    render(<IntroSplash onComplete={secondComplete} />);
+    expect(screen.queryByTestId("intro-splash")).toBeNull();
+    expect(secondComplete).toHaveBeenCalledTimes(1);
+
+    // forceShow overrides sessionStorage
+    render(<IntroSplash forceShow />);
+    expect(screen.getByTestId("intro-splash")).toBeTruthy();
   });
 
-  it("never renders when reduced motion is requested", () => {
-    document.documentElement.dataset.motion = "on";
-    const { container } = render(<IntroSplash />);
-    expect(container.firstElementChild).toBeNull();
+  it("accelerates transition timings when prefers-reduced-motion: reduce is active", () => {
+    mockMatchMedia(true);
+    const onComplete = vi.fn();
 
-    // The skipped intro must not leave timers behind.
+    render(<IntroSplash onComplete={onComplete} />);
+    const splash = screen.getByTestId("intro-splash");
+
     act(() => {
-      vi.advanceTimersByTime(10_000);
+      vi.advanceTimersByTime(INTRO_REDUCED_MOTION_HOLD_MS);
     });
-    expect(container.firstElementChild).toBeNull();
+    expect(splash.getAttribute("data-phase")).toBe("exiting");
+
+    act(() => {
+      vi.advanceTimersByTime(INTRO_REDUCED_MOTION_EXIT_MS);
+    });
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId("intro-splash")).toBeNull();
   });
 });
