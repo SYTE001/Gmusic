@@ -12,6 +12,11 @@ export type NotificationPayload = {
 export type NotificationItem = NotificationPayload & {
   id: string;
   key: string;
+  /**
+   * Distinguishes transient media cards from error alerts. Error items keep
+   * this undefined so existing consumers and tests are unaffected.
+   */
+  kind?: "error" | "media";
 };
 
 export type IslandAnimationStage = "idle" | "initial" | "expanded" | "collapsing";
@@ -21,6 +26,14 @@ type DynamicIslandStore = {
   stage: IslandAnimationStage;
   queue: NotificationItem[];
   showNotification: (payload: NotificationPayload) => void;
+  /**
+   * Presents the floating media card for a playing track. Frequent playback
+   * events (start/play/pause/seek) are deduplicated per track; repeated
+   * same-track events refresh the dismissal countdown only while the user has
+   * not paused it (hover/focus/touch). An active error card is never
+   * overwritten: media waits in the queue until the error collapses.
+   */
+  showMediaNotification: (trackId: string) => void;
   dismissNotification: () => void;
   pauseAutoDismiss: () => void;
   resumeAutoDismiss: () => void;
@@ -95,7 +108,15 @@ export const useDynamicIslandStore = create<DynamicIslandStore>((set, get) => ({
       key,
     };
 
-    if (!state.current || state.stage === "idle" || state.stage === "collapsing") {
+    // Errors take priority over a transient media card: replace it in place.
+    // During a collapse the pending promotion timer owns `current`, so the
+    // error queues instead of racing the collapse (this also removes the old
+    // latent bug where a collapse timeout could clear a just-shown item).
+    if (
+      !state.current ||
+      state.stage === "idle" ||
+      (state.current.kind === "media" && state.stage !== "collapsing")
+    ) {
       clearAllTimers();
       set({ current: newItem, stage: "initial" });
 
@@ -109,6 +130,63 @@ export const useDynamicIslandStore = create<DynamicIslandStore>((set, get) => ({
     // Queue with bounded capacity
     const boundedQueue = state.queue.length >= MAX_QUEUE_SIZE ? state.queue.slice(1) : state.queue;
     set({ queue: [...boundedQueue, newItem] });
+  },
+
+  showMediaNotification: (trackId) => {
+    if (!trackId) return;
+    const key = `media:${trackId}`;
+    const state = get();
+
+    if (state.queue.some((item) => item.key === key)) {
+      return;
+    }
+
+    // Same track already showing: dedupe frequent play/pause/seek events, but
+    // refresh the dismissal countdown so an explicitly re-triggered card stays
+    // visible — unless the user paused it via hover/focus/touch.
+    if (state.current?.key === key && state.stage !== "collapsing") {
+      if (state.stage === "expanded" && !isPaused) {
+        scheduleAutoDismiss(() => get().dismissNotification(), AUTO_DISMISS_DELAY_MS);
+      }
+      return;
+    }
+
+    const newItem: NotificationItem = {
+      kind: "media",
+      trackId,
+      title: "",
+      description: "",
+      id: `din-${++nextId}-${Date.now()}`,
+      key,
+    };
+
+    const presentItem = () => {
+      clearAllTimers();
+      set({ current: newItem, stage: "initial" });
+      expandTimeout = setTimeout(() => {
+        set({ stage: "expanded" });
+        scheduleAutoDismiss(() => get().dismissNotification(), AUTO_DISMISS_DELAY_MS);
+      }, EXPAND_DELAY_MS);
+    };
+
+    // Nothing on screen: present immediately.
+    if (!state.current || state.stage === "idle") {
+      presentItem();
+      return;
+    }
+
+    // Never overwrite an active error (or a card mid-collapse whose promotion
+    // timer owns `current`): the media item waits in the queue, and the latest
+    // media item replaces any previously queued media.
+    if (state.stage === "collapsing" || state.current.kind !== "media") {
+      const others = state.queue.filter((item) => item.kind !== "media");
+      const bounded = others.length >= MAX_QUEUE_SIZE ? others.slice(1) : others;
+      set({ queue: [...bounded, newItem] });
+      return;
+    }
+
+    // A different track started: replace the active media card in place.
+    presentItem();
   },
 
   dismissNotification: () => {

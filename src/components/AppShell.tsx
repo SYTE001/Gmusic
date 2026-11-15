@@ -209,7 +209,7 @@ export function AppShell() {
 
       <CreatePlaylistModal open={creatingPlaylist} onClose={() => setCreatingPlaylist(false)} />
 
-      <DynamicIslandNotification />
+      <DynamicIslandNotification onOpenQueue={() => setQueueOpen(true)} />
       <Toasts />
       <AriaLiveAnnouncer />
     </div>

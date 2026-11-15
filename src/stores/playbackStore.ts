@@ -31,6 +31,8 @@ import {
   resolveTrackSource,
 } from "../services/file-access/FileAccessService";
 import { perfMark, perfMeasure } from "../utils/perf";
+import { MediaSessionController } from "../services/audio/mediaSession";
+import { getArtworkUrl, loadArtworkUrl, subscribeArtwork } from "../services/artwork/artworkCache";
 
 /**
  * PlaybackStore — the single global playback state (PRD §7.6). One audio
@@ -79,7 +81,7 @@ type PlaybackActions = {
   playTrackFromContext(trackId: string, contextTrackIds: string[], context: PlaybackContext): void;
   startTrack(
     trackId: string,
-    options?: { startPositionMs?: number; autoplay?: boolean; requestPermission?: boolean; queueIndex?: number },
+    options?: { startPositionMs?: number; autoplay?: boolean; requestPermission?: boolean; queueIndex?: number; coalesce?: boolean },
   ): Promise<void>;
   togglePlay(): void;
   play(): void;
@@ -130,6 +132,86 @@ let loadToken = 0;
 let pendingSeekMs: number | null = null;
 let lastStartTrackAt = 0;
 let preloadedForTrackId: string | null = null;
+let mediaSession: MediaSessionController | null = null;
+let stopMediaSession: (() => void) | null = null;
+let stopMediaArtwork: (() => void) | null = null;
+let playRequestToken = 0;
+
+function clearMediaArtwork(): void {
+  stopMediaArtwork?.();
+  stopMediaArtwork = null;
+}
+
+function syncMediaSession(): void {
+  if (!mediaSession) return;
+  const state = usePlaybackStore.getState();
+  const engine = state.engine;
+  const sourceIsCurrent = state.status !== "loading" || acceptedSourceGeneration === engine?.sourceGeneration;
+  const duration = engine?.durationSec;
+  mediaSession.syncPlayback(state.isPlaying, sourceIsCurrent && duration !== null && duration !== undefined
+    ? { duration, position: engine?.currentTimeSec ?? 0, playbackRate: engine?.element?.playbackRate ?? 1 }
+    : undefined);
+}
+
+function initMediaSession(): void {
+  if (mediaSession) return;
+  mediaSession = new MediaSessionController({
+    play: () => usePlaybackStore.getState().play(),
+    pause: () => usePlaybackStore.getState().pause(),
+    previous: () => usePlaybackStore.getState().previous(),
+    next: () => usePlaybackStore.getState().next(true),
+    seek: (seconds) => usePlaybackStore.getState().seek(seconds * 1000),
+    seekBy: (seconds) => usePlaybackStore.getState().seekBy(seconds * 1000),
+  });
+  stopMediaSession = usePlaybackStore.subscribe((state, previous) => {
+    if (state.currentTrackId !== previous.currentTrackId || (state.status === "loading" && previous.status !== "loading")) {
+      clearMediaArtwork();
+      mediaSession?.clear();
+    }
+    if (!state.currentTrackId) {
+      if (previous.currentTrackId) {
+        clearMediaArtwork();
+        mediaSession?.clear();
+      }
+      return;
+    }
+    if (state.isPlaying !== previous.isPlaying || state.status !== previous.status ||
+      state.durationMs !== previous.durationMs || state.currentTimeMs !== previous.currentTimeMs) {
+      syncMediaSession();
+    }
+  });
+}
+
+function disposeMediaSession(): void {
+  clearMediaArtwork();
+  stopMediaSession?.();
+  stopMediaSession = null;
+  mediaSession?.dispose();
+  mediaSession = null;
+}
+
+function publishMediaTrack(track: Track, token: number): void {
+  if (!mediaSession) return;
+  clearMediaArtwork();
+  mediaSession.setTrack(track, getArtworkUrl(track.id));
+  stopMediaArtwork = subscribeArtwork(track.id, (url) => {
+    if (token === loadToken && usePlaybackStore.getState().currentTrackId === track.id) mediaSession?.setArtwork(url);
+  });
+  // Artwork resolution never delays play() or the native ended -> next path.
+  void loadArtworkUrl(track).then((url) => {
+    if (token === loadToken && usePlaybackStore.getState().currentTrackId === track.id) mediaSession?.setArtwork(url);
+  }).catch((error: unknown) => {
+    console.warn("Could not load artwork for the media notification", error);
+  });
+  syncMediaSession();
+}
+
+function showMediaNotification(): void {
+  const state = usePlaybackStore.getState();
+  if (state.currentTrackId && state.status === "ready") {
+    useDynamicIslandStore.getState().showMediaNotification(state.currentTrackId);
+  }
+}
 
 function scheduleIdleSideEffect(task: () => void): void {
   if (typeof window !== "undefined" && "requestIdleCallback" in window) {
@@ -228,7 +310,10 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
     onSeeked: () => get().syncFromEngine(),
     onEnded: () => get().handleEngineEnded(),
     onError: (failure) => get().handleEngineError(failure),
-    onDispose: () => releaseActiveTrackSource(),
+    onDispose: () => {
+      disposeMediaSession();
+      releaseActiveTrackSource();
+    },
   };
 }
 
@@ -322,6 +407,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
   setEngineForTests: (engine) => {
     const current = get().engine;
+    disposeMediaSession();
     current?.dispose();
     releaseActiveTrackSource();
     acceptedSourceGeneration = null; // fresh engine, fresh generation space
@@ -339,6 +425,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       acceptedSourceGeneration = null;
       set({ engine });
     }
+    initMediaSession();
     return engine;
   },
 
@@ -362,8 +449,11 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
   startTrack: async (trackId, options) => {
     const token = ++loadToken;
+    playRequestToken += 1;
+    clearMediaArtwork();
+    mediaSession?.clear();
     const now = typeof performance !== "undefined" ? performance.now() : Date.now();
-    const isRapidSkip = !options?.requestPermission && lastStartTrackAt > 0 && now - lastStartTrackAt < RAPID_SKIP_COALESCE_WINDOW_MS;
+    const isRapidSkip = options?.coalesce !== false && !options?.requestPermission && lastStartTrackAt > 0 && now - lastStartTrackAt < RAPID_SKIP_COALESCE_WINDOW_MS;
     lastStartTrackAt = now;
     preloadedForTrackId = null;
 
@@ -372,7 +462,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     // From this moment, any media event from the still-loaded previous
     // source is stale: this attempt owns the engine's next generation.
     acceptedSourceGeneration = expectNextSourceGeneration();
-    const { autoplay = true, startPositionMs, requestPermission, queueIndex } = options ?? {};
+    const { autoplay = true, startPositionMs, requestPermission, queueIndex, coalesce = true } = options ?? {};
     pendingSeekMs = startPositionMs ?? null;
     // Any explicit start consumes a pending session-resume so a later Play
     // cannot resurrect a stale position for a different attempt.
@@ -413,7 +503,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     // triggered this start (Chromium requires activation for the prompt).
     const shouldRequestPermission =
       requestPermission ??
-      (autoplay && !isRapidSkip && (track.accessMode === "handle" || track.availability === "permission-required"));
+      (coalesce && autoplay && !isRapidSkip && (track.accessMode === "handle" || track.availability === "permission-required"));
     if (shouldRequestPermission) {
       const regained = await regainHandleAccess(track);
       if (token !== loadToken) return;
@@ -545,6 +635,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const engine = get().getEngine();
     engine.setSource(resolved.url);
     recordActiveSourceGeneration();
+    publishMediaTrack(track, token);
 
     const commitPostStartSideEffects = () => {
       scheduleIdleSideEffect(() => {
@@ -560,19 +651,30 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     };
 
     if (autoplay) {
+      const playToken = ++playRequestToken;
       try {
         await engine.play();
         perfMeasure("skip:audio-src-to-canplay", `skip:audio-src-to-canplay:start:${token}`, `skip:audio-src-to-canplay:end:${token}`);
         if (token !== loadToken) return;
+        if (playToken !== playRequestToken) {
+          set({ status: "ready" });
+          commitPostStartSideEffects();
+          return;
+        }
         set({
           isPlaying: true,
           status: "ready",
           announcement: `Playing ${track.title} by ${track.artist || "unknown artist"}`,
         });
+        showMediaNotification();
         perfMeasure("skip:total", `skip:start:${token}`, `skip:end:${token}`);
         commitPostStartSideEffects();
       } catch (error) {
         if (token !== loadToken) return;
+        if (playToken !== playRequestToken) {
+          set({ status: "ready" });
+          return;
+        }
         if (error instanceof AutoplayBlockedError) {
           set({
             autoplayBlocked: true,
@@ -634,13 +736,17 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       return;
     }
     const engine = state.getEngine();
-    set({ isPlaying: true, autoplayBlocked: false });
+    const token = ++playRequestToken;
+    const sourceToken = loadToken;
     void engine
       .play()
       .then(() => {
+        if (token !== playRequestToken || sourceToken !== loadToken) return;
         set({ isPlaying: true, autoplayBlocked: false });
+        showMediaNotification();
       })
       .catch((error: unknown) => {
+        if (token !== playRequestToken || sourceToken !== loadToken) return;
         if (error instanceof AutoplayBlockedError) {
           set({ isPlaying: false, autoplayBlocked: true, announcement: "Playback blocked by the browser. Press play to start." });
           const currentTrack = playbackHelpers.currentTrack();
@@ -664,7 +770,9 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const state = get();
     if (!state.currentTrackId) return;
     state.getEngine().pause();
+    playRequestToken += 1;
     set({ isPlaying: false });
+    showMediaNotification();
     void playbackHelpers.persistPosition();
   },
 
@@ -681,7 +789,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       set({ isPlaying: false, status: "ended" });
       return;
     }
-    void get().startTrack(state.queueTrackIds[target], { autoplay: true, queueIndex: target });
+    void get().startTrack(state.queueTrackIds[target], { autoplay: true, queueIndex: target, coalesce: userInitiated });
   },
 
   previous: () => {
@@ -705,16 +813,19 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
   seek: (ms) => {
     const state = get();
-    if (!state.currentTrackId || state.durationMs === null) return;
+    if (!state.currentTrackId || state.status === "loading" || state.status === "error" || state.durationMs === null || !Number.isFinite(ms)) return;
     const clamped = clamp(ms, 0, state.durationMs);
     state.getEngine().seekSec(clamped / 1000);
     set({ currentTimeMs: clamped });
+    syncMediaSession();
+    showMediaNotification();
     void playbackHelpers.persistPosition();
   },
 
   seekBy: (deltaMs) => {
     const state = get();
-    get().seek(state.currentTimeMs + deltaMs);
+    const positionMs = state.engine ? state.engine.currentTimeSec * 1000 : state.currentTimeMs;
+    get().seek(positionMs + deltaMs);
   },
 
   syncFromEngine: () => {
@@ -725,7 +836,8 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const engineMs = engine.currentTimeSec * 1000;
     // Only correct meaningful drift: timeupdate already keeps this fresh.
     if (Math.abs(engineMs - state.currentTimeMs) > 750) {
-      usePlaybackStore.setState({ currentTimeMs: engineMs });
+    usePlaybackStore.setState({ currentTimeMs: engineMs });
+      syncMediaSession();
     }
   },
 
@@ -830,14 +942,24 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const state = get();
     if (state.repeatMode === "one") {
       state.getEngine().seekSec(0);
-      void state.getEngine().play().catch(() => {
-        set({ autoplayBlocked: true });
+      syncMediaSession();
+      const token = ++playRequestToken;
+      const sourceToken = loadToken;
+      void state.getEngine().play().catch((error: unknown) => {
+        if (token !== playRequestToken || sourceToken !== loadToken) return;
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (error instanceof AutoplayBlockedError) {
+          set({ isPlaying: false, autoplayBlocked: true });
+        } else {
+          get().handleEngineError({ code: 0, message: error instanceof Error ? error.message : String(error) });
+        }
       });
       return;
     }
     // Landed on the true final position before deciding what's next, so the
     // bar rests at the end by construction instead of jumping there.
     get().syncFromEngine();
+    syncMediaSession();
     get().next(false);
   },
 
@@ -860,6 +982,8 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     if (track) {
       void diagnoseTrackSource(track, `MediaError(${failure.code}): ${failure.message}`);
     }
+    // MediaError code 1 is transition noise; all other failures invalidate playback promises.
+    playRequestToken += 1;
     loadToken += 1; // invalidate any in-flight loads
     const errorInfo = describeFailureForTrack(failure, track);
     set({
