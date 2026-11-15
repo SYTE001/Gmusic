@@ -66,12 +66,23 @@ export function describeMediaError(code: number): string {
 export class HtmlAudioEngine implements AudioEngine {
   private readonly audio: HTMLAudioElement;
   private readonly events: EngineEvents;
+  /** Aborts every element and document listener on dispose. */
+  private readonly listenerController = new AbortController();
   private sourceGenerationValue = 0;
+  private playing = false;
+  private disposed = false;
+  private wakeLockSentinel: WakeLockSentinel | null = null;
+  private wakeLockPending = false;
 
   constructor(events: EngineEvents) {
     this.events = events;
     this.audio = new Audio();
     this.audio.preload = "auto";
+    // Inline playback (no fullscreen takeover) and invisible mounting keep
+    // the one shared element out of the layout while it stays in the DOM.
+    this.audio.setAttribute("playsinline", "true");
+    this.audio.hidden = true;
+    document.body?.appendChild(this.audio);
     this.bindEvents();
   }
 
@@ -84,17 +95,33 @@ export class HtmlAudioEngine implements AudioEngine {
   }
 
   private bindEvents(): void {
-    this.audio.addEventListener("timeupdate", () => this.events.onTimeUpdate(this.audio.currentTime));
-    this.audio.addEventListener("durationchange", () => this.events.onDurationChange(this.normalizeDuration(this.audio.duration)));
-    this.audio.addEventListener("loadedmetadata", () => this.events.onDurationChange(this.normalizeDuration(this.audio.duration)));
-    this.audio.addEventListener("play", () => this.events.onPlayStateChange(true));
-    this.audio.addEventListener("pause", () => this.events.onPlayStateChange(false));
-    this.audio.addEventListener("waiting", () => this.events.onBufferingChange(true));
-    this.audio.addEventListener("playing", () => this.events.onBufferingChange(false));
-    this.audio.addEventListener("canplay", () => this.events.onBufferingChange(false));
-    this.audio.addEventListener("seeked", () => this.events.onSeeked());
-    this.audio.addEventListener("ended", () => this.events.onEnded());
-    this.audio.addEventListener("error", () => {
+    const signal = this.listenerController.signal;
+    const on = (type: string, listener: () => void): void => {
+      this.audio.addEventListener(type, listener, { signal });
+    };
+    on("timeupdate", () => this.events.onTimeUpdate(this.audio.currentTime));
+    on("durationchange", () => this.events.onDurationChange(this.normalizeDuration(this.audio.duration)));
+    on("loadedmetadata", () => this.events.onDurationChange(this.normalizeDuration(this.audio.duration)));
+    on("play", () => {
+      this.playing = true;
+      this.tryAcquireWakeLock();
+      this.events.onPlayStateChange(true);
+    });
+    on("pause", () => {
+      this.playing = false;
+      this.releaseWakeLock();
+      this.events.onPlayStateChange(false);
+    });
+    on("waiting", () => this.events.onBufferingChange(true));
+    on("playing", () => this.events.onBufferingChange(false));
+    on("canplay", () => this.events.onBufferingChange(false));
+    on("seeked", () => this.events.onSeeked());
+    on("ended", () => {
+      this.playing = false;
+      this.releaseWakeLock();
+      this.events.onEnded();
+    });
+    on("error", () => {
       // An error event without a MediaError carries no information about the
       // current source — it surfaces from load() aborting an in-flight fetch
       // and must never become a fabricated code 0.
@@ -104,8 +131,60 @@ export class HtmlAudioEngine implements AudioEngine {
       // switching sources: the new source reports its own outcome, so an
       // abort is a transition, not a playback failure.
       if (mediaError.code === 1) return;
+      this.playing = false;
+      this.releaseWakeLock();
       this.events.onError({ code: mediaError.code, message: mediaError.message });
     });
+    // A screen wake lock only makes sense while the page is actually visible
+    // and something is playing; visibility flips bracket acquisition.
+    document.addEventListener(
+      "visibilitychange",
+      () => {
+        if (document.hidden) {
+          this.releaseWakeLock();
+        } else {
+          this.tryAcquireWakeLock();
+        }
+      },
+      { signal },
+    );
+  }
+
+  /**
+   * Screen wake lock, best effort: acquire only while actually playing on a
+   * visible document, release on pause/ended/error/hide/dispose. Request
+   * failures are swallowed — the API never influences playback. Note the
+   * API does not guarantee survival of real screen-off on every platform;
+   * it is a hint, not a promise.
+   */
+  private tryAcquireWakeLock(): void {
+    if (this.disposed || !this.playing || document.hidden) return;
+    if (this.wakeLockSentinel || this.wakeLockPending) return;
+    if (typeof navigator.wakeLock?.request !== "function") return;
+    this.wakeLockPending = true;
+    navigator.wakeLock
+      .request("screen")
+      .then((sentinel) => {
+        this.wakeLockPending = false;
+        // The request may outlive the intent that started it: honor the
+        // engine state at resolution time, not at request time.
+        if (this.disposed || !this.playing || document.hidden) {
+          void sentinel.release().catch(() => undefined);
+          return;
+        }
+        this.wakeLockSentinel = sentinel;
+      })
+      .catch(() => {
+        this.wakeLockPending = false;
+      });
+  }
+
+  private releaseWakeLock(): void {
+    const sentinel = this.wakeLockSentinel;
+    this.wakeLockSentinel = null;
+    if (sentinel) {
+      void sentinel.release().catch(() => undefined);
+    }
   }
 
   private normalizeDuration(duration: number): number | null {
@@ -115,6 +194,10 @@ export class HtmlAudioEngine implements AudioEngine {
   setSource(url: string | null): void {
     this.sourceGenerationValue += 1;
     if (url === null) {
+      // No source means nothing can be playing; drop the wake lock now so a
+      // later visibility flip cannot silently reacquire it for dead media.
+      this.playing = false;
+      this.releaseWakeLock();
       this.audio.removeAttribute("src");
       this.audio.load();
       return;
@@ -162,9 +245,16 @@ export class HtmlAudioEngine implements AudioEngine {
 
   dispose(): void {
     this.sourceGenerationValue += 1;
+    this.disposed = true;
+    this.playing = false;
+    // Abort every element/document listener first so cleanup events fired by
+    // load() below cannot re-enter the (possibly store-owned) callbacks.
+    this.listenerController.abort();
+    this.releaseWakeLock();
     this.audio.pause();
     this.audio.removeAttribute("src");
     this.audio.load();
+    this.audio.remove();
     this.events.onDispose?.();
   }
 }
