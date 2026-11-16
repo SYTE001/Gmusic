@@ -575,7 +575,7 @@ export function DynamicIslandNotification({ onOpenQueue }: { onOpenQueue?: () =>
     <div
       role="alert"
       aria-live="assertive"
-      className="pointer-events-none fixed top-3 left-1/2 z-50 flex w-full -translate-x-1/2 items-center justify-center px-4 md:top-4"
+      className="pointer-events-none fixed top-4 left-1/2 z-50 hidden w-full -translate-x-1/2 items-center justify-center px-4 min-[900px]:flex"
     >
       <div
         role="button"

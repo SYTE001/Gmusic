@@ -61,7 +61,7 @@ export function AppShell() {
       <div className="flex min-h-0 flex-1">
         {/* Desktop sidebar (collapsible to an icon rail) */}
         <aside
-          className={`hidden shrink-0 flex-col border-r bg-surface transition-[width] duration-200 ease-out min-[900px]:flex ${
+          className={`hidden min-h-0 shrink-0 overflow-y-auto overscroll-contain border-r bg-surface transition-[width] duration-200 ease-out min-[900px]:block ${
             sidebarCollapsed ? "w-[76px]" : "w-60"
           }`}
           style={{ borderColor: "var(--border-subtle)" }}
@@ -104,13 +104,10 @@ export function AppShell() {
               </button>
             </div>
           )}
-          <div className="flex min-h-0 flex-1 flex-col">
-            <SidebarContent
-              collapsed={sidebarCollapsed}
-              onExpand={() => applySidebarCollapsed(false)}
-              onOpenCommandPalette={() => setPaletteOpen(true)}
-            />
-          </div>
+          <SidebarContent
+            collapsed={sidebarCollapsed}
+            onExpand={() => applySidebarCollapsed(false)}
+          />
           {!sidebarCollapsed && (
             <div className="border-t" style={{ borderColor: "var(--border-subtle)" }}>
               <CloudBadge compact />
@@ -174,27 +171,21 @@ export function AppShell() {
       {drawerOpen && (
         <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Navigation">
           <div className="absolute inset-0 animate-overlay-in" style={{ background: "var(--scrim)" }} onClick={() => setDrawerOpen(false)} />
-          <div className="absolute inset-y-0 left-0 flex w-[280px] flex-col animate-fade-in border-r bg-surface" style={{ borderColor: "var(--border-subtle)" }}>
+          <div className="absolute inset-y-0 left-0 w-[280px] overflow-y-auto overscroll-contain animate-fade-in border-r bg-surface" style={{ borderColor: "var(--border-subtle)" }}>
             <div className="flex items-center justify-between px-4 py-3.5">
               <span className="text-sm font-semibold">{APP_NAME}</span>
               <button type="button" className="icon-btn size-8" aria-label="Close navigation" onClick={() => setDrawerOpen(false)}>
                 <CloseIcon size={16} />
               </button>
             </div>
-            <div className="min-h-0 flex-1">
-              <SidebarContent
-                showSearch={false}
-                onSearchActivate={() => {
-                  setDrawerOpen(false);
-                  // Let the drawer unmount first so the top-bar field is visible.
-                  window.setTimeout(focusVisibleSearch, 80);
-                }}
-                onOpenCommandPalette={() => {
-                  setDrawerOpen(false);
-                  setPaletteOpen(true);
-                }}
-              />
-            </div>
+            <SidebarContent
+              showSearch={false}
+              onSearchActivate={() => {
+                setDrawerOpen(false);
+                // Let the drawer unmount first so the top-bar field is visible.
+                window.setTimeout(focusVisibleSearch, 80);
+              }}
+            />
           </div>
         </div>
       )}

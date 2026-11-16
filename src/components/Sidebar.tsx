@@ -73,7 +73,6 @@ export function SidebarContent({
   collapsed = false,
   onExpand,
   onSearchActivate,
-  onOpenCommandPalette,
 }: {
   showSearch?: boolean;
   collapsed?: boolean;
@@ -81,8 +80,6 @@ export function SidebarContent({
   onExpand?: () => void;
   /** Mobile drawer: close the drawer, then focus the top-bar search field. */
   onSearchActivate?: () => void;
-  /** Optional trigger to open the global Command Palette. */
-  onOpenCommandPalette?: () => void;
 }) {
   recordComponentRender("SidebarContent");
   const playlists = useLibraryStore((state) => state.playlists);
@@ -120,7 +117,7 @@ export function SidebarContent({
     : "nav-item relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-surface-hover hover:text-text-primary";
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="pb-2">
       {showSearch && !collapsed && (
         <div className="px-3 pb-3 pt-1">
           <SearchField />
@@ -176,37 +173,16 @@ export function SidebarContent({
           <SearchIcon size={19} />
           {!collapsed && <span>Search</span>}
         </button>
-        {onOpenCommandPalette && (
-          <button
-            type="button"
-            onClick={onOpenCommandPalette}
-            className={searchRowClass}
-            aria-label="Quick Actions"
-            title={collapsed ? "Quick Actions (Ctrl+K)" : "Open Command Palette (Ctrl+K)"}
-          >
-            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-              <path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z" />
-            </svg>
-            {!collapsed && (
-              <>
-                <span className="flex-1 text-left">Quick Actions</span>
-                <span className="kbd-hint inline-flex" aria-hidden>
-                  Ctrl+K
-                </span>
-              </>
-            )}
-          </button>
-        )}
       </nav>
 
       <div className="mx-3 my-3 border-t" style={{ borderColor: "var(--border-subtle)" }} />
 
       {!collapsed && (
-        <div className="flex min-h-0 flex-1 flex-col px-3">
+        <div className="px-3">
           <div className="px-1 pb-1">
             <span className="text-[11px] font-semibold uppercase tracking-wider text-text-muted">Playlists</span>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto pb-2" role="list" aria-label="Your playlists">
+          <div className="pb-2" role="list" aria-label="Your playlists">
             <div role="listitem" className="contents">
               <button
                 type="button"
@@ -241,7 +217,7 @@ export function SidebarContent({
       )}
 
       {collapsed && (
-        <div className="flex min-h-0 flex-1 flex-col items-center gap-1 overflow-y-auto px-2 pb-2">
+        <div className="flex flex-col items-center gap-1 px-2 pb-2">
           <button
             type="button"
             className="icon-btn"

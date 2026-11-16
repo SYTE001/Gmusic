@@ -121,6 +121,13 @@ describe("Sidebar (redesign layout)", () => {
     expect(playlistLink.textContent ?? "").not.toContain("Road Trip");
   });
 
+  it.each([false, true])("omits Quick Actions with collapsed=%s", (collapsed) => {
+    renderSidebar({ collapsed });
+    expect(screen.queryByRole("button", { name: /Quick Actions/i })).toBeNull();
+    expect(screen.getByRole("link", { name: "Recent" }).getAttribute("href")).toBe("/recent");
+    expect(screen.getByRole("link", { name: "Settings" }).getAttribute("href")).toBe("/settings");
+  });
+
   it("shows a hint when there are no playlists", async () => {
     useLibraryStore.setState({ playlists: [] });
     renderSidebar();

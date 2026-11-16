@@ -123,7 +123,7 @@ describe("CommandPalette integration in AppShell", () => {
     renderShell();
     expect(screen.queryByRole("dialog", { name: "Command Palette" })).toBeNull();
 
-    const triggerBtn = screen.getByRole("button", { name: "Quick Actions" });
+    const triggerBtn = screen.getByRole("button", { name: "Open Command Palette" });
     triggerBtn.focus();
     expect(document.activeElement).toBe(triggerBtn);
 
@@ -143,11 +143,22 @@ describe("CommandPalette integration in AppShell", () => {
     expect(screen.getByRole("dialog", { name: "Command Palette" })).toBeTruthy();
   });
 
-  it("opens via the visible Quick Actions button in the header/sidebar", () => {
+  it("opens via the Command Palette button in the mobile header", () => {
     renderShell();
-    const triggerBtn = screen.getByRole("button", { name: "Quick Actions" });
+    const triggerBtn = screen.getByRole("button", { name: "Open Command Palette" });
     fireEvent.click(triggerBtn);
     expect(screen.getByRole("dialog", { name: "Command Palette" })).toBeTruthy();
+  });
+
+  it("omits Quick Actions from the desktop sidebar and mobile drawer", () => {
+    renderShell();
+    expect(screen.queryByRole("button", { name: "Quick Actions" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open navigation" }));
+    const drawer = screen.getByRole("dialog", { name: "Navigation" });
+    expect(within(drawer).queryByRole("button", { name: "Quick Actions" })).toBeNull();
+    expect(within(drawer).getByRole("link", { name: "Recent" })).toBeTruthy();
+    expect(within(drawer).getByRole("link", { name: "Settings" })).toBeTruthy();
   });
 
   it("navigates results with ArrowDown/ArrowUp and activates with Enter", async () => {
