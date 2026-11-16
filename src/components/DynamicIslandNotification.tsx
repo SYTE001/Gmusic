@@ -383,7 +383,7 @@ function MediaIslandCard({
   const artist = track?.artist || "Unknown artist";
 
   return (
-    <div className="pointer-events-none fixed top-3 left-1/2 z-50 flex w-full -translate-x-1/2 items-center justify-center px-3 md:top-4">
+    <div className="pointer-events-none fixed top-3 left-1/2 z-50 hidden md:flex w-full -translate-x-1/2 items-center justify-center px-3 md:top-4">
       <div
         key={trackId}
         ref={cardRef}
