@@ -94,6 +94,22 @@ cd lyrics-lyricsdb-worker && npm install && npm run typecheck && npm test
 
 More detail: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
+### Windows desktop lyrics (Phase 2)
+
+The optional Tauri desktop build shares the web UI and its single HTML audio clock. Desktop discovery/parsing runs in Rust against the existing lrcmux, LRCLIB and LyricsDB APIs, with bounded concurrency/timeouts, metadata and duration validation, explicit ambiguity, and a versioned local discovery cache. Accepted lyrics, manual edits and per-track offsets remain in IndexedDB; SQLite is reserved for Phase 4. Saved lyrics continue to work offline. Online lookup sends track metadata only when the existing lyrics lookup setting/action allows it; audio is never uploaded by discovery.
+
+```bash
+npm ci
+npm run desktop:dev
+npm run desktop:build -- --debug --no-bundle
+# From src-tauri:
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+Windows requires Rust/MSVC Build Tools and WebView2. The web production command remains `npm run build` and does not require Rust. Details: [desktop architecture](docs/desktop/ARCHITECTURE.md) and [desktop tests](docs/desktop/TEST_STRATEGY.md).
+
 ## Environment variable setup
 
 Copy `.env.example` to `.env.local` (or `.env`) and fill in the browser-safe values:

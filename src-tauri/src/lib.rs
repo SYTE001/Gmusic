@@ -4,6 +4,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
+mod lyrics;
+
 const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "m4a", "m4b", "aac", "wav", "wave", "ogg", "oga", "opus", "flac", "weba", "webm", "mp4",
 ];
@@ -254,12 +256,15 @@ fn read_audio_file_slice(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(lyrics::LyricsEngine::new().expect("create lyrics engine"))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             inspect_audio_paths,
             scan_audio_folder,
             authorize_desktop_paths,
-            read_audio_file_slice
+            read_audio_file_slice,
+            lyrics::discover_desktop_lyrics,
+            lyrics::parse_desktop_lyrics
         ])
         .run(tauri::generate_context!())
         .expect("error while running Gmusic desktop application");

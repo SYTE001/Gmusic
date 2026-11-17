@@ -5,6 +5,12 @@ import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: {
+    watch: {
+      // Native build executables are locked by MSVC on Windows; Tauri owns them.
+      ignored: ["**/src-tauri/**"],
+    },
+  },
   build: {
     sourcemap: false,
     target: "es2020",

@@ -8,7 +8,7 @@ import { DB_SCHEMA_VERSION } from "../../types";
 import {
   clampLyricOffset,
   hasWordTimestamps,
-  parseLyricFile,
+  parseLyricFileForPlatform,
   readLyricFileText,
 } from "../../services/lyrics/lyricsService";
 import type { TrackLyrics } from "../../types";
@@ -364,7 +364,7 @@ export function LyricsView({ mobile = false }: { mobile?: boolean } = {}) {
     try {
       const text = await readLyricFileText(file);
       const existing = await repository.getLyrics(currentTrackId);
-      const parsed = parseLyricFile(currentTrackId, file.name, text);
+      const parsed = await parseLyricFileForPlatform(currentTrackId, file.name, text);
       const withOrigin: TrackLyrics = {
         ...parsed.lyrics,
         offsetMs: existing?.offsetMs ?? 0,

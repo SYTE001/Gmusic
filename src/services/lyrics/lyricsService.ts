@@ -9,6 +9,8 @@ import { artistSimilarity, decideMatch, type LyricMatchRecord, rankCandidates, t
 import { parseLyricsfile } from "./lyricsfile";
 import { normalizeTrackMetadata } from "../metadata/normalization";
 import { recordSearchDiagnostic, type ProviderDiagnostic } from "./lyricsDiagnostics";
+import { discoverDesktopLyrics, parseDesktopLyrics } from "../platform/lyrics";
+import { isTauriRuntime } from "../platform/desktop";
 
 /**
  * LyricsService — parses .lrc / .txt lyrics, applies per-track offsets, and
@@ -161,6 +163,16 @@ export function parseLyricFile(trackId: string, fileName: string, content: strin
       sourceName: fileName,
     },
     skippedLines,
+  };
+}
+
+/** One bounded native parse per import/edit; rendering always uses local data. */
+export async function parseLyricFileForPlatform(trackId: string, fileName: string, content: string): Promise<ParseLyricsResult> {
+  const parsed = await parseDesktopLyrics(content);
+  if (!parsed) return parseLyricFile(trackId, fileName, content);
+  return {
+    lyrics: { trackId, sourceName: fileName, ...parsed, offsetMs: 0, updatedAt: Date.now() },
+    skippedLines: parsed.skippedLines,
   };
 }
 
@@ -397,6 +409,7 @@ export async function attachLrcmuxRecord(track: Track, record: LyricMatchRecord)
     checkedAt: Date.now(),
     recordId: record.id != null ? (typeof record.id === "number" ? record.id : null) : null,
     schemaVersion: DB_SCHEMA_VERSION,
+    ...(isTauriRuntime() ? { discoveryIdentity: desktopDiscoveryIdentity(track, {}) } : {}),
   });
   return lyrics;
 }
@@ -456,6 +469,7 @@ async function persistAttached(
   lyrics: TrackLyrics,
   record: LyricMatchRecord,
   onProgress?: (phase: ResolutionPhase) => void,
+  discoveryIdentity?: string,
 ): Promise<TrackLyrics> {
   onProgress?.("saving");
   await repository.putLyrics(lyrics);
@@ -465,6 +479,7 @@ async function persistAttached(
     checkedAt: Date.now(),
     recordId: typeof record.id === "number" ? record.id : null,
     schemaVersion: DB_SCHEMA_VERSION,
+    ...(discoveryIdentity ? { discoveryIdentity } : {}),
   });
   notifyLyricsResolved(track.id, lyrics);
   return lyrics;
@@ -499,6 +514,7 @@ async function markUpgradeChecked(trackId: string): Promise<void> {
     checkedAt: Date.now(),
     recordId: meta?.recordId ?? null,
     schemaVersion: DB_SCHEMA_VERSION,
+    ...(meta?.discoveryIdentity ? { discoveryIdentity: meta.discoveryIdentity } : {}),
   });
 }
 
@@ -825,6 +841,50 @@ export type ResolveLyricsOptions = {
 export const TOTAL_SEARCH_BUDGET_MS = 14_000;
 let totalSearchBudgetMs = TOTAL_SEARCH_BUDGET_MS;
 
+function desktopDiscoveryIdentity(track: Track, options: ResolveLyricsOptions): string {
+  return JSON.stringify([1, track.title, track.artist, track.album, track.durationMs, [...(options.providers ?? defaultProviders)].sort()]);
+}
+
+async function resolveNativeLyrics(
+  track: Track,
+  canonicalTrack: Track,
+  options: ResolveLyricsOptions,
+  context: { cached: TrackLyrics | null; minCapabilityRank: number; keepOnMiss: boolean },
+): Promise<LyricsResolution | null> {
+  const native = await discoverDesktopLyrics(canonicalTrack, {
+    providers: options.providers ?? defaultProviders, force: options.force, signal: options.signal,
+  });
+  if (!native) return null;
+  if (options.signal?.aborted) throw new DOMException("Request cancelled.", "AbortError");
+  const identity = desktopDiscoveryIdentity(track, options);
+  options.onProgress?.("validating");
+  // Re-read before attaching: an import/edit/offset change during discovery
+  // must not be overwritten by a stale result built from the initial document.
+  const latest = (await repository.getLyrics(track.id)) ?? null;
+  if (latest?.origin?.kind === "manual" && (!options.force || latest.updatedAt !== context.cached?.updatedAt)) {
+    return { outcome: "cached", lyrics: latest };
+  }
+  const cached = latest ?? context.cached;
+  for (const candidate of native.candidates) {
+    if (!candidate.autoAcceptable) continue;
+    const floor = Math.max(context.minCapabilityRank, cached ? CAPABILITY_RANK[detectLyricsCapability(cached)] : 0);
+    const considered = considerRecord(canonicalTrack, candidate.record, cached, floor);
+    if (!considered) continue;
+    if (options.signal?.aborted) throw new DOMException("Request cancelled.", "AbortError");
+    const lyrics = await persistAttached(track, considered.lyrics, candidate.record, options.onProgress, identity);
+    return { outcome: "attached", lyrics };
+  }
+  if (cached && context.keepOnMiss) return { outcome: "cached", lyrics: cached };
+  if (native.candidates.length > 0) {
+    await repository.putLyricsCacheMeta({ trackId: track.id, status: "needs-selection", checkedAt: Date.now(), recordId: null, schemaVersion: DB_SCHEMA_VERSION, discoveryIdentity: identity });
+    return { outcome: "needs-selection", candidates: native.candidates };
+  }
+  if (native.offline) return { outcome: "offline" };
+  if (native.errors.length > 0) return { outcome: "error", message: native.errors.join(" ") };
+  await repository.putLyricsCacheMeta({ trackId: track.id, status: "not-found", checkedAt: Date.now(), recordId: null, schemaVersion: DB_SCHEMA_VERSION, discoveryIdentity: identity });
+  return { outcome: "not-found" };
+}
+
 async function resolveLyrics(
   track: Track,
   options: ResolveLyricsOptions,
@@ -850,6 +910,11 @@ async function resolveLyrics(
   };
 
   options.onProgress?.("searching");
+
+  if (isTauriRuntime()) {
+    const native = await resolveNativeLyrics(track, canonicalTrack, options, context);
+    if (native) return native;
+  }
 
   const activeProviders = options.providers ?? defaultProviders;
   const allCollectedRecords: LyricMatchRecord[] = [];
@@ -1127,7 +1192,7 @@ export async function resolveLyricsForTrack(
 ): Promise<LyricsResolution> {
   const { force = false } = options;
 
-  if (!force) {
+  if (!force && !isTauriRuntime()) {
     const pending = inFlightResolutions.get(track.id);
     if (pending) {
       return pending;
@@ -1142,8 +1207,11 @@ export async function resolveLyricsForTrack(
     // silently replace them. Records without any origin are legacy API caches:
     // their capability is inferred from the payload and they remain upgradable.
     const cachedIsManual = cached?.origin?.kind === "manual";
+    const desktop = isTauriRuntime();
+    const cacheMeta = desktop ? await repository.getLyricsCacheMeta(track.id) : undefined;
+    const identityChanged = desktop && cacheMeta?.discoveryIdentity !== desktopDiscoveryIdentity(track, options);
 
-    if (cached && !force) {
+    if (cached && !force && (cachedIsManual || !identityChanged)) {
       if (typeof navigator !== "undefined" && navigator.onLine === false) {
         return { outcome: "cached", lyrics: cached };
       }
@@ -1174,7 +1242,7 @@ export async function resolveLyricsForTrack(
 
     // 2. Negative cache: skip recently failed lookups instead of hammering the
     //    API. Only meaningful when there are no (usable) lyrics to protect.
-    if (!force) {
+    if (!force && !identityChanged) {
       const meta = await repository.getLyricsCacheMeta(track.id);
       if (meta) {
         if (meta.status === "accepted" && !cached) {
@@ -1185,7 +1253,7 @@ export async function resolveLyricsForTrack(
       }
     }
 
-    if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    if (!desktop && typeof navigator !== "undefined" && navigator.onLine === false) {
       return { outcome: "offline" };
     }
 
@@ -1203,7 +1271,7 @@ export async function resolveLyricsForTrack(
   try {
     return await promise;
   } finally {
-    inFlightResolutions.delete(track.id);
+    if (inFlightResolutions.get(track.id) === promise) inFlightResolutions.delete(track.id);
   }
 }
 
