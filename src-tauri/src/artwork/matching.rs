@@ -14,6 +14,24 @@ pub struct ArtworkQuery {
     pub duration_ms: Option<i64>,
 }
 
+impl ArtworkQuery {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.len() > 2048
+            || self.title.len() > 2048
+            || self.artist.len() > 2048
+            || self.album.len() > 2048
+        {
+            return Err("Artwork query field exceeds maximum length of 2048 bytes.".into());
+        }
+        if let Some(d) = self.duration_ms {
+            if !(0..=86_400_000).contains(&d) {
+                return Err("Artwork query durationMs out of valid range.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MbAlias {
@@ -370,6 +388,14 @@ pub fn get_album_artwork_cache_key(query: &ArtworkQuery) -> String {
         return get_artwork_cache_key(&norm);
     }
     format!("album::{primary_artist}::{clean_album}")
+}
+
+pub fn compute_query_fingerprint(query: &ArtworkQuery) -> String {
+    format!(
+        "{}|{}",
+        get_album_artwork_cache_key(query),
+        get_artwork_cache_key(query)
+    )
 }
 
 pub fn normalize_core_title(raw: &str) -> String {

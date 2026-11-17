@@ -421,18 +421,24 @@ function writeToUnifiedCache(
 /**
  * Evicts a broken or invalidated artwork cache entry for a track.
  */
-export function invalidateArtworkCacheForTrack(track: {
-  id?: string;
-  title: string;
-  artist: string;
-  album?: string;
-}): void {
+export function invalidateArtworkCacheForTrack(
+  track: {
+    id?: string;
+    title: string;
+    artist: string;
+    album?: string;
+  },
+  options?: { includeAlbum?: boolean; markUrlFailed?: boolean },
+): void {
+  const includeAlbum = options?.includeAlbum ?? true;
+  const shouldMarkFailed = options?.markUrlFailed ?? true;
   if (isTauriRuntime()) {
     void invalidateDesktopArtworkCache({
       trackId: track.id,
       title: track.title,
       artist: track.artist,
       album: track.album,
+      includeAlbum,
     });
   }
   const norm = normalizeTrackMetadata({
@@ -444,23 +450,25 @@ export function invalidateArtworkCacheForTrack(track: {
   });
 
   const keys = new Set<string>([
-    getAlbumArtworkCacheKey(track),
     getArtworkCacheKey(track),
-    getAlbumArtworkCacheKey({ title: norm.title, artist: norm.artist, album: norm.album }),
     getArtworkCacheKey({ title: norm.title, artist: norm.artist }),
   ]);
+  if (includeAlbum) {
+    keys.add(getAlbumArtworkCacheKey(track));
+    keys.add(getAlbumArtworkCacheKey({ title: norm.title, artist: norm.artist, album: norm.album }));
+  }
 
   for (const key of keys) {
     if (!key) continue;
     const mem = memoryCache.get(key);
-    if (mem?.url) {
+    if (shouldMarkFailed && mem?.url) {
       markArtworkUrlFailed(mem.url);
     }
     memoryCache.delete(key);
     transientBackoffUntil.delete(key);
     try {
       const rawV2 = localStorage.getItem(`${UNIFIED_CACHE_PREFIX}${key}`);
-      if (rawV2) {
+      if (shouldMarkFailed && rawV2) {
         try {
           const parsed = JSON.parse(rawV2) as { url?: string | null };
           if (parsed?.url) markArtworkUrlFailed(parsed.url);
@@ -1298,8 +1306,11 @@ export async function resolveArtworkForTrack(
     };
   }
 
+  const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
+
   // 2. Check unified artwork cache unless performing explicit force-refresh recovery
-  if (!forceRefresh) {
+  // (on Desktop when offline, prefer native disk-cached blobs over remote URLs in localStorage)
+  if (!forceRefresh && !(isOffline && isTauriRuntime() && !includeDiagnostics)) {
     const cached = getCachedArtworkEntry(track);
     if (cached !== undefined) {
       return {
@@ -1332,7 +1343,6 @@ export async function resolveArtworkForTrack(
     return existingInFlight;
   }
 
-  const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
   if (isOffline && !isTauriRuntime()) {
     return { url: undefined, source: "none" };
   }

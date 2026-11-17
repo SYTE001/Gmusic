@@ -8,6 +8,7 @@ pub const MIN_EMBEDDED_ARTWORK_BYTES: usize = 64;
 const ID3_SCAN_LIMIT: usize = 24 * 1024 * 1024;
 const MP4_SCAN_LIMIT: usize = 8 * 1024 * 1024;
 const OGG_SCAN_LIMIT: usize = 8 * 1024 * 1024;
+const INITIAL_ALLOC_CAP: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedArtwork {
@@ -49,13 +50,35 @@ fn syncsafe_u32(b: &[u8]) -> usize {
         | ((b[3] & 0x7f) as usize)
 }
 
+fn decode_unsynchronized(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0usize;
+    while i < data.len() {
+        out.push(data[i]);
+        if data[i] == 0xff && i + 1 < data.len() && data[i + 1] == 0x00 {
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn read_bounded(file: &mut File, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::with_capacity(max_bytes.min(INITIAL_ALLOC_CAP));
+    file.take(max_bytes as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    Ok(buf)
+}
+
 fn skip_encoded_string(body: &[u8], pos: usize, encoding: u8) -> Option<usize> {
     if pos >= body.len() {
         return None;
     }
     if encoding == 1 || encoding == 2 {
         let mut cur = pos;
-        while cur + 1 < body.len() {
+        while cur.checked_add(1)? < body.len() {
             if body[cur] == 0 && body[cur + 1] == 0 {
                 return Some(cur + 2);
             }
@@ -101,10 +124,31 @@ fn parse_id3_pic2(body: &[u8]) -> Option<ExtractedArtwork> {
     })
 }
 
-fn parse_id3_apic(body: &[u8], flags: u16, major_version: u8) -> Option<ExtractedArtwork> {
-    let mut slice = body;
+fn parse_id3_apic(
+    body: &[u8],
+    frame_flags: u16,
+    tag_flags: u8,
+    major_version: u8,
+) -> Option<ExtractedArtwork> {
+    // Reject compressed or encrypted frames safely
+    if major_version == 3 && (frame_flags & 0x00c0) != 0 {
+        return None;
+    }
+    if major_version == 4 && (frame_flags & 0x000c) != 0 {
+        return None;
+    }
+
+    let deunsync_owned: Option<Vec<u8>> =
+        if major_version == 4 && ((frame_flags & 0x0002) != 0 || (tag_flags & 0x80) != 0) {
+            Some(decode_unsynchronized(body))
+        } else {
+            None
+        };
+    let mut slice: &[u8] = deunsync_owned.as_deref().unwrap_or(body);
+
     // Handle ID3v2.4 data length indicator (flag 0x0001 in second flag byte)
-    if major_version == 4 && (flags & 0x0001) != 0 {
+    // or ID3v2.3 grouping/length prefix when present
+    if major_version == 4 && (frame_flags & 0x0001) != 0 {
         if slice.len() < 4 {
             return None;
         }
@@ -159,36 +203,62 @@ fn extract_from_id3v2(file: &mut File, file_len: u64) -> Result<Option<Extracted
         return Ok(None);
     }
     let flags = header[5];
+    // Reject experimental/unknown tag header flags in ID3v2.2 compression bit (0x40 in v2.2)
+    if major == 2 && (flags & 0x40) != 0 {
+        return Ok(None);
+    }
     let tag_size = syncsafe_u32(&header[6..10]);
     if tag_size == 0 {
         return Ok(None);
     }
-    let to_read = tag_size.min(ID3_SCAN_LIMIT).min((file_len - 10) as usize);
-    let mut buf = vec![0u8; to_read];
-    file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    let available = (file_len - 10).min(ID3_SCAN_LIMIT as u64) as usize;
+    let to_read = tag_size.min(available);
+    let raw_buf = read_bounded(file, to_read)?;
+    if raw_buf.is_empty() {
+        return Ok(None);
+    }
+
+    let buf = if major != 4 && (flags & 0x80) != 0 {
+        decode_unsynchronized(&raw_buf)
+    } else {
+        raw_buf
+    };
 
     let mut offset = 0usize;
-    if (flags & 0x40) != 0 {
-        if offset + 4 > buf.len() {
+    if major != 2 && (flags & 0x40) != 0 {
+        if offset.checked_add(4).is_none_or(|end| end > buf.len()) {
             return Ok(None);
         }
         let ext_size = if major == 4 {
             syncsafe_u32(&buf[offset..offset + 4])
         } else {
-            4 + u32::from_be_bytes([
+            (u32::from_be_bytes([
                 buf[offset],
                 buf[offset + 1],
                 buf[offset + 2],
                 buf[offset + 3],
-            ]) as usize
+            ]) as usize)
+                .saturating_add(4)
         };
-        offset = offset.saturating_add(ext_size);
+        if ext_size < 4 {
+            return Ok(None);
+        }
+        let Some(next_off) = offset.checked_add(ext_size) else {
+            return Ok(None);
+        };
+        if next_off > buf.len() {
+            return Ok(None);
+        }
+        offset = next_off;
     }
 
     let mut fallback_art: Option<ExtractedArtwork> = None;
 
     if major == 2 {
-        while offset + 6 <= buf.len() {
+        while let Some(hdr_end) = offset.checked_add(6) {
+            if hdr_end > buf.len() {
+                break;
+            }
             let id = &buf[offset..offset + 3];
             if !id
                 .iter()
@@ -199,11 +269,14 @@ fn extract_from_id3v2(file: &mut File, file_len: u64) -> Result<Option<Extracted
             let size = ((buf[offset + 3] as usize) << 16)
                 | ((buf[offset + 4] as usize) << 8)
                 | (buf[offset + 5] as usize);
-            if size == 0 || offset + 6 + size > buf.len() {
+            let Some(frame_end) = hdr_end.checked_add(size) else {
+                break;
+            };
+            if size == 0 || frame_end > buf.len() {
                 break;
             }
             if id == b"PIC" {
-                let body = &buf[offset + 6..offset + 6 + size];
+                let body = &buf[hdr_end..frame_end];
                 if let Some(art) = parse_id3_pic2(body) {
                     if art.picture_type == 3 {
                         return Ok(Some(art));
@@ -213,12 +286,15 @@ fn extract_from_id3v2(file: &mut File, file_len: u64) -> Result<Option<Extracted
                     }
                 }
             }
-            offset += 6 + size;
+            offset = frame_end;
         }
         return Ok(fallback_art);
     }
 
-    while offset + 10 <= buf.len() {
+    while let Some(hdr_end) = offset.checked_add(10) {
+        if hdr_end > buf.len() {
+            break;
+        }
         let id = &buf[offset..offset + 4];
         if !id
             .iter()
@@ -237,12 +313,15 @@ fn extract_from_id3v2(file: &mut File, file_len: u64) -> Result<Option<Extracted
             ]) as usize
         };
         let frame_flags = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]);
-        if size == 0 || offset + 10 + size > buf.len() {
+        let Some(frame_end) = hdr_end.checked_add(size) else {
+            break;
+        };
+        if size == 0 || frame_end > buf.len() {
             break;
         }
         if id == b"APIC" {
-            let body = &buf[offset + 10..offset + 10 + size];
-            if let Some(art) = parse_id3_apic(body, frame_flags, major) {
+            let body = &buf[hdr_end..frame_end];
+            if let Some(art) = parse_id3_apic(body, frame_flags, flags, major) {
                 if art.picture_type == 3 {
                     return Ok(Some(art));
                 }
@@ -251,7 +330,7 @@ fn extract_from_id3v2(file: &mut File, file_len: u64) -> Result<Option<Extracted
                 }
             }
         }
-        offset += 10 + size;
+        offset = frame_end;
     }
 
     Ok(fallback_art)
@@ -263,29 +342,41 @@ pub fn parse_flac_picture_bytes(data: &[u8]) -> Option<ExtractedArtwork> {
     }
     let pic_type = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u8;
     let mime_len = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    let mut pos = 8usize;
-    if pos.checked_add(mime_len)? + 4 > data.len() {
+    let pos = 8usize;
+    let mime_end = pos.checked_add(mime_len)?;
+    if mime_end.checked_add(4)? > data.len() {
         return None;
     }
-    let raw_mime = String::from_utf8_lossy(&data[pos..pos + mime_len])
+    let raw_mime = String::from_utf8_lossy(&data[pos..mime_end])
         .trim()
         .to_string();
-    pos += mime_len;
-    let desc_len =
-        u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos = pos.checked_add(4)?.checked_add(desc_len)?.checked_add(16)?;
-    if pos + 4 > data.len() {
+    let desc_len = u32::from_be_bytes([
+        data[mime_end],
+        data[mime_end + 1],
+        data[mime_end + 2],
+        data[mime_end + 3],
+    ]) as usize;
+    let img_len_pos = mime_end
+        .checked_add(4)?
+        .checked_add(desc_len)?
+        .checked_add(16)?;
+    let img_data_pos = img_len_pos.checked_add(4)?;
+    if img_data_pos > data.len() {
         return None;
     }
-    let img_len =
-        u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
+    let img_len = u32::from_be_bytes([
+        data[img_len_pos],
+        data[img_len_pos + 1],
+        data[img_len_pos + 2],
+        data[img_len_pos + 3],
+    ]) as usize;
+    let img_end = img_data_pos.checked_add(img_len)?;
     if !(MIN_EMBEDDED_ARTWORK_BYTES..=MAX_EMBEDDED_ARTWORK_BYTES).contains(&img_len)
-        || pos.checked_add(img_len)? > data.len()
+        || img_end > data.len()
     {
         return None;
     }
-    let img_bytes = &data[pos..pos + img_len];
+    let img_bytes = &data[img_data_pos..img_end];
     let mime_type = sniff_image_mime(img_bytes, &raw_mime)?;
     Some(ExtractedArtwork {
         bytes: img_bytes.to_vec(),
@@ -307,7 +398,10 @@ fn extract_from_flac(file: &mut File, file_len: u64) -> Result<Option<ExtractedA
     let mut fallback_art: Option<ExtractedArtwork> = None;
 
     for _ in 0..128 {
-        if offset + 4 > file_len {
+        let Some(data_start) = offset.checked_add(4) else {
+            break;
+        };
+        if data_start > file_len {
             break;
         }
         file.seek(SeekFrom::Start(offset))
@@ -320,24 +414,27 @@ fn extract_from_flac(file: &mut File, file_len: u64) -> Result<Option<ExtractedA
         let block_type = hdr[0] & 0x7f;
         let block_len =
             (((hdr[1] as u64) << 16) | ((hdr[2] as u64) << 8) | (hdr[3] as u64)) as usize;
-        let data_start = offset + 4;
-        if data_start + (block_len as u64) > file_len {
+        let Some(next_offset) = data_start.checked_add(block_len as u64) else {
+            break;
+        };
+        if next_offset > file_len {
             break;
         }
         if block_type == 6 && (32..=MAX_EMBEDDED_ARTWORK_BYTES + 65536).contains(&block_len) {
-            let mut block_buf = vec![0u8; block_len];
-            if file.read_exact(&mut block_buf).is_ok() {
-                if let Some(art) = parse_flac_picture_bytes(&block_buf) {
-                    if art.picture_type == 3 {
-                        return Ok(Some(art));
-                    }
-                    if fallback_art.is_none() {
-                        fallback_art = Some(art);
+            if let Ok(block_buf) = read_bounded(file, block_len) {
+                if block_buf.len() == block_len {
+                    if let Some(art) = parse_flac_picture_bytes(&block_buf) {
+                        if art.picture_type == 3 {
+                            return Ok(Some(art));
+                        }
+                        if fallback_art.is_none() {
+                            fallback_art = Some(art);
+                        }
                     }
                 }
             }
         }
-        offset = data_start + (block_len as u64);
+        offset = next_offset;
         if is_last {
             break;
         }
@@ -345,9 +442,10 @@ fn extract_from_flac(file: &mut File, file_len: u64) -> Result<Option<ExtractedA
     Ok(fallback_art)
 }
 
-fn parse_mp4_buffer(buf: &[u8]) -> Option<ExtractedArtwork> {
+pub fn parse_mp4_buffer(buf: &[u8]) -> Option<ExtractedArtwork> {
     fn read_atom(slice: &[u8], offset: usize) -> Option<(usize, &[u8; 4], usize)> {
-        if offset + 8 > slice.len() {
+        let hdr_end = offset.checked_add(8)?;
+        if hdr_end > slice.len() {
             return None;
         }
         let size32 = u32::from_be_bytes([
@@ -356,31 +454,94 @@ fn parse_mp4_buffer(buf: &[u8]) -> Option<ExtractedArtwork> {
             slice[offset + 2],
             slice[offset + 3],
         ]) as usize;
-        let kind: &[u8; 4] = slice[offset + 4..offset + 8].try_into().ok()?;
+        let kind: &[u8; 4] = slice[offset + 4..hdr_end].try_into().ok()?;
         if size32 == 1 {
-            if offset + 16 > slice.len() {
+            let ext_end = offset.checked_add(16)?;
+            if ext_end > slice.len() {
                 return None;
             }
-            let size64 =
-                u64::from_be_bytes(slice[offset + 8..offset + 16].try_into().ok()?) as usize;
+            let size64 = u64::from_be_bytes(slice[hdr_end..ext_end].try_into().ok()?);
             if size64 < 16 {
                 return None;
             }
-            Some((size64, kind, offset + 16))
+            let clamped = usize::try_from(size64).unwrap_or(slice.len());
+            Some((clamped, kind, ext_end))
         } else if size32 == 0 {
-            Some((slice.len() - offset, kind, offset + 8))
+            Some((slice.len() - offset, kind, hdr_end))
         } else if size32 >= 8 {
-            Some((size32, kind, offset + 8))
+            Some((size32, kind, hdr_end))
         } else {
             None
         }
+    }
+
+    fn extract_from_meta(
+        buf: &[u8],
+        meta_content: usize,
+        meta_end: usize,
+    ) -> Option<ExtractedArtwork> {
+        let mut o3 = meta_content.checked_add(4)?;
+        if o3 > meta_end {
+            return None;
+        }
+        while let Some((s3, k3, c3)) = read_atom(buf, o3) {
+            let e3 = o3.saturating_add(s3).min(meta_end);
+            if e3 <= c3 {
+                break;
+            }
+            if k3 == b"ilst" {
+                let mut o4 = c3;
+                while let Some((s4, k4, c4)) = read_atom(buf, o4) {
+                    let e4 = o4.saturating_add(s4).min(e3);
+                    if e4 <= c4 {
+                        break;
+                    }
+                    if k4 == b"covr" {
+                        let mut o5 = c4;
+                        while let Some((s5, k5, c5)) = read_atom(buf, o5) {
+                            let e5 = o5.saturating_add(s5).min(e4);
+                            if e5 <= c5 {
+                                break;
+                            }
+                            if let Some(data_start) = c5.checked_add(8) {
+                                if k5 == b"data" && data_start <= e5 {
+                                    let dtype = u32::from_be_bytes([
+                                        buf[c5],
+                                        buf[c5 + 1],
+                                        buf[c5 + 2],
+                                        buf[c5 + 3],
+                                    ]);
+                                    let img_bytes = &buf[data_start..e5];
+                                    let declared = if dtype == 14 {
+                                        "image/png"
+                                    } else {
+                                        "image/jpeg"
+                                    };
+                                    if let Some(mime_type) = sniff_image_mime(img_bytes, declared) {
+                                        return Some(ExtractedArtwork {
+                                            bytes: img_bytes.to_vec(),
+                                            mime_type,
+                                            picture_type: 3,
+                                        });
+                                    }
+                                }
+                            }
+                            o5 = e5;
+                        }
+                    }
+                    o4 = e4;
+                }
+            }
+            o3 = e3;
+        }
+        None
     }
 
     // Locate moov atom
     let mut moov_range: Option<(usize, usize)> = None;
     let mut top = 0usize;
     while let Some((size, kind, content_start)) = read_atom(buf, top) {
-        let end = (top + size).min(buf.len());
+        let end = top.saturating_add(size).min(buf.len());
         if end <= content_start {
             break;
         }
@@ -394,7 +555,7 @@ fn parse_mp4_buffer(buf: &[u8]) -> Option<ExtractedArtwork> {
         for i in 0..buf.len().saturating_sub(8) {
             if &buf[i + 4..i + 8] == b"moov" {
                 if let Some((size, _, content_start)) = read_atom(buf, i) {
-                    let end = (i + size).min(buf.len());
+                    let end = i.saturating_add(size).min(buf.len());
                     if end > content_start {
                         moov_range = Some((content_start, end));
                         break;
@@ -407,68 +568,24 @@ fn parse_mp4_buffer(buf: &[u8]) -> Option<ExtractedArtwork> {
 
     let mut o1 = moov_start;
     while let Some((s1, k1, c1)) = read_atom(buf, o1) {
-        let e1 = (o1 + s1).min(moov_end);
+        let e1 = o1.saturating_add(s1).min(moov_end);
         if e1 <= c1 {
             break;
         }
-        if k1 == b"udta" {
+        if k1 == b"meta" {
+            if let Some(art) = extract_from_meta(buf, c1, e1) {
+                return Some(art);
+            }
+        } else if k1 == b"udta" {
             let mut o2 = c1;
             while let Some((s2, k2, c2)) = read_atom(buf, o2) {
-                let e2 = (o2 + s2).min(e1);
+                let e2 = o2.saturating_add(s2).min(e1);
                 if e2 <= c2 {
                     break;
                 }
-                if k2 == b"meta" && c2 + 4 <= e2 {
-                    let mut o3 = c2 + 4;
-                    while let Some((s3, k3, c3)) = read_atom(buf, o3) {
-                        let e3 = (o3 + s3).min(e2);
-                        if e3 <= c3 {
-                            break;
-                        }
-                        if k3 == b"ilst" {
-                            let mut o4 = c3;
-                            while let Some((s4, k4, c4)) = read_atom(buf, o4) {
-                                let e4 = (o4 + s4).min(e3);
-                                if e4 <= c4 {
-                                    break;
-                                }
-                                if k4 == b"covr" {
-                                    let mut o5 = c4;
-                                    while let Some((s5, k5, c5)) = read_atom(buf, o5) {
-                                        let e5 = (o5 + s5).min(e4);
-                                        if e5 <= c5 {
-                                            break;
-                                        }
-                                        if k5 == b"data" && c5 + 8 <= e5 {
-                                            let dtype = u32::from_be_bytes([
-                                                buf[c5],
-                                                buf[c5 + 1],
-                                                buf[c5 + 2],
-                                                buf[c5 + 3],
-                                            ]);
-                                            let img_bytes = &buf[c5 + 8..e5];
-                                            let declared = if dtype == 14 {
-                                                "image/png"
-                                            } else {
-                                                "image/jpeg"
-                                            };
-                                            if let Some(mime_type) =
-                                                sniff_image_mime(img_bytes, declared)
-                                            {
-                                                return Some(ExtractedArtwork {
-                                                    bytes: img_bytes.to_vec(),
-                                                    mime_type,
-                                                    picture_type: 3,
-                                                });
-                                            }
-                                        }
-                                        o5 = e5;
-                                    }
-                                }
-                                o4 = e4;
-                            }
-                        }
-                        o3 = e3;
+                if k2 == b"meta" {
+                    if let Some(art) = extract_from_meta(buf, c2, e2) {
+                        return Some(art);
                     }
                 }
                 o2 = e2;
@@ -483,10 +600,9 @@ fn extract_from_mp4(file: &mut File, file_len: u64) -> Result<Option<ExtractedAr
     if file_len < 16 {
         return Ok(None);
     }
-    let head_len = (file_len as usize).min(MP4_SCAN_LIMIT);
+    let head_len = file_len.min(MP4_SCAN_LIMIT as u64) as usize;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    let mut head = vec![0u8; head_len];
-    file.read_exact(&mut head).map_err(|e| e.to_string())?;
+    let head = read_bounded(file, head_len)?;
     if let Some(art) = parse_mp4_buffer(&head) {
         return Ok(Some(art));
     }
@@ -494,8 +610,7 @@ fn extract_from_mp4(file: &mut File, file_len: u64) -> Result<Option<ExtractedAr
         let tail_offset = file_len - (MP4_SCAN_LIMIT as u64);
         file.seek(SeekFrom::Start(tail_offset))
             .map_err(|e| e.to_string())?;
-        let mut tail = vec![0u8; MP4_SCAN_LIMIT];
-        file.read_exact(&mut tail).map_err(|e| e.to_string())?;
+        let tail = read_bounded(file, MP4_SCAN_LIMIT)?;
         if let Some(art) = parse_mp4_buffer(&tail) {
             return Ok(Some(art));
         }
@@ -503,7 +618,7 @@ fn extract_from_mp4(file: &mut File, file_len: u64) -> Result<Option<ExtractedAr
     Ok(None)
 }
 
-fn parse_vorbis_comment_artwork(payload: &[u8]) -> Option<ExtractedArtwork> {
+pub fn parse_vorbis_comment_artwork(payload: &[u8]) -> Option<ExtractedArtwork> {
     let mut pos = if payload.len() > 7 && payload[0] == 0x03 && &payload[1..7] == b"vorbis" {
         7usize
     } else if payload.len() > 8 && &payload[0..8] == b"OpusTags" {
@@ -511,7 +626,7 @@ fn parse_vorbis_comment_artwork(payload: &[u8]) -> Option<ExtractedArtwork> {
     } else {
         return None;
     };
-    if pos + 4 > payload.len() {
+    if pos.checked_add(4)? > payload.len() {
         return None;
     }
     let vendor_len = u32::from_le_bytes([
@@ -521,7 +636,7 @@ fn parse_vorbis_comment_artwork(payload: &[u8]) -> Option<ExtractedArtwork> {
         payload[pos + 3],
     ]) as usize;
     pos = pos.checked_add(4)?.checked_add(vendor_len)?;
-    if pos + 4 > payload.len() {
+    if pos.checked_add(4)? > payload.len() {
         return None;
     }
     let count = u32::from_le_bytes([
@@ -530,11 +645,14 @@ fn parse_vorbis_comment_artwork(payload: &[u8]) -> Option<ExtractedArtwork> {
         payload[pos + 2],
         payload[pos + 3],
     ]) as usize;
-    pos += 4;
+    pos = pos.checked_add(4)?;
 
     let mut fallback_art: Option<ExtractedArtwork> = None;
     for _ in 0..count.min(256) {
-        if pos + 4 > payload.len() {
+        let Some(len_end) = pos.checked_add(4) else {
+            break;
+        };
+        if len_end > payload.len() {
             break;
         }
         let len = u32::from_le_bytes([
@@ -543,12 +661,15 @@ fn parse_vorbis_comment_artwork(payload: &[u8]) -> Option<ExtractedArtwork> {
             payload[pos + 2],
             payload[pos + 3],
         ]) as usize;
-        pos += 4;
-        if pos.checked_add(len)? > payload.len() {
+        pos = len_end;
+        let Some(comment_end) = pos.checked_add(len) else {
+            break;
+        };
+        if comment_end > payload.len() {
             break;
         }
-        let raw_comment = &payload[pos..pos + len];
-        pos += len;
+        let raw_comment = &payload[pos..comment_end];
+        pos = comment_end;
         if let Some(eq_idx) = raw_comment.iter().position(|&b| b == b'=') {
             let key = String::from_utf8_lossy(&raw_comment[..eq_idx]).to_ascii_uppercase();
             let val = &raw_comment[eq_idx + 1..];
@@ -595,20 +716,24 @@ fn extract_from_ogg(file: &mut File, file_len: u64) -> Result<Option<ExtractedAr
     if file_len < 28 {
         return Ok(None);
     }
-    let scan_len = (file_len as usize).min(OGG_SCAN_LIMIT);
+    let scan_len = file_len.min(OGG_SCAN_LIMIT as u64) as usize;
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-    let mut data = vec![0u8; scan_len];
-    file.read_exact(&mut data).map_err(|e| e.to_string())?;
+    let data = read_bounded(file, scan_len)?;
 
     // Reassemble Ogg packets across continuation pages so large METADATA_BLOCK_PICTURE tags succeed
     let mut cursor = 0usize;
     let mut packet = Vec::new();
-    while cursor + 27 <= data.len() {
+    let mut pages_scanned = 0usize;
+    while cursor.checked_add(27).is_some_and(|end| end <= data.len()) && pages_scanned < 4096 {
         let Some(rel) = data[cursor..].windows(4).position(|w| w == b"OggS") else {
             break;
         };
+        pages_scanned += 1;
         let page_start = cursor + rel;
-        if page_start + 27 > data.len() {
+        let Some(seg_table_start) = page_start.checked_add(27) else {
+            break;
+        };
+        if seg_table_start > data.len() {
             break;
         }
         let header_type = data[page_start + 5];
@@ -620,21 +745,25 @@ fn extract_from_ogg(file: &mut File, file_len: u64) -> Result<Option<ExtractedAr
             packet.clear();
         }
         let seg_count = data[page_start + 26] as usize;
-        let seg_table_start = page_start + 27;
-        if seg_table_start + seg_count > data.len() {
+        let Some(mut body_cursor) = seg_table_start.checked_add(seg_count) else {
+            break;
+        };
+        if body_cursor > data.len() {
             break;
         }
-        let segs = &data[seg_table_start..seg_table_start + seg_count];
-        let mut body_cursor = seg_table_start + seg_count;
+        let segs = &data[seg_table_start..body_cursor];
         for &seg_len in segs {
             let sl = seg_len as usize;
-            if body_cursor + sl > data.len() {
+            let Some(seg_end) = body_cursor.checked_add(sl) else {
+                break;
+            };
+            if seg_end > data.len() {
                 break;
             }
-            if packet.len() + sl <= MAX_EMBEDDED_ARTWORK_BYTES * 2 {
-                packet.extend_from_slice(&data[body_cursor..body_cursor + sl]);
+            if packet.len().saturating_add(sl) <= MAX_EMBEDDED_ARTWORK_BYTES * 2 {
+                packet.extend_from_slice(&data[body_cursor..seg_end]);
             }
-            body_cursor += sl;
+            body_cursor = seg_end;
             if seg_len < 255 {
                 if let Some(art) = parse_vorbis_comment_artwork(&packet) {
                     return Ok(Some(art));
@@ -897,5 +1026,57 @@ mod tests {
         let bad_flac = dir.path().join("bad.flac");
         fs::write(&bad_flac, b"fLaC\x86\xff\xff\xff\x00\x00\x00\x03").unwrap();
         assert!(extract_embedded_artwork(&bad_flac).unwrap().is_none());
+    }
+
+    #[test]
+    fn handles_id3_unsynchronization_and_rejects_overflowing_flac_mp4_ogg_headers() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. ID3v2.4 APIC with frame-level unsynchronization (0xFF 0x00 -> 0xFF)
+        let mut fake_jpeg = vec![0xff, 0xd8, 0xff, 0xe0];
+        fake_jpeg.extend_from_slice(&[0x42; 80]);
+        let mut unsynced_jpeg = Vec::new();
+        for &b in &fake_jpeg {
+            unsynced_jpeg.push(b);
+            if b == 0xff {
+                unsynced_jpeg.push(0x00);
+            }
+        }
+        let mut apic_body = Vec::new();
+        apic_body.push(0); // Latin-1
+        apic_body.extend_from_slice(b"image/jpeg\x00\x03\x00");
+        apic_body.extend_from_slice(&unsynced_jpeg);
+        let parsed_unsync = parse_id3_apic(&apic_body, 0x0002, 0, 4).unwrap();
+        assert_eq!(parsed_unsync.bytes, fake_jpeg);
+        assert_eq!(parsed_unsync.mime_type, "image/jpeg");
+
+        // Compressed/encrypted ID3v2.3 & v2.4 APIC frames are safely skipped
+        assert!(parse_id3_apic(&apic_body, 0x0080, 0, 3).is_none());
+        assert!(parse_id3_apic(&apic_body, 0x0008, 0, 4).is_none());
+
+        // 2. Malformed FLAC picture block with u32::MAX mime_len or desc_len must not overflow
+        let mut bad_pic = vec![0u8; 40];
+        bad_pic[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(parse_flac_picture_bytes(&bad_pic).is_none());
+
+        // 3. Malformed MP4 buffer with u64::MAX extended atom size inside moov must not overflow
+        let mut bad_mp4 = Vec::new();
+        bad_mp4.extend_from_slice(&24u32.to_be_bytes());
+        bad_mp4.extend_from_slice(b"moov");
+        bad_mp4.extend_from_slice(&1u32.to_be_bytes()); // size32 == 1 -> 64-bit size
+        bad_mp4.extend_from_slice(b"udta");
+        bad_mp4.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(parse_mp4_buffer(&bad_mp4).is_none());
+
+        // 4. Malformed Vorbis comment with u32::MAX vendor_len / comment_len must not overflow
+        let mut bad_vorbis = Vec::new();
+        bad_vorbis.extend_from_slice(b"OpusTags");
+        bad_vorbis.extend_from_slice(&u32::MAX.to_le_bytes());
+        bad_vorbis.extend_from_slice(&[0u8; 16]);
+        assert!(parse_vorbis_comment_artwork(&bad_vorbis).is_none());
+
+        let bad_mp4_path = dir.path().join("overflow.m4a");
+        fs::write(&bad_mp4_path, &bad_mp4).unwrap();
+        assert!(extract_embedded_artwork(&bad_mp4_path).unwrap().is_none());
     }
 }

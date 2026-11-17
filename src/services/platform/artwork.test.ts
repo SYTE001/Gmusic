@@ -124,6 +124,8 @@ describe("desktop artwork platform adapter", () => {
         title: "One More Time",
         artist: "Daft Punk",
         album: "Discovery",
+        includeAlbum: true,
+        clearAll: false,
       },
     });
   });

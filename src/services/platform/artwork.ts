@@ -197,6 +197,8 @@ export async function invalidateDesktopArtworkCache(params: {
   title?: string;
   artist?: string;
   album?: string;
+  includeAlbum?: boolean;
+  clearAll?: boolean;
 }): Promise<void> {
   if (!isTauriRuntime()) return;
   try {
@@ -206,6 +208,8 @@ export async function invalidateDesktopArtworkCache(params: {
         title: params.title ?? null,
         artist: params.artist ?? null,
         album: params.album ?? null,
+        includeAlbum: params.includeAlbum ?? true,
+        clearAll: params.clearAll ?? false,
       },
     });
   } catch {

@@ -76,6 +76,12 @@ pub(crate) fn normalize_fs_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn build_audio_info(path: &Path) -> Result<Option<DesktopAudioFileInfo>, String> {
+    let Ok(sym_meta) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+        return Ok(None);
+    }
     let normalized = normalize_fs_path(path)?;
     let metadata = fs::metadata(&normalized)
         .map_err(|err| format!("Failed to inspect {}: {err}", normalized.display()))?;
@@ -219,7 +225,10 @@ fn authorize_desktop_paths(
     let mut statuses = Vec::with_capacity(paths.len());
     for raw_path in paths {
         let candidate = Path::new(&raw_path);
-        let exists = if candidate.is_file() && is_supported_audio_extension(candidate) {
+        let is_regular = fs::symlink_metadata(candidate)
+            .map(|m| !m.file_type().is_symlink() && m.is_file())
+            .unwrap_or(false);
+        let exists = if is_regular && is_supported_audio_extension(candidate) {
             if let Ok(normalized) = normalize_fs_path(candidate) {
                 scope.allow_file(&normalized).is_ok()
             } else {
@@ -243,7 +252,13 @@ fn read_audio_file_slice(
     offset: u64,
     length: u64,
 ) -> Result<tauri::ipc::Response, String> {
-    let normalized = normalize_fs_path(Path::new(&path))?;
+    let raw_path = Path::new(&path);
+    let sym_meta = fs::symlink_metadata(raw_path)
+        .map_err(|err| format!("Failed to inspect {}: {err}", raw_path.display()))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("Symlink audio paths are not permitted.".to_string());
+    }
+    let normalized = normalize_fs_path(raw_path)?;
     if !is_supported_audio_extension(&normalized) {
         return Err("Unsupported audio file extension.".to_string());
     }

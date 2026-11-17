@@ -200,7 +200,41 @@ describe("native desktop artwork integration", () => {
       expect.objectContaining({
         title: "One More Time",
         artist: "Daft Punk",
+        includeAlbum: true,
       }),
     );
+  });
+
+  it("preserves shared album cache when invalidating a single track with includeAlbum: false", async () => {
+    const cachedBlob = new Blob([new Uint8Array(256).fill(7)], { type: "image/jpeg" });
+    vi.mocked(resolveDesktopArtwork).mockResolvedValueOnce(baseNativeResult);
+    vi.mocked(readDesktopCachedArtworkBlob).mockResolvedValueOnce(cachedBlob);
+
+    await resolveArtworkForTrack(sampleDesktopTrack);
+    vi.mocked(invalidateDesktopArtworkCache).mockClear();
+
+    invalidateArtworkCacheForTrack(sampleDesktopTrack, {
+      includeAlbum: false,
+      markUrlFailed: false,
+    });
+    expect(invalidateDesktopArtworkCache).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trackId: sampleDesktopTrack.id,
+        title: "One More Time",
+        artist: "Daft Punk",
+        album: "Discovery",
+        includeAlbum: false,
+      }),
+    );
+
+    // Sibling track in the same album still hits the shared album cache
+    const siblingTrack: Track = {
+      ...sampleDesktopTrack,
+      id: "desk-art-2",
+      title: "Aerodynamic",
+    };
+    const siblingRes = await resolveArtworkForTrack(siblingTrack);
+    expect(siblingRes.source).toBe("cache");
+    expect(siblingRes.url).toBe(baseNativeResult.url);
   });
 });

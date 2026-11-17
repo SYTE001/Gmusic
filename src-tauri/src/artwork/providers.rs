@@ -242,42 +242,62 @@ impl NativeArtworkProviders {
             return Err("Untrusted or invalid artwork URL".into());
         };
         let url = Url::parse(&sanitized).map_err(|e| e.to_string())?;
-        let res = tokio::time::timeout(self.timeout, async {
-            let mut resp = self
-                .image_client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| format!("Image download failed: {e}"))?;
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(format!("HTTP {}", status.as_u16()));
-            }
-            if resp
-                .content_length()
-                .is_some_and(|len| len > MAX_IMAGE_BYTES as u64)
-            {
-                return Err("oversized".into());
-            }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = resp
-                .chunk()
-                .await
-                .map_err(|e| format!("Failed reading image stream: {e}"))?
-            {
-                if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
-                    return Err("oversized".into());
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            Ok(bytes)
-        })
-        .await;
+        let mut last_err = String::from("Image download failed");
 
-        match res {
-            Ok(inner) => inner,
-            Err(_) => Err("timeout".into()),
+        for attempt in 0..2 {
+            let target = url.clone();
+            let res = tokio::time::timeout(self.timeout, async {
+                let mut resp = self
+                    .image_client
+                    .get(target)
+                    .send()
+                    .await
+                    .map_err(|e| (format!("Image download failed: {e}"), true))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let retryable =
+                        status == StatusCode::SERVICE_UNAVAILABLE || status.as_u16() >= 500;
+                    return Err((format!("HTTP {}", status.as_u16()), retryable));
+                }
+                if resp
+                    .content_length()
+                    .is_some_and(|len| len > MAX_IMAGE_BYTES as u64)
+                {
+                    return Err(("oversized".into(), false));
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = resp
+                    .chunk()
+                    .await
+                    .map_err(|e| (format!("Failed reading image stream: {e}"), true))?
+                {
+                    if bytes.len() + chunk.len() > MAX_IMAGE_BYTES {
+                        return Err(("oversized".into(), false));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(bytes)
+            })
+            .await;
+
+            match res {
+                Ok(Ok(bytes)) => return Ok(bytes),
+                Ok(Err((msg, retryable))) => {
+                    last_err = msg;
+                    if !retryable || attempt == 1 {
+                        return Err(last_err);
+                    }
+                }
+                Err(_) => {
+                    last_err = "timeout".into();
+                    if attempt == 1 {
+                        return Err(last_err);
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
         }
+        Err(last_err)
     }
 
     async fn fetch_caa(
@@ -888,6 +908,88 @@ mod tests {
             res.url.as_deref(),
             Some("https://is1-ssl.mzstatic.com/image/thumb/dp/600x600bb.jpg")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handles_rate_limiting_retries_and_blocks_untrusted_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let img_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let img_attempts_clone = img_attempts.clone();
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempts = img_attempts_clone.clone();
+                let addr_str = addr.to_string();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.split_whitespace().nth(1).unwrap_or("");
+                    if path.starts_with("/evil-redirect") {
+                        let reply = "HTTP/1.1 302 Found\r\nLocation: https://evil.example.com/payload.jpg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    } else if path.starts_with("/valid-redirect") {
+                        let reply = format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr_str}/flaky-img\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    } else if path.starts_with("/flaky-img") {
+                        let count = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if count == 0 {
+                            let reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = stream.write_all(reply.as_bytes()).await;
+                        } else {
+                            let body = [0xffu8, 0xd8, 0xff, 0xe0];
+                            let reply = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(reply.as_bytes()).await;
+                            let _ = stream.write_all(&body).await;
+                        }
+                    } else {
+                        let reply = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                        let _ = stream.write_all(reply.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let providers =
+            NativeArtworkProviders::with_test_endpoints(base.clone(), base.clone(), base.clone());
+
+        // 1. Redirect to untrusted host is blocked
+        let blocked = providers
+            .download_image(&format!("{base}/evil-redirect"))
+            .await;
+        assert!(blocked.is_err());
+
+        // 2. Valid redirect + transient 503 retries and succeeds
+        let recovered = providers
+            .download_image(&format!("{base}/valid-redirect"))
+            .await
+            .unwrap();
+        assert_eq!(recovered, vec![0xff, 0xd8, 0xff, 0xe0]);
+        assert!(img_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+
+        // 3. 429 rate-limit sets transient_failure = true
+        let query = ArtworkQuery {
+            id: "t-rate".into(),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: Some(200_000),
+        };
+        let disc = providers.discover(&query, "500", &[]).await;
+        assert!(disc.transient_failure);
+        assert!(disc.url.is_none());
+
         server.abort();
     }
 }

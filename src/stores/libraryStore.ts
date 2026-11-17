@@ -17,7 +17,13 @@ import {
   setCachedArtworkForTrack,
   upgradeArtworkToPersisted,
 } from "../services/artwork/artworkCache";
-import { resolveArtworkForAlbumBatch } from "../services/artwork/artworkService";
+import {
+  getAlbumArtworkCacheKey,
+  getCachedArtworkEntry,
+  invalidateArtworkCacheForTrack,
+  resolveArtworkForAlbumBatch,
+} from "../services/artwork/artworkService";
+import { invalidateDesktopArtworkCache } from "../services/platform/artwork";
 import { importAudioItems, type ImportItem, type ImportProgress } from "../services/library/importService";
 import {
   clearPlaybackSession,
@@ -423,7 +429,18 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       });
     }
 
+    const remainingTracks = get().tracks.filter((track) => !idSet.has(track.id));
     await repository.deleteTracks(ids);
+    for (const removed of tracks) {
+      const albumKey = getAlbumArtworkCacheKey(removed);
+      const hasAlbumSibling =
+        albumKey.startsWith("album::") &&
+        remainingTracks.some((rem) => getAlbumArtworkCacheKey(rem) === albumKey);
+      invalidateArtworkCacheForTrack(removed, {
+        includeAlbum: !hasAlbumSibling,
+        markUrlFailed: false,
+      });
+    }
     for (const id of ids) {
       evictArtworkUrlCache(id);
     }
@@ -581,6 +598,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   clearLibrary: async () => {
     await repository.clearLibrary();
     clearArtworkCache();
+    void invalidateDesktopArtworkCache({ clearAll: true });
     set({ tracks: [], playlists: [], trackStats: {}, lastImportOutcome: null });
     await resetPlaybackState();
   },
@@ -678,11 +696,27 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       tracks: get().tracks.map((item) => (item.id === trackId ? updatedTrack : item)),
     });
 
-    // If the track title changed and the track does not yet have a persisted local blob URL,
-    // re-trigger artwork lookup under the updated metadata identity.
-    if (track.title !== cleanTitle && !getArtworkUrl(trackId)?.startsWith("blob:")) {
-      evictArtworkUrlCache(trackId);
-      void loadArtworkUrl(updatedTrack);
+    // If the track title changed and the track's artwork was online-resolved (or has no embedded blob),
+    // invalidate stale cache keys and re-trigger artwork lookup under the updated metadata identity.
+    if (track.title !== cleanTitle) {
+      const hadOnlineCache = getCachedArtworkEntry(track) !== undefined;
+      if (hadOnlineCache || !getArtworkUrl(trackId)?.startsWith("blob:")) {
+        const albumKey = getAlbumArtworkCacheKey(track);
+        const hasAlbumSibling =
+          albumKey.startsWith("album::") &&
+          get().tracks.some(
+            (other) => other.id !== trackId && getAlbumArtworkCacheKey(other) === albumKey,
+          );
+        invalidateArtworkCacheForTrack(track, {
+          includeAlbum: !hasAlbumSibling,
+          markUrlFailed: false,
+        });
+        if (hadOnlineCache) {
+          await repository.deleteArtwork(trackId).catch(() => undefined);
+        }
+        evictArtworkUrlCache(trackId);
+        void loadArtworkUrl(updatedTrack);
+      }
     }
 
     // 2. Check cloud sync
