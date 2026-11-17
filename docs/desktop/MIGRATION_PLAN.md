@@ -40,3 +40,13 @@
 - Every phase lands on a dedicated feature branch via PR; `main` is never pushed to directly without human approval.
 - Web builds (`npm run build`) must pass after every desktop change; Tauri imports must be dynamically loaded or runtime-guarded so browsers never execute `window.__TAURI_INTERNALS__` calls.
 - User data compatibility: Phase 1 keeps IndexedDB in WebView2 so no user data is lost; Phase 4 introduces explicit one-time migration/import with validation before switching desktop storage authority.
+
+## 5. Phase 2 Implementation Verification (2026-11-18)
+
+- Started from latest `origin/main` `dad9d75` on `feat/desktop-phase2-lyrics`; `main` was not modified.
+- Baseline: `npm ci`, typecheck, lint, full frontend suite (67 files / 892 tests), web build, Rust baseline tests (4) and format check passed. `npm ci` reports the existing 10 audit findings (8 moderate / 2 critical); no forced dependency remediation was applied.
+- Implemented native parser, fixed-provider async transport, normalized metadata ranking, ambiguity, versioned atomic per-track disk discovery cache and runtime-guarded integration. IndexedDB accepted/manual lyrics and user offsets remain the authority; no SQLite or artwork migration.
+- Rust: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` passed (23 tests). Frontend typecheck/lint/build and focused adapter, integration, clock/renderer, and manual-editor regressions passed. Final `npm test`: 70 files, 917 tests passed.
+- Windows executable build passed: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc`. Available packaging targets are `msi` and `nsis`; only x64 MSVC is installed. Installers/signing and other architectures were not verified.
+- Browser smoke could not run: the host returned `browser guest not attached (webview not ready)` twice. A Vite `EBUSY` watcher error on Rust build executables was fixed by ignoring `src-tauri` in frontend watching; the dev server then started cleanly. Real WebView2 playback/seek/pause/lyrics/offline acceptance remains tracked by Beads `music-82d` before approval.
+- Rollback: the native cache is disposable discovery data; removing/disabling the adapter restores the existing web service path without migrating or deleting accepted lyrics, manual edits or offsets. Phase 3 must wait for human approval of Phase 2.

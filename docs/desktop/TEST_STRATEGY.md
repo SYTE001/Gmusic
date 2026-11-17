@@ -35,3 +35,19 @@ Verify that additive Tauri 2 desktop support preserves 100% of existing web beha
 3. **Zero path leaks**: Backup export and cloud sync tests must verify `desktopPath` (and any machine-specific path) is never serialized into portable JSON backups or cloud payloads.
 4. **Honest availability states**: Tests must verify that missing/moved desktop files surface as `"missing"` / recoverable relink states rather than silent failures or corrupted library records.
 5. **No disabled tests**: Never skip or weaken existing tests to make a build green.
+
+## 4. Phase 2 Deterministic Coverage
+
+- Rust unit tests: exact/wrong/missing artist, metadata normalization, duration/version guards, duplicate candidates, ambiguous recordings and conflicting cross-provider payloads; malformed/empty LRC, decimal/comma timestamps, stable duplicate timestamps, genuine enhanced word times, embedded offsets, lyricsfile word timing and plain fallback.
+- Rust HTTP tests use local TCP servers only: timeout, HTTP failure, malformed JSON, missing result, `Retry-After` cooldown and established provider mapping. Native integration tests cover duplicate request coalescing, offline positive-cache reuse, offline misses, invalid provider rejection, confirmed-negative cache hits and metadata invalidation. No test depends on a live paid or external lyrics service.
+- `src/services/platform/lyrics.test.ts`: runtime guard, metadata-only command payload, offline dispatch, typed failures, invalid IPC response rejection, cancellation, native parser validation and web fallback.
+- `src/services/lyrics/lyricsService.native.test.ts`: shared IndexedDB attachment, manual preservation (including an import during discovery), latest user offset preservation, chooser ambiguity, no negative cache for failures, metadata invalidation, offline disk recovery, aborted/late lookup handling and web fallback.
+- Existing `syncEngine.test.ts` and `LyricsView.test.tsx` cover real-clock semantics: seeking forward/backward, pause/resume, track changes, equal timestamps, per-track offsets, word highlighting and the actual renderer DOM. Rust does not run a timer or receive per-frame clock calls.
+
+Run frontend gates from the repository root; run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` from `src-tauri`. Windows build verification uses the installed `x86_64-pc-windows-msvc` target and `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc`. MSI/NSIS packaging and other architectures remain separate release validation. The Vite watcher excludes native sources/artifacts to avoid MSVC executable locks during `desktop:dev`.
+
+### Manual smoke scope
+
+Check the shared web shell, navigation and lyrics screen in a browser, then desktop import/play/seek/pause/resume with a local audio track and genuine LRC/enhanced-LRC fixture. Disable connectivity and verify saved lyrics remain usable; retry a missing result online. Do not report a browser/runtime smoke test as passed if the host cannot attach the browser or the desktop window was only built, not exercised.
+
+The PR #7 final verification results, actual Tauri runtime observations, installer-build results and remaining human acceptance blockers are recorded in [PHASE2_VERIFICATION.md](PHASE2_VERIFICATION.md). That report distinguishes read-only runtime evidence from visual/audible acceptance and records the initial full-suite failure as well as the passing rerun.

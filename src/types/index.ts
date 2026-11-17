@@ -159,6 +159,8 @@ export type LyricsCacheMeta = {
   checkedAt: number;
   recordId: number | null;
   schemaVersion: number;
+  /** Desktop discovery metadata/provider identity; absent in legacy web entries. */
+  discoveryIdentity?: string;
 };
 
 export type RepeatMode = "off" | "all" | "one";

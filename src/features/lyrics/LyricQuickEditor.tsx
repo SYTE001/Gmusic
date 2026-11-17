@@ -2,7 +2,7 @@ import { useState } from "react";
 import type { TrackLyrics } from "../../types";
 import { DB_SCHEMA_VERSION } from "../../types";
 import { formatClock } from "../../utils/misc";
-import { parseLyricFile } from "../../services/lyrics/lyricsService";
+import { parseLyricFileForPlatform } from "../../services/lyrics/lyricsService";
 import { repository } from "../../services/indexeddb/LibraryRepository";
 
 /** Minimal lyric text/timestamp editor. */
@@ -17,8 +17,13 @@ export function LyricQuickEditor({ lyrics, onSaved }: { lyrics: TrackLyrics; onS
   const save = async () => {
     setSaving(true);
     try {
-      const parsed = parseLyricFile(lyrics.trackId, lyrics.sourceName, value);
-      const updated = { ...parsed.lyrics, offsetMs: lyrics.offsetMs, origin: lyrics.origin, schemaVersion: DB_SCHEMA_VERSION };
+      const parsed = await parseLyricFileForPlatform(lyrics.trackId, lyrics.sourceName, value);
+      const updated: TrackLyrics = {
+        ...parsed.lyrics,
+        offsetMs: lyrics.offsetMs,
+        origin: { kind: "manual", recordId: null, fetchedAt: Date.now(), capability: parsed.lyrics.lines.some((line) => line.words?.length) ? "word" : parsed.lyrics.format === "lrc" ? "line" : "plain" },
+        schemaVersion: DB_SCHEMA_VERSION,
+      };
       await repository.putLyrics(updated);
       onSaved(updated);
     } catch {
