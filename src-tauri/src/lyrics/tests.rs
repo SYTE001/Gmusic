@@ -131,6 +131,76 @@ async fn offline_without_cache_and_invalid_identity_never_request_network() {
 }
 
 #[tokio::test]
+async fn lrcmux_missing_uses_supported_search_and_can_be_negative_cached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut paths = Vec::new();
+        for _ in 0..3 {
+            let accepted =
+                tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept()).await;
+            let Ok(Ok((mut stream, _))) = accepted else {
+                break;
+            };
+            let mut buffer = [0; 4096];
+            let size = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            let path = request.split_whitespace().nth(1).unwrap().to_string();
+            let (status, body) = if path.starts_with("/get?") {
+                ("404 Not Found", "{}")
+            } else if path.contains("artist_name=Artist") {
+                ("200 OK", "[]")
+            } else {
+                ("400 Bad Request", "{}")
+            };
+            paths.push(path);
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        }
+        paths
+    });
+    let url = format!("http://{address}");
+    let engine = engine([url.clone(), url.clone(), url]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut query = request();
+    query.providers = vec!["lrcmux".into()];
+    let result = engine
+        .discover(dir.path().into(), query.clone())
+        .await
+        .unwrap();
+    assert!(result.candidates.is_empty());
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert!(
+        engine
+            .discover(dir.path().into(), query)
+            .await
+            .unwrap()
+            .from_cache
+    );
+    let paths = task.await.unwrap();
+    assert_eq!(paths.len(), 2, "{paths:?}");
+    assert!(paths[1].starts_with("/compat/lrclib/api/search?"));
+    assert!(paths[1].contains("track_name=Song") && paths[1].contains("artist_name=Artist"));
+}
+
+#[tokio::test]
+async fn lrcmux_without_artist_does_not_send_unsupported_requests() {
+    let (url, count, task) = server("400 Bad Request", "{}", std::time::Duration::ZERO).await;
+    let engine = engine([url.clone(), url.clone(), url]);
+    let dir = tempfile::tempdir().unwrap();
+    let mut query = request();
+    query.providers = vec!["lrcmux".into()];
+    query.track.artist = " ".into();
+    let result = engine.discover(dir.path().into(), query).await.unwrap();
+    assert!(result.candidates.is_empty() && result.errors.is_empty());
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    task.abort();
+}
+
+#[tokio::test]
 async fn confirmed_missing_is_cached_and_metadata_changes_invalidate_it() {
     let (url, count, task) = server("404 Not Found", "{}", std::time::Duration::ZERO).await;
     let engine = engine([url.clone(), url.clone(), url]);

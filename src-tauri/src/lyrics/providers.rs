@@ -154,6 +154,9 @@ impl NativeProviders {
             return self.lyricsdb(track).await;
         }
         let native = provider == "lrcmux";
+        if native && track.artist.trim().is_empty() {
+            return Ok(Vec::new());
+        }
         let exact_path = "/get";
         let mut params = vec![
             (
@@ -212,9 +215,11 @@ impl NativeProviders {
         } else {
             "/search"
         };
-        // A maximum of two distinct search queries. First structured metadata,
-        // then title-only for catalogues with inconsistent artist credits.
+        // LRCLIB supports title-only search; lrcmux requires both artist and title.
         for artist in [track.artist.as_str(), ""] {
+            if native && artist.is_empty() {
+                break;
+            }
             if artist.is_empty() && track.artist.is_empty() && last_error.is_some() {
                 break;
             }

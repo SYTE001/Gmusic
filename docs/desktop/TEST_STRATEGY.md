@@ -49,3 +49,5 @@ Run frontend gates from the repository root; run `cargo fmt --check`, `cargo cli
 ### Manual smoke scope
 
 Check the shared web shell, navigation and lyrics screen in a browser, then desktop import/play/seek/pause/resume with a local audio track and genuine LRC/enhanced-LRC fixture. Disable connectivity and verify saved lyrics remain usable; retry a missing result online. Do not report a browser/runtime smoke test as passed if the host cannot attach the browser or the desktop window was only built, not exercised.
+
+The PR #7 final verification results, actual Tauri runtime observations, installer-build results and remaining human acceptance blockers are recorded in [PHASE2_VERIFICATION.md](PHASE2_VERIFICATION.md). That report distinguishes read-only runtime evidence from visual/audible acceptance and records the initial full-suite failure as well as the passing rerun.
