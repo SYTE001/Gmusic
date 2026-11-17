@@ -38,7 +38,7 @@ export type BrokenInfo = {
  * - "session-only" transient File object, valid until reload ("Re-import required after reload")
  * - "cloud"       no usable local copy; the audio is fetched from R2 (requires a network connection)
  */
-export type TrackAccessMode = "handle" | "stored-copy" | "session-only" | "cloud";
+export type TrackAccessMode = "handle" | "stored-copy" | "session-only" | "cloud" | "desktop-path";
 
 /**
  * Lifecycle of a track's cloud copy (spec §5).
@@ -80,6 +80,9 @@ export type Track = {
   description?: string;
   /** Epoch ms when this track's metadata was last modified locally. */
   updatedAt?: number;
+
+  /** Desktop-local filesystem path (never exported in backups or synced to cloud). */
+  desktopPath?: string | null;
 
   // ---- Cloud fields (all optional: every pre-existing record is a valid cloud-less record) ----
 

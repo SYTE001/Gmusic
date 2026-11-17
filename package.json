@@ -12,11 +12,15 @@
     "typecheck": "tsc -b --noEmit",
     "lint": "eslint src scripts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build"
   },
   "dependencies": {
     "@applemusic-like-lyrics/core": "0.6.0",
     "@supabase/supabase-js": "^2.118.0",
+    "@tauri-apps/api": "^2.12.5",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.6.0",

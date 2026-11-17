@@ -3,6 +3,7 @@ import type { AppPreferences } from "../types";
 import { DB_SCHEMA_VERSION } from "../types";
 import { repository } from "../services/indexeddb/LibraryRepository";
 import { fileSystemAccessSupported } from "../services/file-access/FileAccessService";
+import { isTauriRuntime } from "../services/platform/desktop";
 import { debounce } from "../utils/misc";
 
 export const DEFAULT_PREFERENCES: AppPreferences = {
@@ -19,7 +20,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   lyricLineSpacing: 1.5,
   // Without the File System Access API the only way to keep files playable
   // across reloads is storing a copy; default it on there, off elsewhere.
-  storeAudioCopies: !fileSystemAccessSupported(),
+  storeAudioCopies: !fileSystemAccessSupported() && !isTauriRuntime(),
   // Online lyrics discovery via lrcmux (metadata only, never audio).
   autoFetchLyrics: true,
   schemaVersion: DB_SCHEMA_VERSION,

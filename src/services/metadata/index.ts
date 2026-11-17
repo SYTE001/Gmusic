@@ -77,12 +77,11 @@ export async function parseAudioTags(file: File): Promise<ParsedTags> {
 }
 
 /**
- * Probes a file with a detached audio element to learn the real duration and
- * whether this browser can decode it. Never uploads or transcodes anything.
+ * Probes an audio URL with a detached audio element to learn the real duration and
+ * whether this runtime can decode it. Never uploads or transcodes anything.
  */
-export function probeAudioFile(file: File): Promise<{ supported: boolean; durationMs: number | null }> {
+export function probeAudioUrl(url: string): Promise<{ supported: boolean; durationMs: number | null }> {
   return new Promise((resolve) => {
-    const url = URL.createObjectURL(file);
     const audio = new Audio();
     let settled = false;
     const finish = (supported: boolean, durationMs: number | null) => {
@@ -91,7 +90,6 @@ export function probeAudioFile(file: File): Promise<{ supported: boolean; durati
       clearTimeout(timer);
       audio.removeAttribute("src");
       audio.load();
-      URL.revokeObjectURL(url);
       resolve({ supported, durationMs });
     };
     const timer = setTimeout(() => finish(false, null), 15000);
@@ -103,4 +101,17 @@ export function probeAudioFile(file: File): Promise<{ supported: boolean; durati
     audio.addEventListener("error", () => finish(false, null));
     audio.src = url;
   });
+}
+
+/**
+ * Probes a file with a detached audio element to learn the real duration and
+ * whether this browser can decode it. Never uploads or transcodes anything.
+ */
+export async function probeAudioFile(file: File): Promise<{ supported: boolean; durationMs: number | null }> {
+  const url = URL.createObjectURL(file);
+  try {
+    return await probeAudioUrl(url);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }

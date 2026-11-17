@@ -14,6 +14,7 @@ import {
 import { repository } from "../../services/indexeddb/LibraryRepository";
 import { resetPlaybackState } from "../../stores/libraryStore";
 import { fileSystemAccessSupported } from "../../services/file-access/FileAccessService";
+import { isTauriRuntime } from "../../services/platform/desktop";
 import { humanBytes } from "../../utils/misc";
 import { APP_VERSION } from "../../types";
 import {
@@ -359,7 +360,7 @@ export function SettingsPage() {
         <div className="space-y-2 rounded-xl border p-4 text-sm" style={{ borderColor: "var(--border-subtle)" }}>
           <div className="flex justify-between gap-4">
             <span className="text-text-secondary">Tracks with retained file access</span>
-            <span className="tabular-nums">{accessSummary.handle ?? 0}</span>
+            <span className="tabular-nums">{(accessSummary.handle ?? 0) + (accessSummary["desktop-path"] ?? 0)}</span>
           </div>
           <div className="flex justify-between gap-4">
             <span className="text-text-secondary">Tracks stored in this app</span>
@@ -385,9 +386,11 @@ export function SettingsPage() {
         <Row
           label="Keep copies of audio in this app"
           hint={
-            fileSystemAccessSupported()
-              ? "Files imported through the folder/file fallback can't be re-opened after a reload; a stored copy keeps them playable. Uses device storage."
-              : "This browser can't retain file access between visits, so copies keep your library playable after a reload. Uses device storage."
+            isTauriRuntime()
+              ? "Desktop keeps direct access to your local music files without copying them into app storage."
+              : fileSystemAccessSupported()
+                ? "Files imported through the folder/file fallback can't be re-opened after a reload; a stored copy keeps them playable. Uses device storage."
+                : "This browser can't retain file access between visits, so copies keep your library playable after a reload. Uses device storage."
           }
         >
           <Toggle checked={prefs.storeAudioCopies} onChange={(value) => update({ storeAudioCopies: value })} label="Store audio copies" />

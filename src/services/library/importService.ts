@@ -1,12 +1,18 @@
 import type { ImportOutcome, Track } from "../../types";
 import { createId, deriveArtistTitleFromFileName, looksLikeAudioFile, normalizeForSearch } from "../../utils/misc";
-import { parseAudioTags, probeAudioFile } from "../metadata";
+import { parseAudioTags, probeAudioFile, probeAudioUrl } from "../metadata";
 import { isCorruptedOrSuspiciousMetadata, type ParsedTags } from "../metadata/types";
 import { normalizeTrackMetadata } from "../metadata/normalization";
 import { repository } from "../indexeddb/LibraryRepository";
 import { rememberSessionFile } from "../file-access/FileAccessService";
+import {
+  createDesktopSliceFile,
+  isDesktopImportItem,
+  toDesktopAudioUrl,
+  type DesktopImportItem,
+} from "../platform/desktop";
 
-export type ImportItem = File | FileSystemFileHandle;
+export type ImportItem = File | FileSystemFileHandle | DesktopImportItem;
 
 export type ImportProgress = {
   done: number;
@@ -22,11 +28,13 @@ export type ImportOptions = {
 };
 
 async function itemToFile(item: ImportItem): Promise<File> {
+  if (isDesktopImportItem(item)) return createDesktopSliceFile(item);
   if ("getFile" in item) return item.getFile();
   return item;
 }
 
 async function itemIsHandle(item: ImportItem): Promise<boolean> {
+  if (isDesktopImportItem(item)) return false;
   return "getFile" in item;
 }
 
@@ -405,7 +413,8 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
     }
 
     try {
-      const probe = await probeAudioFile(file);
+      const isDesktop = isDesktopImportItem(item);
+      const probe = isDesktop ? await probeAudioUrl(toDesktopAudioUrl(item.path)) : await probeAudioFile(file);
       if (!probe.supported) {
         outcome.unsupported.push(file.name);
         done += 1;
@@ -479,7 +488,8 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           wasBroken ||
           matchedTrack.availability === "missing" ||
           matchedTrack.availability === "permission-required" ||
-          matchedTrack.availability === "offline";
+          matchedTrack.availability === "offline" ||
+          (isDesktop && matchedTrack.desktopPath !== item.path);
 
         if (comparison.hasImprovement || needsRelink) {
           const updatedTrack: Track = {
@@ -507,7 +517,8 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
             fileSize: file.size,
             mimeType: file.type || matchedTrack.mimeType,
             fingerprint: fingerprint || matchedTrack.fingerprint,
-            accessMode: isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only",
+            accessMode: isDesktop ? "desktop-path" : isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only",
+            desktopPath: isDesktop ? item.path : matchedTrack.desktopPath,
           };
 
           // Audio source, artwork and metadata are replaced together or not at all:
@@ -516,7 +527,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
             await repository.putTrackWithFiles(updatedTrack, {
               artwork: comparison.improvedArtwork,
               handle: isHandle ? (item as FileSystemFileHandle) : undefined,
-              audio: !isHandle && options.storeCopies ? file : undefined,
+              audio: !isDesktop && !isHandle && options.storeCopies ? file : undefined,
             });
           } catch (error) {
             outcome.failed.push({
@@ -526,7 +537,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
             done += 1;
             continue;
           }
-          if (!isHandle && !options.storeCopies) rememberSessionFile(matchedTrack.id, file);
+          if (!isDesktop && !isHandle && !options.storeCopies) rememberSessionFile(matchedTrack.id, file);
           outcome.updated = (outcome.updated ?? 0) + 1;
           outcome.updatedTracks!.push(updatedTrack);
 
@@ -557,7 +568,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           }
         }
 
-        const accessMode: Track["accessMode"] = isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only";
+        const accessMode: Track["accessMode"] = isDesktop ? "desktop-path" : isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only";
 
         const track: Track = {
           id: createId(),
@@ -578,6 +589,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           isLiked: false,
           availability: "available",
           accessMode,
+          desktopPath: isDesktop ? item.path : undefined,
           fingerprint,
           metadataFromFilename: !validTagTitle,
         };
@@ -586,9 +598,9 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
         await repository.putTrackWithFiles(track, {
           artwork: tags.artwork,
           handle: isHandle ? (item as FileSystemFileHandle) : undefined,
-          audio: !isHandle && options.storeCopies ? file : undefined,
+          audio: !isDesktop && !isHandle && options.storeCopies ? file : undefined,
         });
-        if (!isHandle && !options.storeCopies) rememberSessionFile(track.id, file);
+        if (!isDesktop && !isHandle && !options.storeCopies) rememberSessionFile(track.id, file);
         outcome.newTracks!.push(track);
         if (accessMode === "session-only") outcome.sessionOnlyAdded += 1;
         outcome.added += 1;

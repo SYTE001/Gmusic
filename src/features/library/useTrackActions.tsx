@@ -22,6 +22,7 @@ import {
 } from "../../components/Icons";
 import type { Track } from "../../types";
 import { useCloudStore } from "../../stores/cloudStore";
+import { isTauriRuntime, pickDesktopSingleAudioFile } from "../../services/platform/desktop";
 import { CloudStorageError } from "../../services/cloud/r2StorageService";
 
 export interface TrackActionsContextValue {
@@ -92,6 +93,12 @@ export function useTrackActions() {
         label: "Locate file…",
         icon: <LinkIcon size={16} />,
         onSelect: () => {
+          if (isTauriRuntime()) {
+            void pickDesktopSingleAudioFile().then((picked) => {
+              if (picked) void relinkTrack(track.id, picked);
+            });
+            return;
+          }
           setRelinkFor(track);
           setTimeout(() => relinkInputRef.current?.click(), 0);
         },

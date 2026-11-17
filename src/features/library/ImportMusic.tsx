@@ -9,6 +9,7 @@ import {
   type ImportItem,
 } from "../../services/library/importService";
 import { fileSystemAccessSupported } from "../../services/file-access/FileAccessService";
+import { isTauriRuntime, pickDesktopAudioFiles, pickDesktopAudioFolder } from "../../services/platform/desktop";
 import { Modal } from "../../components/Modal";
 import { FolderIcon, ImportIcon } from "../../components/Icons";
 import type { ImportOutcome } from "../../types";
@@ -153,8 +154,19 @@ export function ImportMusicButtons({ variant = "buttons" }: { variant?: "buttons
   const inputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const supportsPicker = fileSystemAccessSupported();
+  const desktopRuntime = isTauriRuntime();
 
   const onPickFiles = async () => {
+    if (desktopRuntime) {
+      try {
+        const desktopItems = await pickDesktopAudioFiles();
+        if (desktopItems === null) return;
+        await run(desktopItems);
+      } catch {
+        toast("error", "The file picker could not be opened.");
+      }
+      return;
+    }
     if (supportsPicker) {
       try {
         const handles = await pickAudioFilesWithPicker();
@@ -169,6 +181,16 @@ export function ImportMusicButtons({ variant = "buttons" }: { variant?: "buttons
   };
 
   const onPickFolder = async () => {
+    if (desktopRuntime) {
+      try {
+        const desktopItems = await pickDesktopAudioFolder();
+        if (desktopItems === null) return;
+        await run(desktopItems);
+      } catch {
+        toast("error", "The folder picker could not be opened.");
+      }
+      return;
+    }
     try {
       const handles = await pickAudioFolderWithPicker();
       await run(handles);
@@ -225,7 +247,7 @@ export function ImportMusicButtons({ variant = "buttons" }: { variant?: "buttons
             : "inline-flex items-center gap-2 rounded-lg border border-line-strong px-4 py-2.5 text-sm font-medium text-text-primary transition-colors hover:bg-surface-hover disabled:opacity-50"
         }
         onClick={() => {
-          if (supportsPicker || "showDirectoryPicker" in window) void onPickFolder();
+          if (desktopRuntime || supportsPicker || "showDirectoryPicker" in window) void onPickFolder();
           else folderInputRef.current?.click();
         }}
         disabled={busy}
