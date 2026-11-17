@@ -5,6 +5,7 @@ import { CloudBadge, MobileTopBar, OfflineBadge } from "./TopBar";
 import { MiniPlayer } from "./MiniPlayer";
 import { QueuePanel } from "./QueuePanel";
 import { CommandPalette } from "./CommandPalette";
+import { isTauriRuntime } from "../services/platform/desktop";
 import { CreatePlaylistModal } from "../features/playlists/CreatePlaylistModal";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { useLibraryStore } from "../stores/libraryStore";
@@ -347,6 +348,7 @@ function InstallHint() {
   const [dismissed, setDismissed] = useState(() => localStorage.getItem("lm-install-hint-dismissed") === "1");
 
   useEffect(() => {
+    if (isTauriRuntime()) return;
     const onPrompt = (event: Event) => {
       event.preventDefault();
       setPromptEvent(event as BeforeInstallPromptEvent);
@@ -360,7 +362,7 @@ function InstallHint() {
     };
   }, []);
 
-  if (!promptEvent || dismissed) return null;
+  if (isTauriRuntime() || !promptEvent || dismissed) return null;
   const isStandalone = window.matchMedia("(display-mode: standalone)").matches;
   if (isStandalone) return null;
 

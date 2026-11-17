@@ -1,3 +1,5 @@
+import { isTauriRuntime } from "../platform/desktop";
+
 /**
  * Service worker registration (PRD §7.12). The worker precaches the app
  * shell; it never caches arbitrary audio (rules §11). Registration happens
@@ -22,7 +24,7 @@ function setStatus(status: OfflineStatus): void {
 }
 
 export function registerServiceWorker(): void {
-  if (!import.meta.env.PROD) return;
+  if (!import.meta.env.PROD || isTauriRuntime()) return;
   if (typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
   if (!window.isSecureContext) {
     // Service workers require HTTPS or localhost; report honestly.

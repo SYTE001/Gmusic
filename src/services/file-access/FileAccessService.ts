@@ -1,6 +1,13 @@
 import type { Track } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
 import { getPlayUrl } from "../cloud/r2StorageService";
+import {
+  authorizeDesktopPaths,
+  isDesktopImportItem,
+  isTauriRuntime,
+  toDesktopAudioUrl,
+  type DesktopImportItem,
+} from "../platform/desktop";
 import { perfMark, perfMeasure, recordObjectUrlCreated, recordObjectUrlRevoked } from "../../utils/perf";
 
 /**
@@ -185,8 +192,8 @@ export async function preloadTrackSource(track: Track): Promise<void> {
   if (activeUrl?.trackId === track.id || preloadedUrl?.trackId === track.id) return;
 
   // Never preload cloud streams over Data Saver or cellular connections; keep
-  // preloading strictly to cheap local sources.
-  if (track.accessMode === "cloud") return;
+  // preloading strictly to cheap local sources. Desktop asset URLs are instant.
+  if (track.accessMode === "cloud" || track.accessMode === "desktop-path") return;
 
   const sessionFile = sessionFiles.get(track.id);
   if (sessionFile) {
@@ -250,6 +257,19 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
     const sessionFile = sessionFiles.get(track.id);
     if (sessionFile) {
       return activateBlobSource(track.id, sessionFile);
+    }
+  }
+
+  // Fast-path for desktop path-backed tracks: authorize asset scope and stream directly.
+  if (track.desktopPath && isTauriRuntime()) {
+    try {
+      const statuses = await authorizeDesktopPaths([track.desktopPath]);
+      if (statuses.get(track.desktopPath)) {
+        releaseActiveUrl();
+        return { ok: true, url: toDesktopAudioUrl(track.desktopPath), release: () => undefined };
+      }
+    } catch {
+      // Desktop authorization failed or file missing; fall through to other sources.
     }
   }
 
@@ -375,10 +395,28 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
  */
 export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Track["availability"]>> {
   const updates = new Map<string, Track["availability"]>();
+  const desktopPaths = isTauriRuntime()
+    ? tracks.map((t) => t.desktopPath).filter((p): p is string => typeof p === "string" && p.length > 0)
+    : [];
+  const desktopStatuses = desktopPaths.length > 0
+    ? await authorizeDesktopPaths(desktopPaths).catch(() => new Map<string, boolean>())
+    : new Map<string, boolean>();
   for (const track of tracks) {
     // Broken tracks stay broken across reloads until retried or restored.
     if (track.broken?.isBroken || track.availability === "broken") {
       updates.set(track.id, "broken");
+      continue;
+    }
+    if (track.accessMode === "desktop-path") {
+      const storedCopy = await repository.getAudioBlob(track.id);
+      const playableFallback = Boolean(storedCopy) || sessionFiles.has(track.id);
+      if (isTauriRuntime() && track.desktopPath && desktopStatuses.get(track.desktopPath)) {
+        updates.set(track.id, "available");
+      } else if (playableFallback) {
+        updates.set(track.id, "available");
+      } else {
+        updates.set(track.id, track.objectKey ? (deviceIsOffline() ? "offline" : "available") : "missing");
+      }
       continue;
     }
     // Cloud-backed tracks with a live local copy are validated by the local
@@ -458,8 +496,30 @@ export async function regainHandleAccess(track: Track): Promise<"granted" | "den
  */
 export async function relinkTrackWithFile(
   track: Track,
-  file: File | FileSystemFileHandle,
+  file: File | FileSystemFileHandle | DesktopImportItem,
 ): Promise<{ updated: Track; warning: string | null }> {
+  if (isDesktopImportItem(file)) {
+    let warning: string | null = null;
+    if (file.size !== track.fileSize) {
+      warning = `The selected file is ${file.size} bytes but this track was ${track.fileSize} bytes. Linked anyway.`;
+    }
+    const updated: Track = {
+      ...track,
+      availability: "available",
+      accessMode: "desktop-path",
+      desktopPath: file.path,
+      broken: null,
+    };
+    await repository.deleteAudioBlob(track.id).catch(() => undefined);
+    await repository.updateTrack(track.id, {
+      availability: "available",
+      accessMode: "desktop-path",
+      desktopPath: file.path,
+      broken: null,
+    });
+    return { updated, warning };
+  }
+
   const actualFile = "getFile" in file ? await file.getFile() : file;
   let warning: string | null = null;
   if (actualFile.size !== track.fileSize) {

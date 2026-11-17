@@ -44,14 +44,18 @@ export async function buildBackup(): Promise<BackupFile> {
     if (lyrics) lyricEntries.push(lyrics);
   }
 
-  const sanitisedTracks: Track[] = tracks.map((track) => ({
-    ...track,
-    // A restored backup never carries live file access. A cloud object key
-    // survives (it is a server-side reference, not a session token) — the
-    // cloud copy is re-verified on the next authenticated sync.
-    availability: track.objectKey ? "offline" : "missing",
-    accessMode: track.objectKey ? "cloud" : "session-only",
-  }));
+  const sanitisedTracks: Track[] = tracks.map((track) => {
+    const { desktopPath: _desktopPath, ...portableTrack } = track;
+    void _desktopPath;
+    return {
+      ...portableTrack,
+      // A restored backup never carries live file access or machine-specific paths.
+      // A cloud object key survives (it is a server-side reference, not a session token) — the
+      // cloud copy is re-verified on the next authenticated sync.
+      availability: track.objectKey ? "offline" : "missing",
+      accessMode: track.objectKey ? "cloud" : "session-only",
+    };
+  });
 
   return {
     app: "local-music",
@@ -167,8 +171,10 @@ function normalizeTrack(track: Track, hasHandle: boolean, hasStoredCopy: boolean
   // Local file access survives only where the device still owns the record;
   // otherwise the track needs re-import/relink (or its cloud copy).
   const accessMode: Track["accessMode"] = hasStoredCopy ? "stored-copy" : hasHandle ? "handle" : cloud ? "cloud" : "session-only";
+  const { desktopPath: _desktopPath, ...portableTrack } = track;
+  void _desktopPath;
   return {
-    ...track,
+    ...portableTrack,
     artist: str(track.artist, "Unknown Artist"),
     album: str(track.album, ""),
     description: str(track.description, ""),

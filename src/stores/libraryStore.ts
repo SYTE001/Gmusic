@@ -68,7 +68,7 @@ type LibraryState = {
   reorderPlaylist: (playlistId: string, from: number, to: number) => Promise<void>;
 
   grantFileAccess: (trackId: string) => Promise<boolean>;
-  relinkTrack: (trackId: string, file: File | FileSystemFileHandle) => Promise<void>;
+  relinkTrack: (trackId: string, file: ImportItem) => Promise<void>;
   markTrackPlayed: (trackId: string) => Promise<void>;
   clearLibrary: () => Promise<void>;
   /** Applies a cloud-side patch (object key, status, sync stamp) to one track. */

@@ -1,6 +1,7 @@
 import type { Track } from "../../types";
 import { repository } from "../indexeddb/LibraryRepository";
 import { getSessionFile, queryHandlePermission, requestHandlePermission } from "../file-access/FileAccessService";
+import { authorizeDesktopPaths, isTauriRuntime, toDesktopAudioUrl } from "../platform/desktop";
 import { completeUpload, deleteCloudObject, getPlayUrl, requestUploadUrl, CloudStorageError } from "./r2StorageService";
 import { upsertCloudTracks } from "./cloudLibraryService";
 
@@ -167,6 +168,22 @@ export async function resolveLocalAudioForTrack(
     return blob instanceof File
       ? blob
       : new File([blob], track.fileName, { type: resolveAudioMimeType(track.fileName, track.mimeType || blob.type) });
+  }
+  if (track.desktopPath && isTauriRuntime()) {
+    try {
+      const statuses = await authorizeDesktopPaths([track.desktopPath]);
+      if (statuses.get(track.desktopPath)) {
+        const response = await fetch(toDesktopAudioUrl(track.desktopPath));
+        if (response.ok) {
+          const fileBlob = await response.blob();
+          return new File([fileBlob], track.fileName, {
+            type: resolveAudioMimeType(track.fileName, track.mimeType || fileBlob.type),
+          });
+        }
+      }
+    } catch {
+      // Fall through to session file check.
+    }
   }
   const sessionFile = getSessionFile(track.id);
   return sessionFile ?? null;
