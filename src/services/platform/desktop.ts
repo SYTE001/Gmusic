@@ -55,7 +55,7 @@ export async function pickDesktopAudioFiles(): Promise<DesktopImportItem[] | nul
   const paths = Array.isArray(selected) ? selected : [selected];
   if (paths.length === 0) return [];
   const infos = await invoke<DesktopAudioFileInfo[]>("inspect_audio_paths", { paths });
-  return infos.map((info) => ({ ...info, kind: "desktop-file" as const }));
+  return infos.map((info: DesktopAudioFileInfo) => ({ ...info, kind: "desktop-file" as const }));
 }
 
 export async function pickDesktopAudioFolder(): Promise<DesktopImportItem[] | null> {
@@ -68,7 +68,7 @@ export async function pickDesktopAudioFolder(): Promise<DesktopImportItem[] | nu
   const dirPath = Array.isArray(selected) ? selected[0] : selected;
   if (!dirPath) return [];
   const infos = await invoke<DesktopAudioFileInfo[]>("scan_audio_folder", { dirPath });
-  return infos.map((info) => ({ ...info, kind: "desktop-file" as const }));
+  return infos.map((info: DesktopAudioFileInfo) => ({ ...info, kind: "desktop-file" as const }));
 }
 
 export async function pickDesktopSingleAudioFile(): Promise<DesktopImportItem | null> {
