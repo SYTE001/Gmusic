@@ -36,6 +36,12 @@ import {
   type MusicBrainzStageDiagnostic,
   type TrackDiscoveryDiagnostic,
 } from "./artworkDiagnostics";
+import { isTauriRuntime } from "../platform/desktop";
+import {
+  invalidateDesktopArtworkCache,
+  readDesktopCachedArtworkBlob,
+  resolveDesktopArtwork,
+} from "../platform/artwork";
 
 export type ArtworkProviderSource = "embedded" | "cache" | "musicbrainz-caa" | "itunes" | "none";
 
@@ -72,6 +78,7 @@ export interface ArtworkTrackInput {
   album?: string;
   durationMs?: number | null;
   fileName?: string;
+  desktopPath?: string | null;
 }
 
 const LEGACY_CACHE_PREFIX = "artwork_cache_v1:";
@@ -415,10 +422,19 @@ function writeToUnifiedCache(
  * Evicts a broken or invalidated artwork cache entry for a track.
  */
 export function invalidateArtworkCacheForTrack(track: {
+  id?: string;
   title: string;
   artist: string;
   album?: string;
 }): void {
+  if (isTauriRuntime()) {
+    void invalidateDesktopArtworkCache({
+      trackId: track.id,
+      title: track.title,
+      artist: track.artist,
+      album: track.album,
+    });
+  }
   const norm = normalizeTrackMetadata({
     title: track.title,
     artist: track.artist,
@@ -1317,7 +1333,7 @@ export async function resolveArtworkForTrack(
   }
 
   const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
-  if (isOffline) {
+  if (isOffline && !isTauriRuntime()) {
     return { url: undefined, source: "none" };
   }
 
@@ -1376,6 +1392,90 @@ export async function resolveArtworkForTrack(
 
   const promise = (async (): Promise<ArtworkResolution> => {
     try {
+      // On desktop (when full diagnostic telemetry isn't explicitly requested), try native Rust
+      // extraction, matching, resizing, and disk cache first.
+      if (isTauriRuntime() && !includeDiagnostics) {
+        const nativeRes = await resolveDesktopArtwork(normalizedTrack, {
+          size: options?.size ?? "500",
+          forceRefresh,
+          excludeUrls: options?.excludeUrls,
+          downloadAndCache: true,
+        });
+        if (nativeRes) {
+          const targetPath = nativeRes.cachedPath ?? nativeRes.thumbPath500 ?? nativeRes.originalPath;
+          if (targetPath) {
+            const diskBlob = await readDesktopCachedArtworkBlob(
+              targetPath,
+              nativeRes.mimeType ?? "image/jpeg",
+            );
+            if (diskBlob) {
+              try {
+                await repository.putArtwork(track.id, diskBlob);
+              } catch {
+                // Best-effort IndexedDB persistence
+              }
+              const blobUrl = URL.createObjectURL(diskBlob);
+              const verifiedAlbum = nativeRes.album || norm.album || track.album || "";
+              const verifiedArtist =
+                nativeRes.artist || extractPrimaryArtist(norm.artist || track.artist);
+              const keysToCache = Array.from(new Set([trackKey, albumKey].filter(Boolean)));
+              if (nativeRes.url) {
+                writeToUnifiedCache(keysToCache, {
+                  artist: verifiedArtist,
+                  album: verifiedAlbum,
+                  releaseGroupMbid: nativeRes.releaseGroupMbid ?? null,
+                  releaseMbid: nativeRes.releaseMbid ?? null,
+                  url: nativeRes.url,
+                  provider: nativeRes.source === "musicbrainz-caa" ? "musicbrainz-caa" : "itunes",
+                  confidence: nativeRes.confidence ?? 85,
+                  negative: false,
+                });
+              }
+              return {
+                url: blobUrl,
+                source: nativeRes.source,
+                releaseGroupMbid: nativeRes.releaseGroupMbid,
+                releaseMbid: nativeRes.releaseMbid,
+                confidence: nativeRes.confidence,
+                album: nativeRes.album ?? undefined,
+                artist: nativeRes.artist ?? undefined,
+              };
+            }
+          }
+          if (nativeRes.url) {
+            const verifiedAlbum = nativeRes.album || norm.album || track.album || "";
+            const verifiedArtist =
+              nativeRes.artist || extractPrimaryArtist(norm.artist || track.artist);
+            const keysToCache = Array.from(new Set([trackKey, albumKey].filter(Boolean)));
+            writeToUnifiedCache(keysToCache, {
+              artist: verifiedArtist,
+              album: verifiedAlbum,
+              releaseGroupMbid: nativeRes.releaseGroupMbid ?? null,
+              releaseMbid: nativeRes.releaseMbid ?? null,
+              url: nativeRes.url,
+              provider: nativeRes.source === "musicbrainz-caa" ? "musicbrainz-caa" : "itunes",
+              confidence: nativeRes.confidence ?? 85,
+              negative: false,
+            });
+            return {
+              url: nativeRes.url,
+              source: nativeRes.source,
+              releaseGroupMbid: nativeRes.releaseGroupMbid,
+              releaseMbid: nativeRes.releaseMbid,
+              confidence: nativeRes.confidence,
+              album: nativeRes.album ?? undefined,
+              artist: nativeRes.artist ?? undefined,
+            };
+          }
+          if (isOffline) {
+            return { url: undefined, source: "none" };
+          }
+        }
+        if (isOffline) {
+          return { url: undefined, source: "none" };
+        }
+      }
+
       const { resolution, transientFailure, diagnostic } = await discoverOnlineArtwork(
         normalizedTrack,
         options?.size ?? "500",

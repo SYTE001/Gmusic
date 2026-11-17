@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
+mod artwork;
 mod lyrics;
 
 const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &[
@@ -58,7 +59,7 @@ pub fn mime_type_for_path(path: &Path) -> &'static str {
 
 /// Strips Windows `\\?\` verbatim prefix after canonicalization so paths remain
 /// compatible with WebView2 asset URLs and standard path checks.
-fn normalize_fs_path(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn normalize_fs_path(path: &Path) -> Result<PathBuf, String> {
     let canonical = fs::canonicalize(path)
         .map_err(|err| format!("Failed to resolve path {}: {err}", path.display()))?;
     #[cfg(windows)]
@@ -257,6 +258,7 @@ fn read_audio_file_slice(
 pub fn run() {
     tauri::Builder::default()
         .manage(lyrics::LyricsEngine::new().expect("create lyrics engine"))
+        .manage(artwork::ArtworkEngine::new().expect("create artwork engine"))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             inspect_audio_paths,
@@ -264,7 +266,12 @@ pub fn run() {
             authorize_desktop_paths,
             read_audio_file_slice,
             lyrics::discover_desktop_lyrics,
-            lyrics::parse_desktop_lyrics
+            lyrics::parse_desktop_lyrics,
+            artwork::extract_desktop_embedded_artwork,
+            artwork::resolve_desktop_artwork,
+            artwork::cache_desktop_remote_artwork,
+            artwork::read_desktop_cached_artwork_bytes,
+            artwork::invalidate_desktop_artwork_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running Gmusic desktop application");
