@@ -352,6 +352,7 @@ describe("DynamicIslandNotification media card", () => {
 
     const card = screen.getByRole("group", { name: "Now playing: Midnight City" });
     expect(card).toBeTruthy();
+    expect(card.parentElement?.className).toContain("hidden md:flex");
     expect(card.getAttribute("data-kind")).toBe("media");
     expect(screen.getByText("Midnight City")).toBeTruthy();
     expect(screen.getByText("M83")).toBeTruthy();
