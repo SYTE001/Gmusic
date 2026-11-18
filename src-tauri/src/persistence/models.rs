@@ -284,6 +284,8 @@ pub struct ArtworkMigrationEntryDto {
     pub track_id: String,
     pub mime_type: String,
     pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -292,6 +294,8 @@ pub struct AudioMigrationEntryDto {
     pub track_id: String,
     pub mime_type: String,
     pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -325,6 +329,8 @@ pub struct MigrationBeginRequest {
     pub expected_artwork: i64,
     pub expected_audio: i64,
     pub expected_checksum: String,
+    #[serde(default)]
+    pub force_reimport: bool,
 }
 
 impl MigrationBeginRequest {
@@ -403,13 +409,39 @@ impl MigrationBatchRequest {
             if art.track_id.trim().is_empty() || art.track_id.len() > 256 {
                 return Err("Invalid artwork trackId in migration batch.".into());
             }
+            if art.bytes.is_empty() {
+                return Err("Artwork bytes in migration batch cannot be empty.".into());
+            }
+            if let Some(ref expected) = art.sha256 {
+                use sha2::{Digest, Sha256};
+                let actual = format!("{:x}", Sha256::digest(&art.bytes));
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(format!(
+                        "Artwork SHA-256 mismatch for track {} (expected {expected}, got {actual}).",
+                        art.track_id
+                    ));
+                }
+            }
         }
         for aud in &self.audio {
             if aud.track_id.trim().is_empty() || aud.track_id.len() > 256 {
                 return Err("Invalid audio trackId in migration batch.".into());
             }
+            if aud.bytes.is_empty() {
+                return Err("Audio bytes in migration batch cannot be empty.".into());
+            }
             if aud.bytes.len() > MAX_AUDIO_BLOB_BYTES {
                 return Err("Audio blob exceeds maximum allowed size.".into());
+            }
+            if let Some(ref expected) = aud.sha256 {
+                use sha2::{Digest, Sha256};
+                let actual = format!("{:x}", Sha256::digest(&aud.bytes));
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Err(format!(
+                        "Audio SHA-256 mismatch for track {} (expected {expected}, got {actual}).",
+                        aud.track_id
+                    ));
+                }
             }
         }
         Ok(())

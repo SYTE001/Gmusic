@@ -394,6 +394,63 @@ pub fn put_tracks(conn: &mut Connection, tracks: &[TrackDto]) -> Result<(), Stri
     tx.commit().map_err(|e| e.to_string())
 }
 
+fn ext_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "jpg",
+    }
+}
+
+fn persistent_artwork_blobs_dir(artwork_cache_dir: &Path) -> std::path::PathBuf {
+    let parent = artwork_cache_dir.parent().unwrap_or(artwork_cache_dir);
+    parent.join("persistent-artwork-v1").join("blobs")
+}
+
+fn atomic_write_persistent_artwork(dir: &Path, target: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    fs::create_dir_all(dir)
+        .map_err(|e| format!("Failed to create persistent artwork directory: {e}"))?;
+    let mut temp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("Failed to create temp persistent artwork file: {e}"))?;
+    temp.write_all(bytes)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|e| format!("Failed to flush persistent artwork file: {e}"))?;
+    temp.persist(target)
+        .map_err(|e| format!("Failed to persist artwork file: {e}"))?;
+    Ok(())
+}
+
+fn remove_unreferenced_persistent_artwork_blobs(conn: &Connection, artwork_cache_dir: &Path) {
+    let blobs_dir = persistent_artwork_blobs_dir(artwork_cache_dir);
+    if !blobs_dir.is_dir() {
+        return;
+    }
+    let mut referenced = HashSet::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT content_hash FROM artwork_refs") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for r in rows.flatten() {
+                referenced.insert(r);
+            }
+        }
+    }
+    if let Ok(entries) = fs::read_dir(&blobs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let hash_prefix = fname.split('_').next().unwrap_or("");
+            if hash_prefix.is_empty() || !referenced.contains(hash_prefix) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
 fn store_artwork_in_cache_and_ref_tx(
     tx: &Transaction<'_>,
     artwork_cache_dir: &Path,
@@ -401,8 +458,28 @@ fn store_artwork_in_cache_and_ref_tx(
     bytes: &[u8],
 ) -> Result<(), String> {
     let validated = art_process::validate_and_inspect_image(bytes)?;
+    let content_hash = format!("{:x}", Sha256::digest(&validated.bytes));
+
+    // 1. Write to durable SQLite-owned persistent artwork store (never pruned by disposable cache LRU)
+    let p_blobs_dir = persistent_artwork_blobs_dir(artwork_cache_dir);
+    let orig_ext = ext_for_mime(&validated.mime_type);
+    let p_orig = p_blobs_dir.join(format!("{content_hash}_orig.{orig_ext}"));
+    if !p_orig.exists() {
+        atomic_write_persistent_artwork(&p_blobs_dir, &p_orig, &validated.bytes)?;
+    }
+    if let Ok(thumb_500) = art_process::generate_thumbnail(&validated, 500) {
+        if thumb_500.bytes != validated.bytes {
+            let t500_ext = ext_for_mime(&thumb_500.mime_type);
+            let p_500 = p_blobs_dir.join(format!("{content_hash}_500.{t500_ext}"));
+            if !p_500.exists() {
+                let _ = atomic_write_persistent_artwork(&p_blobs_dir, &p_500, &thumb_500.bytes);
+            }
+        }
+    }
+
+    // 2. Also warm Phase 3 disposable artwork cache for fast thumbnail serving
     let key = format!("track::{track_id}");
-    let rec = art_cache::store_artwork_blob(
+    let _ = art_cache::store_artwork_blob(
         artwork_cache_dir,
         &[key],
         Some(track_id),
@@ -412,10 +489,8 @@ fn store_artwork_in_cache_and_ref_tx(
             confidence: 100,
             ..Default::default()
         },
-    )?;
-    let content_hash = rec
-        .content_hash
-        .unwrap_or_else(|| format!("{:x}", Sha256::digest(bytes)));
+    );
+
     tx.execute(
         r#"
         INSERT INTO artwork_refs (track_id, content_hash, mime_type, updated_at)
@@ -530,6 +605,7 @@ pub fn delete_tracks(
 
     let keys: Vec<String> = ids.iter().map(|id| format!("track::{id}")).collect();
     let _ = art_cache::invalidate_keys(artwork_cache_dir, &keys);
+    remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
     Ok(())
 }
 
@@ -546,7 +622,9 @@ pub fn put_artwork(
     }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     store_artwork_in_cache_and_ref_tx(&tx, artwork_cache_dir, track_id, bytes)?;
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(|e| e.to_string())?;
+    remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
+    Ok(())
 }
 
 pub fn get_artwork(
@@ -566,21 +644,18 @@ pub fn get_artwork(
         .optional()
         .map_err(|e| e.to_string())?;
 
-    let key = format!("track::{track_id}");
-    if let Ok(Some(rec)) = art_cache::read_cached_artwork(artwork_cache_dir, &key, true) {
-        if let Some(p) = art_cache::blob_path_for_record(&rec, 500) {
-            if let Ok(bytes) = fs::read(&p) {
-                let mime = rec.mime_type.unwrap_or_else(|| "image/jpeg".into());
-                return Ok(Some((mime, bytes)));
-            }
-        }
-    }
+    let Some((content_hash, mime_type)) = row else {
+        return Ok(None);
+    };
 
-    if let Some((content_hash, mime_type)) = row {
-        let blobs_dir = artwork_cache_dir.join("blobs");
-        if let Ok(entries) = fs::read_dir(&blobs_dir) {
-            let prefix_500 = format!("{content_hash}_500.");
-            let prefix_orig = format!("{content_hash}_orig.");
+    // 1. Check durable persistent artwork store first, then disposable artwork cache blobs
+    let p_blobs_dir = persistent_artwork_blobs_dir(artwork_cache_dir);
+    let c_blobs_dir = artwork_cache_dir.join("blobs");
+    let prefix_500 = format!("{content_hash}_500.");
+    let prefix_orig = format!("{content_hash}_orig.");
+
+    for dir in [&p_blobs_dir, &c_blobs_dir] {
+        if let Ok(entries) = fs::read_dir(dir) {
             let mut orig_candidate = None;
             for entry in entries.flatten() {
                 let fname = entry.file_name().to_string_lossy().into_owned();
@@ -617,6 +692,7 @@ pub fn delete_artwork(
     )
     .map_err(|e| e.to_string())?;
     let _ = art_cache::invalidate_keys(artwork_cache_dir, &[format!("track::{track_id}")]);
+    remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
     Ok(())
 }
 
@@ -1119,6 +1195,7 @@ pub fn clear_library(conn: &mut Connection, artwork_cache_dir: &Path) -> Result<
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     let _ = art_cache::clear_all_cache(artwork_cache_dir);
+    remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
     Ok(())
 }
 
@@ -1139,6 +1216,7 @@ pub fn clear_all_data(conn: &mut Connection, artwork_cache_dir: &Path) -> Result
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     let _ = art_cache::clear_all_cache(artwork_cache_dir);
+    remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
     Ok(())
 }
 
@@ -1232,6 +1310,7 @@ pub fn replace_library(
             .map(|id| format!("track::{id}"))
             .collect();
         let _ = art_cache::invalidate_keys(artwork_cache_dir, &keys);
+        remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
     }
 
     Ok(())
@@ -1246,23 +1325,20 @@ pub fn begin_idb_migration(
     req.validate()?;
     ensure_migration_state_row(conn)?;
 
-    // Idempotency check: if already authority == 'sqlite' and verified_checksum matches expected_checksum
-    // and current counts match expected counts, return current status immediately without re-wiping.
-    let (current_auth, verified_cs): (String, Option<String>) = conn
+    let current_auth: String = conn
         .query_row(
-            "SELECT authority, verified_checksum FROM migration_state WHERE id = 1",
+            "SELECT authority FROM migration_state WHERE id = 1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
 
-    if current_auth == "sqlite" && verified_cs.as_deref() == Some(req.expected_checksum.as_str()) {
+    // P0 Data Integrity Guard: Once SQLite is authoritative, NEVER overwrite or wipe
+    // existing SQLite records during automatic migration—even if IndexedDB holds an older
+    // or divergent snapshot—unless `force_reimport` is explicitly requested and SQLite is healthy.
+    if current_auth == "sqlite" {
         let status = get_status(conn)?;
-        if status.integrity_ok
-            && status.track_count == req.expected_tracks
-            && status.playlist_count == req.expected_playlists
-            && status.lyrics_count == req.expected_lyrics
-        {
+        if status.integrity_ok && !req.force_reimport {
             return Ok(status);
         }
     }
@@ -1325,11 +1401,6 @@ pub fn write_idb_migration_batch(
     artwork_cache_dir: &Path,
     batch: &MigrationBatchRequest,
 ) -> Result<(), String> {
-    if let Err(validation_err) = batch.validate() {
-        let _ = mark_migration_failed(conn, &validation_err);
-        return Err(validation_err);
-    }
-
     let (authority, active_id): (String, Option<String>) = conn
         .query_row(
             "SELECT authority, migration_id FROM migration_state WHERE id = 1",
@@ -1339,9 +1410,12 @@ pub fn write_idb_migration_batch(
         .map_err(|e| e.to_string())?;
 
     if authority != "migrating" || active_id.as_deref() != Some(batch.migration_id.as_str()) {
-        let err = "No active migration matches the supplied migrationId.".to_string();
-        let _ = mark_migration_failed(conn, &err);
-        return Err(err);
+        return Err("No active migration matches the supplied migrationId.".to_string());
+    }
+
+    if let Err(validation_err) = batch.validate() {
+        let _ = mark_migration_failed(conn, &validation_err);
+        return Err(validation_err);
     }
 
     let res = (|| -> Result<(), String> {
@@ -1400,6 +1474,22 @@ pub fn mark_migration_failed(
     conn: &mut Connection,
     reason: &str,
 ) -> Result<PersistenceStatusDto, String> {
+    let current_auth: String = conn
+        .query_row(
+            "SELECT authority FROM migration_state WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Never wipe an already-verified authoritative SQLite database if mark_migration_failed is called
+    if current_auth == "sqlite" {
+        let status = get_status(conn)?;
+        if status.integrity_ok {
+            return Ok(status);
+        }
+    }
+
     let _ = conn.execute_batch(
         r#"
         DELETE FROM playlist_tracks;

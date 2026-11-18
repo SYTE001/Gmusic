@@ -1,5 +1,19 @@
 import "fake-indexeddb/auto";
 
+// Ensure globalThis.Blob is Node's native buffer-backed Blob rather than jsdom's
+// Symbol-backed Blob wrapper, so structuredClone / fake-indexeddb preserves actual
+// binary bytes across IndexedDB transactions in tests just like a real browser.
+void import("node:buffer")
+  .then((mod) => {
+    if (mod.Blob) {
+      globalThis.Blob = mod.Blob as unknown as typeof globalThis.Blob;
+      if (typeof window !== "undefined") {
+        window.Blob = mod.Blob as unknown as typeof window.Blob;
+      }
+    }
+  })
+  .catch(() => undefined);
+
 // Node >= 26 ships an experimental `localStorage` global that stays
 // uninitialized unless `--localstorage-file` is provided, shadowing jsdom's
 // backed implementation in test runs. Restore a working in-memory storage.

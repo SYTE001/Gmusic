@@ -108,11 +108,7 @@ function createMockSqliteBackend() {
         return getStatus();
       case "begin_desktop_idb_migration": {
         const req = args.request as Record<string, unknown>;
-        if (
-          state.authority === "sqlite" &&
-          state.verifiedChecksum === req.expectedChecksum &&
-          state.tracks.size === req.expectedTracks
-        ) {
+        if (state.authority === "sqlite" && state.integrityOk && !req.forceReimport) {
           return getStatus();
         }
         clearTables();
@@ -182,6 +178,9 @@ function createMockSqliteBackend() {
         return getStatus();
       }
       case "fail_desktop_idb_migration": {
+        if (state.authority === "sqlite" && state.integrityOk) {
+          return getStatus();
+        }
         clearTables();
         state.authority = "recovery-required";
         state.lastError = String(args.reason ?? "Migration failed");
@@ -511,5 +510,108 @@ describe("LibraryRepository native SQLite migration & desktop runtime switching"
       tx.objectStore(STORES.tracks).put({ id: "bad-track", title: 12345 });
     });
     await expect(repository.migrateIndexedDbToSqlite()).rejects.toThrow("Malformed track record");
+  });
+
+  it("never overwrites modified authoritative SQLite data with a stale IndexedDB snapshot unless forceReimport is true", async () => {
+    // 1. Seed initial track in IndexedDB
+    const t1 = makeTrack({ id: "t1", title: "Original IDB Title" });
+    await repository.putTracks([t1]);
+
+    const backend = createMockSqliteBackend();
+    invoke.mockImplementation(backend.handler);
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    // 2. Migrate to SQLite
+    await repository.ensureDesktopPersistence();
+    expect(repository.getPersistenceAuthority()).toBe("sqlite");
+
+    // 3. Modify SQLite data (rename t1 and add t2 on desktop)
+    await repository.updateTrack("t1", { title: "Updated In SQLite" });
+    await repository.putTracks([makeTrack({ id: "t2", title: "Added In SQLite" })]);
+    expect(await repository.listTracks()).toHaveLength(2);
+
+    // 4. Simulate app restart or calling migrateIndexedDbToSqlite() while IndexedDB still has stale 1-track data
+    repository.resetDesktopAuthorityForTests();
+    const afterRestart = await repository.listTracks();
+    expect(afterRestart).toHaveLength(2);
+    expect(afterRestart.find((t) => t.id === "t1")?.title).toBe("Updated In SQLite");
+
+    const manualMigrateStatus = await repository.migrateIndexedDbToSqlite();
+    expect(manualMigrateStatus.authority).toBe("sqlite");
+    expect(manualMigrateStatus.trackCount).toBe(2);
+    expect((await repository.getTrack("t1"))?.title).toBe("Updated In SQLite");
+
+    // 5. Explicit forceReimport: true re-imports from IndexedDB
+    const forcedStatus = await repository.migrateIndexedDbToSqlite({ forceReimport: true });
+    expect(forcedStatus.authority).toBe("sqlite");
+    expect(forcedStatus.trackCount).toBe(1);
+    expect((await repository.getTrack("t1"))?.title).toBe("Original IDB Title");
+  });
+
+  it("rejects unreadable or empty artwork/audio blobs during migration without fabricating bytes and preserves IDB", async () => {
+    const t1 = makeTrack({ id: "t1", title: "Song With Empty Artwork" });
+    await repository.putTracks([t1]);
+    // Insert a 0-byte artwork blob into IndexedDB
+    await withTransaction([STORES.artwork], "readwrite", (tx) => {
+      tx.objectStore(STORES.artwork).put({ trackId: "t1", blob: new Blob([], { type: "image/png" }) });
+    });
+
+    const backend = createMockSqliteBackend();
+    invoke.mockImplementation(backend.handler);
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    await expect(repository.migrateIndexedDbToSqlite()).rejects.toThrow("empty or unreadable");
+    expect(backend.state.authority).toBe("recovery-required");
+    expect(backend.state.artwork.size).toBe(0);
+
+    // IndexedDB track remains intact and readable via fallback
+    const fallbackTracks = await repository.listTracks();
+    expect(fallbackTracks).toHaveLength(1);
+    expect(fallbackTracks[0].id).toBe("t1");
+  });
+
+  it("transfers artwork and audio blobs in memory-bounded paginated batches with SHA-256 hashes", async () => {
+    // Seed 30 artwork blobs and 7 stored-copy audio blobs in IndexedDB
+    const tracks: Track[] = [];
+    for (let i = 0; i < 30; i++) {
+      tracks.push(
+        makeTrack({
+          id: `art-track-${i}`,
+          title: `Art Track ${i}`,
+          desktopPath: i < 7 ? undefined : `C:\\Music\\${i}.flac`,
+          accessMode: i < 7 ? "stored-copy" : "desktop-path",
+        }),
+      );
+    }
+    await repository.putTracks(tracks);
+    for (let i = 0; i < 30; i++) {
+      await repository.putArtwork(`art-track-${i}`, new Blob([`image-payload-${i}`], { type: "image/png" }));
+    }
+    for (let i = 0; i < 7; i++) {
+      await repository.putAudioBlob(`art-track-${i}`, new Blob([`audio-payload-${i}`], { type: "audio/mpeg" }));
+    }
+
+    const backend = createMockSqliteBackend();
+    invoke.mockImplementation(backend.handler);
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    const status = await repository.migrateIndexedDbToSqlite();
+    expect(status.authority).toBe("sqlite");
+    expect(status.artworkCount).toBe(30);
+    expect(status.audioCount).toBe(7);
+
+    // Verify artwork was sent in 2 bounded batches (25 + 5) and audio in 2 bounded batches (5 + 2), each with sha256
+    const artworkBatches = invoke.mock.calls.filter(
+      (c) => c[0] === "write_desktop_idb_migration_batch" && Array.isArray((c[1] as { batch?: { artwork?: unknown[] } })?.batch?.artwork),
+    );
+    expect(artworkBatches).toHaveLength(2);
+    const firstArtEntry = (artworkBatches[0][1] as { batch: { artwork: Array<{ sha256?: string; bytes: number[] }> } }).batch.artwork[0];
+    expect(firstArtEntry.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(firstArtEntry.bytes.length).toBeGreaterThan(5);
+
+    const audioBatches = invoke.mock.calls.filter(
+      (c) => c[0] === "write_desktop_idb_migration_batch" && Array.isArray((c[1] as { batch?: { audio?: unknown[] } })?.batch?.audio),
+    );
+    expect(audioBatches).toHaveLength(2);
   });
 });

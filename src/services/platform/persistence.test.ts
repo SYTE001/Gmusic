@@ -231,4 +231,21 @@ describe("desktop SQLite persistence platform adapter", () => {
     });
     expect(invoke).toHaveBeenCalledWith("sqlite_put_pref_json", expect.objectContaining({ name: "app" }));
   });
+
+  it("rejects unreadable non-empty blobs with an actionable error instead of fabricating synthetic bytes", async () => {
+    const brokenNonEmptyBlob = {
+      size: 2048,
+      type: "audio/mpeg",
+      arrayBuffer: async () => {
+        throw new Error("Disk read error");
+      },
+    };
+    await expect(blobToByteArray(brokenNonEmptyBlob)).rejects.toThrow(
+      "Blob binary content is unreadable and cannot be migrated without data loss.",
+    );
+
+    // Genuinely empty (0-byte) blob returns [] without fabricating bytes
+    const emptyBlob = new Blob([], { type: "audio/mpeg" });
+    expect(await blobToByteArray(emptyBlob)).toEqual([]);
+  });
 });

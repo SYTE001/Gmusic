@@ -43,12 +43,14 @@ export interface MigrationBeginRequest {
   expectedArtwork: number;
   expectedAudio: number;
   expectedChecksum: string;
+  forceReimport?: boolean;
 }
 
 export interface BinaryBlobPayload {
   trackId: string;
   mimeType: string;
   bytes: number[];
+  sha256?: string;
 }
 
 export interface MigrationBatchRequest {
@@ -84,8 +86,16 @@ function isValidPersistenceStatus(value: unknown): value is PersistenceStatus {
   );
 }
 
+export async function computeBytesSha256(bytes: number[] | Uint8Array): Promise<string> {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const digest = await crypto.subtle.digest("SHA-256", arr as unknown as BufferSource);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export async function blobToByteArray(value: unknown): Promise<number[]> {
-  if (!value) return [];
+  if (value === null || value === undefined) return [];
   if (value instanceof ArrayBuffer) {
     return Array.from(new Uint8Array(value));
   }
@@ -99,9 +109,11 @@ export async function blobToByteArray(value: unknown): Promise<number[]> {
   if (typeof blob.arrayBuffer === "function") {
     try {
       const buf = await blob.arrayBuffer();
-      if (buf && buf.byteLength > 0) return Array.from(new Uint8Array(buf));
+      if (buf && (buf.byteLength > 0 || blob.size === 0)) {
+        return Array.from(new Uint8Array(buf));
+      }
     } catch {
-      // Fall through
+      // Fall through to alternative readers
     }
   }
   if (blob._buffer) {
@@ -114,28 +126,8 @@ export async function blobToByteArray(value: unknown): Promise<number[]> {
       );
     }
   }
-  if (typeof FileReader !== "undefined") {
-    try {
-      const buf = await new Promise<ArrayBuffer>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(reader.result as ArrayBuffer);
-        reader.onerror = () => reject(reader.error ?? new Error("FileReader failed"));
-        reader.readAsArrayBuffer(blob as Blob);
-      });
-      if (buf && buf.byteLength > 0) return Array.from(new Uint8Array(buf));
-    } catch {
-      // Fall through
-    }
-  }
-  if (typeof Response !== "undefined") {
-    try {
-      const buf = await new Response(blob as BodyInit).arrayBuffer();
-      if (buf && buf.byteLength > 0) return Array.from(new Uint8Array(buf));
-    } catch {
-      // Fall through
-    }
-  }
   if (isObject(value)) {
+    // Extract internal jsdom Blob buffer symbol if structured clone returned a plain object
     for (const sym of Object.getOwnPropertySymbols(value)) {
       const impl = (value as Record<symbol, unknown>)[sym];
       if (isObject(impl) && impl._buffer) {
@@ -146,15 +138,43 @@ export async function blobToByteArray(value: unknown): Promise<number[]> {
         }
       }
     }
-    const size =
-      typeof value.size === "number" && Number.isFinite(value.size) && value.size > 0
-        ? Math.min(value.size, 1024 * 1024)
-        : 0;
-    if (size > 0) {
-      return new Array<number>(size).fill(1);
+    // Also check if structured clone copied `_buffer` as a numeric-keyed or Buffer-like object
+    if (isObject(value._buffer)) {
+      const rawBuf = value._buffer as Record<string, unknown>;
+      if (rawBuf.type === "Buffer" && Array.isArray(rawBuf.data)) {
+        return (rawBuf.data as unknown[]).map((v) => Number(v) & 0xff);
+      }
     }
   }
-  return [];
+  if (typeof FileReader !== "undefined") {
+    try {
+      const buf = await new Promise<ArrayBuffer>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as ArrayBuffer);
+        reader.onerror = () => reject(reader.error ?? new Error("FileReader failed"));
+        reader.readAsArrayBuffer(blob as Blob);
+      });
+      if (buf && (buf.byteLength > 0 || blob.size === 0)) {
+        return Array.from(new Uint8Array(buf));
+      }
+    } catch {
+      // Fall through
+    }
+  }
+  if (typeof Response !== "undefined" && typeof Blob !== "undefined" && value instanceof Blob) {
+    try {
+      const buf = await new Response(value).arrayBuffer();
+      if (buf && (buf.byteLength > 0 || value.size === 0)) {
+        return Array.from(new Uint8Array(buf));
+      }
+    } catch {
+      // Fall through
+    }
+  }
+  if (isObject(value) && typeof value.size === "number" && value.size === 0) {
+    return [];
+  }
+  throw new Error("Blob binary content is unreadable and cannot be migrated without data loss.");
 }
 
 export function byteArrayToBlob(raw: unknown, defaultMime = "application/octet-stream"): Blob | undefined {

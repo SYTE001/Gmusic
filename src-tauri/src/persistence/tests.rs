@@ -264,6 +264,7 @@ fn idb_migration_verifies_counts_and_checksum_and_is_idempotent() {
         expected_artwork: 0,
         expected_audio: 0,
         expected_checksum: expected_checksum.clone(),
+        force_reimport: false,
     };
 
     let st = begin_idb_migration(&mut conn, &begin_req).unwrap();
@@ -314,6 +315,7 @@ fn interrupted_or_failed_migration_falls_back_to_recovery_required_and_recovers_
         expected_artwork: 0,
         expected_audio: 0,
         expected_checksum: "dummy-checksum".into(),
+        force_reimport: false,
     };
 
     begin_idb_migration(&mut conn, &begin_req).unwrap();
@@ -545,5 +547,162 @@ fn rejects_duplicate_ids_and_malformed_records_and_preserves_missing_availabilit
     assert_eq!(
         get_track(&conn, "t-missing").unwrap().unwrap().availability,
         "missing"
+    );
+}
+
+#[test]
+fn protects_authoritative_sqlite_data_from_stale_idb_snapshots_unless_force_reimport_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("authoritative.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+
+    let t1 = make_track("t1", "Initial Title");
+    let mut temp_conn = Connection::open_in_memory().unwrap();
+    configure_connection(&temp_conn).unwrap();
+    apply_migrations(&mut temp_conn).unwrap();
+    put_tracks(&mut temp_conn, std::slice::from_ref(&t1)).unwrap();
+    let stale_idb_cs = compute_library_checksum(&temp_conn).unwrap();
+
+    // 1. Perform initial migration from IndexedDB -> SQLite becomes authoritative
+    let begin_req = MigrationBeginRequest {
+        migration_id: "mig-initial".into(),
+        expected_tracks: 1,
+        expected_checksum: stale_idb_cs.clone(),
+        ..Default::default()
+    };
+    begin_idb_migration(&mut conn, &begin_req).unwrap();
+    write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-initial".into(),
+            tracks: vec![t1],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let st = finalize_idb_migration(&mut conn, "mig-initial").unwrap();
+    assert_eq!(st.authority, "sqlite");
+
+    // 2. Mutate SQLite directly (user imports a new track and renames t1 on desktop)
+    let t1_edited = make_track("t1", "Edited On Desktop");
+    let t2_new = make_track("t2", "Imported On Desktop");
+    put_tracks(&mut conn, &[t1_edited, t2_new]).unwrap();
+    assert_eq!(list_tracks(&conn).unwrap().len(), 2);
+
+    // 3. Call begin_idb_migration with the stale 1-track IndexedDB snapshot (force_reimport: false)
+    // Must NOT wipe SQLite or revert to 1 track!
+    let stale_req = MigrationBeginRequest {
+        migration_id: "mig-stale-attempt".into(),
+        expected_tracks: 1,
+        expected_checksum: stale_idb_cs.clone(),
+        force_reimport: false,
+        ..Default::default()
+    };
+    let protected_st = begin_idb_migration(&mut conn, &stale_req).unwrap();
+    assert_eq!(protected_st.authority, "sqlite");
+    assert_eq!(protected_st.track_count, 2);
+    assert_eq!(
+        get_track(&conn, "t1").unwrap().unwrap().title,
+        "Edited On Desktop"
+    );
+
+    // 4. Even if mark_migration_failed is mistakenly called while authority == 'sqlite', data is preserved
+    let fail_st = mark_migration_failed(&mut conn, "accidental error").unwrap();
+    assert_eq!(fail_st.authority, "sqlite");
+    assert_eq!(fail_st.track_count, 2);
+
+    // 5. Explicit force_reimport: true allows intentional re-migration
+    let force_req = MigrationBeginRequest {
+        migration_id: "mig-forced".into(),
+        expected_tracks: 1,
+        expected_checksum: stale_idb_cs,
+        force_reimport: true,
+        ..Default::default()
+    };
+    let forced_st = begin_idb_migration(&mut conn, &force_req).unwrap();
+    assert_eq!(forced_st.authority, "migrating");
+}
+
+#[test]
+fn persistent_artwork_survives_disposable_cache_pruning_and_cleans_up_only_when_unreferenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("art_persist.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+
+    let t1 = make_track("t1", "Song 1");
+    let t2 = make_track("t2", "Song 2");
+    put_tracks(&mut conn, &[t1, t2]).unwrap();
+
+    // Shared content-addressed artwork across t1 and t2
+    let png = sample_png_bytes(99);
+    put_artwork(&mut conn, &art_dir, "t1", &png).unwrap();
+    put_artwork(&mut conn, &art_dir, "t2", &png).unwrap();
+
+    // Aggressively prune disposable artwork-v1 cache to 0 bytes AND clear all disposable cache
+    crate::artwork::cache::prune_cache(&art_dir, 0).unwrap();
+    crate::artwork::cache::clear_all_cache(&art_dir).unwrap();
+
+    // SQLite-owned artwork must STILL be available from persistent-artwork-v1/blobs!
+    let (mime1, bytes1) = get_artwork(&conn, &art_dir, "t1").unwrap().unwrap();
+    assert_eq!(mime1, "image/png");
+    assert_eq!(bytes1, png);
+
+    // Reopen connection (simulating app restart) -> artwork still available
+    drop(conn);
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+    assert!(get_artwork(&conn, &art_dir, "t1").unwrap().is_some());
+
+    // Delete t1 -> shared persistent blob must remain intact for t2
+    delete_tracks(&mut conn, &art_dir, &["t1".into()]).unwrap();
+    assert!(get_artwork(&conn, &art_dir, "t1").unwrap().is_none());
+    let (_, bytes2) = get_artwork(&conn, &art_dir, "t2").unwrap().unwrap();
+    assert_eq!(bytes2, png);
+
+    // Delete t2 -> now unreferenced persistent blob is cleaned up from disk
+    delete_tracks(&mut conn, &art_dir, &["t2".into()]).unwrap();
+    assert!(get_artwork(&conn, &art_dir, "t2").unwrap().is_none());
+    let p_blobs = dir.path().join("persistent-artwork-v1").join("blobs");
+    let remaining_files = std::fs::read_dir(&p_blobs).unwrap().count();
+    assert_eq!(remaining_files, 0);
+}
+
+#[test]
+fn verifies_binary_sha256_on_migration_batches_and_rejects_corrupted_or_oversized_blobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("sha_verify.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-sha".into(),
+            expected_tracks: 0,
+            expected_artwork: 1,
+            expected_checksum: "empty".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let png = sample_png_bytes(44);
+    let bad_batch = MigrationBatchRequest {
+        migration_id: "mig-sha".into(),
+        artwork: vec![ArtworkMigrationEntryDto {
+            track_id: "t1".into(),
+            mime_type: "image/png".into(),
+            bytes: png,
+            sha256: Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+        }],
+        ..Default::default()
+    };
+    let err = write_idb_migration_batch(&mut conn, &art_dir, &bad_batch).unwrap_err();
+    assert!(err.contains("SHA-256 mismatch"));
+    assert_eq!(
+        get_status(&mut conn).unwrap().authority,
+        "recovery-required"
     );
 }

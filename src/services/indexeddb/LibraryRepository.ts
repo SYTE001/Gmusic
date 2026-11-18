@@ -12,6 +12,7 @@ import { isTauriRuntime } from "../platform/desktop";
 import {
   beginDesktopIdbMigration,
   blobToByteArray,
+  computeBytesSha256,
   computeSnapshotChecksum,
   failDesktopIdbMigration,
   finalizeDesktopIdbMigration,
@@ -189,11 +190,24 @@ export class LibraryRepository {
   }
 
   /**
-   * Reads a consistent snapshot of all IndexedDB stores in a single readonly
-   * transaction and transfers it to SQLite in bounded transactional batches.
-   * Never clears or mutates IndexedDB.
+   * Reads a consistent metadata and key snapshot of IndexedDB in a single readonly
+   * transaction, then transfers metadata and binary blobs (artwork/audio) in bounded,
+   * memory-safe paginated batches with SHA-256 verification and concurrent-modification detection.
+   * Never clears or mutates IndexedDB, and never overwrites authoritative SQLite data unless
+   * `options.forceReimport` is explicitly true.
    */
-  async migrateIndexedDbToSqlite(): Promise<PersistenceStatus> {
+  async migrateIndexedDbToSqlite(options?: { forceReimport?: boolean }): Promise<PersistenceStatus> {
+    const forceReimport = options?.forceReimport === true;
+    const preStatus = await getDesktopPersistenceStatus();
+    if (!preStatus) {
+      throw new Error("Desktop SQLite migration unavailable.");
+    }
+    if (preStatus.authority === "sqlite" && preStatus.integrityOk && !forceReimport) {
+      this.lastStatus = preStatus;
+      this.activeAuthority = "sqlite";
+      return preStatus;
+    }
+
     this.activeAuthority = "migrating";
     const migrationId = `mig-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -209,7 +223,7 @@ export class LibraryRepository {
       ],
       "readonly",
       async (tx) => {
-        const [tracks, playlists, lyrics, lyricsMeta, rawPrefs, artworkRecords, audioRecords] =
+        const [tracks, playlists, lyrics, lyricsMeta, rawPrefs, artworkKeys, audioKeys] =
           await Promise.all([
             requestToPromise(tx.objectStore(STORES.tracks).getAll() as IDBRequest<Track[]>),
             requestToPromise(tx.objectStore(STORES.playlists).getAll() as IDBRequest<Playlist[]>),
@@ -220,10 +234,8 @@ export class LibraryRepository {
             requestToPromise(
               tx.objectStore(STORES.prefs).getAll() as IDBRequest<RawPrefRecord[]>,
             ),
-            requestToPromise(
-              tx.objectStore(STORES.artwork).getAll() as IDBRequest<ArtworkRecord[]>,
-            ),
-            requestToPromise(tx.objectStore(STORES.audio).getAll() as IDBRequest<AudioRecord[]>),
+            requestToPromise(tx.objectStore(STORES.artwork).getAllKeys()),
+            requestToPromise(tx.objectStore(STORES.audio).getAllKeys()),
           ]);
         return {
           tracks,
@@ -231,8 +243,8 @@ export class LibraryRepository {
           lyrics,
           lyricsMeta,
           rawPrefs,
-          artworkRecords,
-          audioRecords,
+          artworkTrackIds: artworkKeys.map(String),
+          audioTrackIds: audioKeys.map(String),
         };
       },
     );
@@ -288,48 +300,19 @@ export class LibraryRepository {
       }
     }
 
-    const artworkPayloads: BinaryBlobPayload[] = [];
-    for (const art of snapshot.artworkRecords) {
-      if (!art || typeof art.trackId !== "string" || !art.blob) continue;
-      try {
-        let bytes = await blobToByteArray(art.blob);
-        if (bytes.length === 0 && typeof art.blob === "object") {
-          bytes = [1];
-        }
-        if (bytes.length > 0) {
-          artworkPayloads.push({
-            trackId: art.trackId,
-            mimeType: (art.blob as { type?: string }).type || "image/jpeg",
-            bytes,
-          });
-        }
-      } catch {
-        // Skip unreadable blob
-      }
-    }
-
-    const audioPayloads: BinaryBlobPayload[] = [];
-    for (const aud of snapshot.audioRecords) {
-      if (!aud || typeof aud.trackId !== "string" || !aud.blob) continue;
-      // Do not duplicate audio into SQLite if the track already has an authoritative desktopPath
-      const ownerTrack = trackById.get(aud.trackId);
-      if (ownerTrack?.desktopPath) continue;
-      try {
-        let bytes = await blobToByteArray(aud.blob);
-        if (bytes.length === 0 && typeof aud.blob === "object") {
-          bytes = [1];
-        }
-        if (bytes.length > 0) {
-          audioPayloads.push({
-            trackId: aud.trackId,
-            mimeType: (aud.blob as { type?: string }).type || ownerTrack?.mimeType || "audio/mpeg",
-            bytes,
-          });
-        }
-      } catch {
-        // Skip unreadable audio blob
-      }
-    }
+    const artworkIdsToMigrate = Array.from(
+      new Set(snapshot.artworkTrackIds.filter((id) => id.trim().length > 0)),
+    );
+    // Do not duplicate audio into SQLite if the track already has an authoritative desktopPath
+    const audioIdsToMigrate = Array.from(
+      new Set(
+        snapshot.audioTrackIds.filter((id) => {
+          if (!id.trim()) return false;
+          const ownerTrack = trackById.get(id);
+          return !ownerTrack?.desktopPath;
+        }),
+      ),
+    );
 
     const expectedChecksum = await computeSnapshotChecksum({
       tracks: validTracks,
@@ -345,17 +328,17 @@ export class LibraryRepository {
         expectedLyrics: validLyrics.length,
         expectedLyricsMeta: validLyricsMeta.length,
         expectedPrefs: prefEntries.length,
-        expectedArtwork: artworkPayloads.length,
-        expectedAudio: audioPayloads.length,
+        expectedArtwork: artworkIdsToMigrate.length,
+        expectedAudio: audioIdsToMigrate.length,
         expectedChecksum,
+        forceReimport,
       });
 
       if (!beginStatus) {
         throw new Error("Desktop SQLite migration unavailable.");
       }
 
-      // Idempotent fast-path: already verified with identical counts and checksum
-      if (beginStatus.authority === "sqlite" && beginStatus.integrityOk) {
+      if (beginStatus.authority === "sqlite" && beginStatus.integrityOk && !forceReimport) {
         this.lastStatus = beginStatus;
         this.activeAuthority = "sqlite";
         return beginStatus;
@@ -376,11 +359,99 @@ export class LibraryRepository {
       if (prefEntries.length > 0) {
         await writeDesktopIdbMigrationBatch({ migrationId, prefs: prefEntries });
       }
-      for (const chunk of chunkArray(artworkPayloads, MIGRATION_ARTWORK_BATCH_SIZE)) {
-        await writeDesktopIdbMigrationBatch({ migrationId, artwork: chunk });
+
+      // Paginated artwork migration: read only MIGRATION_ARTWORK_BATCH_SIZE blobs into memory at a time
+      for (const idChunk of chunkArray(artworkIdsToMigrate, MIGRATION_ARTWORK_BATCH_SIZE)) {
+        const records = await withTransaction([STORES.artwork], "readonly", (tx) => {
+          const store = tx.objectStore(STORES.artwork);
+          return Promise.all(
+            idChunk.map((tid) =>
+              requestToPromise(store.get(tid) as IDBRequest<ArtworkRecord | undefined>),
+            ),
+          );
+        });
+        const artworkBatch: BinaryBlobPayload[] = [];
+        for (let i = 0; i < idChunk.length; i++) {
+          const tid = idChunk[i];
+          const art = records[i];
+          if (!art || !art.blob) {
+            throw new Error(
+              `IndexedDB artwork record for track "${tid}" disappeared during migration (concurrent modification detected).`,
+            );
+          }
+          const bytes = await blobToByteArray(art.blob);
+          if (bytes.length === 0) {
+            throw new Error(`IndexedDB artwork blob for track "${tid}" is empty or unreadable.`);
+          }
+          const sha256 = await computeBytesSha256(bytes);
+          artworkBatch.push({
+            trackId: tid,
+            mimeType: (art.blob as { type?: string }).type || "image/jpeg",
+            bytes,
+            sha256,
+          });
+        }
+        await writeDesktopIdbMigrationBatch({ migrationId, artwork: artworkBatch });
       }
-      for (const chunk of chunkArray(audioPayloads, MIGRATION_AUDIO_BATCH_SIZE)) {
-        await writeDesktopIdbMigrationBatch({ migrationId, audio: chunk });
+
+      // Paginated audio migration: read only MIGRATION_AUDIO_BATCH_SIZE blobs into memory at a time
+      for (const idChunk of chunkArray(audioIdsToMigrate, MIGRATION_AUDIO_BATCH_SIZE)) {
+        const records = await withTransaction([STORES.audio], "readonly", (tx) => {
+          const store = tx.objectStore(STORES.audio);
+          return Promise.all(
+            idChunk.map((tid) =>
+              requestToPromise(store.get(tid) as IDBRequest<AudioRecord | undefined>),
+            ),
+          );
+        });
+        const audioBatch: BinaryBlobPayload[] = [];
+        for (let i = 0; i < idChunk.length; i++) {
+          const tid = idChunk[i];
+          const aud = records[i];
+          if (!aud || !aud.blob) {
+            throw new Error(
+              `IndexedDB audio record for track "${tid}" disappeared during migration (concurrent modification detected).`,
+            );
+          }
+          const bytes = await blobToByteArray(aud.blob);
+          if (bytes.length === 0) {
+            throw new Error(`IndexedDB audio blob for track "${tid}" is empty or unreadable.`);
+          }
+          const sha256 = await computeBytesSha256(bytes);
+          const ownerTrack = trackById.get(tid);
+          audioBatch.push({
+            trackId: tid,
+            mimeType:
+              (aud.blob as { type?: string }).type || ownerTrack?.mimeType || "audio/mpeg",
+            bytes,
+            sha256,
+          });
+        }
+        await writeDesktopIdbMigrationBatch({ migrationId, audio: audioBatch });
+      }
+
+      // Verify IndexedDB metadata did not mutate concurrently during paginated blob transfer
+      const postMeta = await withTransaction(
+        [STORES.tracks, STORES.playlists, STORES.lyrics],
+        "readonly",
+        async (tx) => {
+          const [tracks, playlists, lyrics] = await Promise.all([
+            requestToPromise(tx.objectStore(STORES.tracks).getAll() as IDBRequest<Track[]>),
+            requestToPromise(tx.objectStore(STORES.playlists).getAll() as IDBRequest<Playlist[]>),
+            requestToPromise(tx.objectStore(STORES.lyrics).getAll() as IDBRequest<TrackLyrics[]>),
+          ]);
+          return { tracks, playlists, lyrics };
+        },
+      );
+      const postChecksum = await computeSnapshotChecksum({
+        tracks: [...new Map(postMeta.tracks.map((t) => [t.id, t])).values()],
+        playlists: [...new Map(postMeta.playlists.map((p) => [p.id, p])).values()],
+        lyrics: [...new Map(postMeta.lyrics.map((l) => [l.trackId, l])).values()],
+      });
+      if (postChecksum !== expectedChecksum) {
+        throw new Error(
+          "IndexedDB library was modified concurrently during migration. Rolling back incomplete SQLite migration.",
+        );
       }
 
       const finalStatus = await finalizeDesktopIdbMigration(migrationId);
@@ -395,8 +466,10 @@ export class LibraryRepository {
       const failedStatus = await failDesktopIdbMigration(reason).catch(() => null);
       if (failedStatus) {
         this.lastStatus = failedStatus;
+        this.activeAuthority = failedStatus.authority;
+      } else {
+        this.activeAuthority = "recovery-required";
       }
-      this.activeAuthority = "recovery-required";
       throw error;
     }
   }
