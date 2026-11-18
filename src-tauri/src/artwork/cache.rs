@@ -1,4 +1,4 @@
-use super::process::{generate_thumbnail, validate_and_inspect_image, ValidatedImage};
+use super::process::{generate_thumbnails, validate_and_inspect_image, ValidatedImage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -153,7 +153,8 @@ pub fn store_artwork_blob(
         atomic_write_file(&blobs_dir, &orig_path, &image.bytes)?;
     }
 
-    let thumb_500 = generate_thumbnail(image, 500)?;
+    let thumbnails = generate_thumbnails(image, &[500, 256])?;
+    let thumb_500 = &thumbnails[0];
     let t500_ext = ext_for_mime(&thumb_500.mime_type);
     let t500_path = if thumb_500.bytes == image.bytes {
         orig_path.clone()
@@ -165,7 +166,7 @@ pub fn store_artwork_blob(
         p
     };
 
-    let thumb_256 = generate_thumbnail(image, 256)?;
+    let thumb_256 = &thumbnails[1];
     let t256_ext = ext_for_mime(&thumb_256.mime_type);
     let t256_path = if thumb_256.bytes == image.bytes {
         orig_path.clone()

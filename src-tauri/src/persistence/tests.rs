@@ -481,6 +481,29 @@ fn detects_database_corruption_and_transitions_to_recovery_required() {
 }
 
 #[tokio::test]
+async fn persistence_connection_work_does_not_block_async_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = PersistenceEngine::new().unwrap();
+    let path = dir.path().join("progress.sqlite3");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let task = tokio::spawn(async move {
+        engine
+            .with_conn(path, move |conn| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                put_tracks(conn, &[make_track("progress", "Progress")])
+            })
+            .await
+    });
+    entered_rx.await.unwrap();
+    // The current-thread runtime can release the deliberately blocked connection.
+    tokio::task::yield_now().await;
+    release_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn persistence_engine_handles_concurrent_access_without_blocking_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("concurrent.sqlite3");
@@ -506,6 +529,24 @@ async fn persistence_engine_handles_concurrent_access_without_blocking_runtime()
         .await
         .unwrap();
     assert_eq!(tracks.len(), 10);
+}
+
+#[test]
+fn cached_track_upsert_rolls_back_sql_failure_and_remains_reusable() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut conn = open_and_initialize_db(&dir.path().join("cached.sqlite3")).unwrap();
+    let original = make_track("original", "Original");
+    put_tracks(&mut conn, std::slice::from_ref(&original)).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_fixture BEFORE INSERT ON tracks WHEN NEW.id = 'reject' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+    let update = make_track("original", "Should roll back");
+    let rejected = make_track("reject", "Rejected");
+    assert!(put_tracks(&mut conn, &[update, rejected]).is_err());
+    assert_eq!(list_tracks(&conn).unwrap(), vec![original]);
+    conn.execute_batch("DROP TRIGGER reject_fixture;").unwrap();
+    let accepted = make_track("reject", "Accepted after rollback");
+    put_tracks(&mut conn, std::slice::from_ref(&accepted)).unwrap();
+    assert_eq!(get_track(&conn, "reject").unwrap(), Some(accepted));
+    assert!(run_integrity_checks(&conn).unwrap().is_empty());
 }
 
 #[test]

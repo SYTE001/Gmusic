@@ -8,6 +8,9 @@ mod artwork;
 mod lyrics;
 mod persistence;
 
+#[cfg(test)]
+mod performance_tests;
+
 const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "m4a", "m4b", "aac", "wav", "wave", "ogg", "oga", "opus", "flac", "weba", "webm", "mp4",
 ];

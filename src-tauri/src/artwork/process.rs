@@ -85,12 +85,27 @@ pub fn validate_and_inspect_image(bytes: &[u8]) -> Result<ValidatedImage, String
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static THUMBNAIL_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn generate_thumbnail(
     source: &ValidatedImage,
     max_edge: u32,
 ) -> Result<ValidatedImage, String> {
-    if max_edge == 0 || (source.width <= max_edge && source.height <= max_edge) {
-        return Ok(source.clone());
+    Ok(generate_thumbnails(source, &[max_edge])?.remove(0))
+}
+
+pub fn generate_thumbnails(
+    source: &ValidatedImage,
+    max_edges: &[u32],
+) -> Result<Vec<ValidatedImage>, String> {
+    let needs_resize = max_edges
+        .iter()
+        .any(|&edge| edge != 0 && (source.width > edge || source.height > edge));
+    if !needs_resize {
+        return Ok(max_edges.iter().map(|_| source.clone()).collect());
     }
 
     let mut reader = ImageReader::new(Cursor::new(&source.bytes))
@@ -102,9 +117,27 @@ pub fn generate_thumbnail(
     limits.max_alloc = Some(192 * 1024 * 1024);
     reader.limits(limits);
 
+    #[cfg(test)]
+    THUMBNAIL_DECODES.with(|count| count.set(count.get() + 1));
     let decoded = reader
         .decode()
         .map_err(|e| format!("Failed to decode image for resize: {e}"))?;
+    max_edges
+        .iter()
+        .map(|&max_edge| {
+            if max_edge == 0 || (source.width <= max_edge && source.height <= max_edge) {
+                return Ok(source.clone());
+            }
+            encode_thumbnail(&decoded, source, max_edge)
+        })
+        .collect()
+}
+
+fn encode_thumbnail(
+    decoded: &image::DynamicImage,
+    source: &ValidatedImage,
+    max_edge: u32,
+) -> Result<ValidatedImage, String> {
     let resized = decoded.resize(max_edge, max_edge, FilterType::Triangle);
     let width = resized.width();
     let height = resized.height();
@@ -166,6 +199,34 @@ mod tests {
             0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3
         ])
         .is_err());
+    }
+
+    #[test]
+    fn thumbnail_pair_decodes_once_and_matches_individual_results() {
+        let bytes = make_test_image(800, 600, ImageFormat::Png);
+        let validated = validate_and_inspect_image(&bytes).unwrap();
+        let expected = [
+            generate_thumbnail(&validated, 500).unwrap(),
+            generate_thumbnail(&validated, 256).unwrap(),
+        ];
+        THUMBNAIL_DECODES.with(|count| count.set(0));
+        let thumbnails = generate_thumbnails(&validated, &[500, 256]).unwrap();
+        assert_eq!(THUMBNAIL_DECODES.with(|count| count.get()), 1);
+        assert_eq!(thumbnails, expected);
+        for thumbnail in thumbnails {
+            assert_eq!(
+                validate_and_inspect_image(&thumbnail.bytes).unwrap(),
+                thumbnail
+            );
+        }
+        let small =
+            validate_and_inspect_image(&make_test_image(120, 80, ImageFormat::Png)).unwrap();
+        THUMBNAIL_DECODES.with(|count| count.set(0));
+        assert_eq!(
+            generate_thumbnails(&small, &[500, 256, 0]).unwrap(),
+            vec![small.clone(), small.clone(), small]
+        );
+        assert_eq!(THUMBNAIL_DECODES.with(|count| count.get()), 0);
     }
 
     #[test]
