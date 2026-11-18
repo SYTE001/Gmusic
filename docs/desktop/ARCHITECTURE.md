@@ -103,3 +103,11 @@ React 19 UI (src/components/, src/features/)
 - Playlist detail uses a local lookup map and one memoized ordered playback context array rather than quadratic lookups/per-row copies. Missing/duplicate memberships and drag/keyboard controls retain their existing behavior. No design or renderer changes.
 - `performance_tests.rs` is test-only and opt-in (`GMUSIC_BENCH=1`); it never adds production IPC or telemetry. Fixtures use isolated temporary paths. `scripts/measure-desktop-process.ps1` samples the test process only, not the desktop application's WebView2 tree.
 - See [PHASE5_BENCHMARKS.md](PHASE5_BENCHMARKS.md) and raw JSON evidence for hardware, native debug and jsdom before/after measurements, controls, harness failures and unverified workloads. No full desktop startup/import/playback/soak certification is claimed. The shared `HTMLAudioElement` clock and `AmllLyricPlayer` remain unchanged.
+
+## 8. Phase 6A Build and Release Trust Boundary
+
+- CI is additive infrastructure: read-only web quality and Windows native quality on PR/main, lockfile installs, pinned Rust/Node/action revisions, explicit timeouts and ref-separated caches. No UI/audio/lyrics/artwork/SQLite source changes.
+- Stable product/identifier/version and existing MSI upgrade GUID are checked by `scripts/validate-desktop-release.mjs`. Tauri generates stock per-machine MSI and explicit per-user NSIS; WebView2 Evergreen bootstrapper remains required. No data-reset hooks or updater.
+- Tag pipeline rejects version drift/moved or off-main tags, requires all quality gates, builds release-mode MSI+NSIS and streams SHA256 evidence with `collect-desktop-artifacts.mjs`.
+- Draft-only writer is separate from repository code execution, has the only `contents:write` grant and uses same-run checked artifacts after protected `desktop-release` human approval. Repository opt-in plus verified environment controls fail closed; no release is published by this change.
+- [RELEASE.md](RELEASE.md) and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) document signing, protection setup, build provenance/limits, WebView2/install/upgrade/rollback and outstanding actual installer/runtime certification (`music-lua` remains open).

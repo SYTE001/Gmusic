@@ -1,7 +1,7 @@
 {
   "name": "local-music",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "Offline-first personal music player for the web. Original clean-room implementation.",
   "license": "MIT",
