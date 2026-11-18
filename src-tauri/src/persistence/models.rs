@@ -375,6 +375,31 @@ pub struct MigrationBatchRequest {
     pub audio: Vec<AudioMigrationEntryDto>,
 }
 
+fn validate_sha256_digest(
+    kind: &str,
+    track_id: &str,
+    expected_opt: Option<&str>,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let expected = expected_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("Missing SHA-256 digest for {kind} track {track_id}."))?;
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "Malformed SHA-256 digest for {kind} track {track_id}: expected 64 hex characters."
+        ));
+    }
+    use sha2::{Digest, Sha256};
+    let actual = format!("{:x}", Sha256::digest(bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "{kind} SHA-256 mismatch for track {track_id} (expected {expected}, got {actual})."
+        ));
+    }
+    Ok(())
+}
+
 impl MigrationBatchRequest {
     pub fn validate(&self) -> Result<(), String> {
         if self.migration_id.trim().is_empty() || self.migration_id.len() > 128 {
@@ -412,16 +437,7 @@ impl MigrationBatchRequest {
             if art.bytes.is_empty() {
                 return Err("Artwork bytes in migration batch cannot be empty.".into());
             }
-            if let Some(ref expected) = art.sha256 {
-                use sha2::{Digest, Sha256};
-                let actual = format!("{:x}", Sha256::digest(&art.bytes));
-                if !actual.eq_ignore_ascii_case(expected) {
-                    return Err(format!(
-                        "Artwork SHA-256 mismatch for track {} (expected {expected}, got {actual}).",
-                        art.track_id
-                    ));
-                }
-            }
+            validate_sha256_digest("Artwork", &art.track_id, art.sha256.as_deref(), &art.bytes)?;
         }
         for aud in &self.audio {
             if aud.track_id.trim().is_empty() || aud.track_id.len() > 256 {
@@ -433,16 +449,7 @@ impl MigrationBatchRequest {
             if aud.bytes.len() > MAX_AUDIO_BLOB_BYTES {
                 return Err("Audio blob exceeds maximum allowed size.".into());
             }
-            if let Some(ref expected) = aud.sha256 {
-                use sha2::{Digest, Sha256};
-                let actual = format!("{:x}", Sha256::digest(&aud.bytes));
-                if !actual.eq_ignore_ascii_case(expected) {
-                    return Err(format!(
-                        "Audio SHA-256 mismatch for track {} (expected {expected}, got {actual}).",
-                        aud.track_id
-                    ));
-                }
-            }
+            validate_sha256_digest("Audio", &aud.track_id, aud.sha256.as_deref(), &aud.bytes)?;
         }
         Ok(())
     }

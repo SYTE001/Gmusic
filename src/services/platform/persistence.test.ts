@@ -248,4 +248,34 @@ describe("desktop SQLite persistence platform adapter", () => {
     const emptyBlob = new Blob([], { type: "audio/mpeg" });
     expect(await blobToByteArray(emptyBlob)).toEqual([]);
   });
+
+  it("requires valid 64-char hex SHA-256 digests on every artwork and audio migration batch entry", async () => {
+    await expect(
+      writeDesktopIdbMigrationBatch({
+        migrationId: "m1",
+        artwork: [{ trackId: "t1", mimeType: "image/png", bytes: [1, 2, 3], sha256: "" }],
+      }),
+    ).rejects.toThrow("Missing SHA-256 digest");
+
+    await expect(
+      writeDesktopIdbMigrationBatch({
+        migrationId: "m1",
+        audio: [{ trackId: "t1", mimeType: "audio/mpeg", bytes: [1, 2, 3], sha256: "not-hex-64" }],
+      }),
+    ).rejects.toThrow("Malformed SHA-256 digest");
+
+    await expect(
+      writeDesktopIdbMigrationBatch({
+        migrationId: "m1",
+        artwork: [
+          {
+            trackId: "t1",
+            mimeType: "image/png",
+            bytes: [1, 2, 3],
+            sha256: "0".repeat(64),
+          },
+        ],
+      }),
+    ).rejects.toThrow("Artwork SHA-256 mismatch");
+  });
 });

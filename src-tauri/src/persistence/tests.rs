@@ -670,12 +670,72 @@ fn persistent_artwork_survives_disposable_cache_pruning_and_cleans_up_only_when_
 }
 
 #[test]
-fn verifies_binary_sha256_on_migration_batches_and_rejects_corrupted_or_oversized_blobs() {
+fn verifies_binary_sha256_on_migration_batches_and_rejects_missing_malformed_or_mismatched_digests()
+{
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("sha_verify.sqlite3");
     let art_dir = dir.path().join("artwork-v1");
     let mut conn = open_and_initialize_db(&db_path).unwrap();
 
+    let png = sample_png_bytes(44);
+
+    // 1. Missing SHA-256 on artwork is rejected
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-sha-missing".into(),
+            expected_artwork: 1,
+            expected_checksum: "empty".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let missing_art_err = write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-sha-missing".into(),
+            artwork: vec![ArtworkMigrationEntryDto {
+                track_id: "t1".into(),
+                mime_type: "image/png".into(),
+                bytes: png.clone(),
+                sha256: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(missing_art_err.contains("Missing SHA-256 digest"));
+
+    // 2. Malformed SHA-256 (wrong length / non-hex) on audio is rejected
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-sha-malformed".into(),
+            expected_audio: 1,
+            expected_checksum: "empty".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let malformed_aud_err = write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-sha-malformed".into(),
+            audio: vec![AudioMigrationEntryDto {
+                track_id: "t1".into(),
+                mime_type: "audio/mpeg".into(),
+                bytes: b"audio-bytes".to_vec(),
+                sha256: Some("not-a-valid-64-char-hex-digest".into()),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap_err();
+    assert!(malformed_aud_err.contains("Malformed SHA-256 digest"));
+
+    // 3. Mismatched 64-char hex SHA-256 on artwork is rejected
     begin_idb_migration(
         &mut conn,
         &MigrationBeginRequest {
@@ -688,7 +748,6 @@ fn verifies_binary_sha256_on_migration_batches_and_rejects_corrupted_or_oversize
     )
     .unwrap();
 
-    let png = sample_png_bytes(44);
     let bad_batch = MigrationBatchRequest {
         migration_id: "mig-sha".into(),
         artwork: vec![ArtworkMigrationEntryDto {
@@ -705,4 +764,201 @@ fn verifies_binary_sha256_on_migration_batches_and_rejects_corrupted_or_oversize
         get_status(&mut conn).unwrap().authority,
         "recovery-required"
     );
+}
+
+#[test]
+fn never_deletes_authoritative_sqlite_data_when_integrity_checks_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("auth_corrupt.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+
+    let t1 = make_track("t1", "Protected Track 1");
+    let t2 = make_track("t2", "Protected Track 2");
+    let mut temp_conn = Connection::open_in_memory().unwrap();
+    configure_connection(&temp_conn).unwrap();
+    apply_migrations(&mut temp_conn).unwrap();
+    put_tracks(&mut temp_conn, &[t1.clone(), t2.clone()]).unwrap();
+    let cs = compute_library_checksum(&temp_conn).unwrap();
+
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-auth-ok".into(),
+            expected_tracks: 2,
+            expected_checksum: cs.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-auth-ok".into(),
+            tracks: vec![t1, t2],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let st = finalize_idb_migration(&mut conn, "mig-auth-ok").unwrap();
+    assert_eq!(st.authority, "sqlite");
+    assert_eq!(st.track_count, 2);
+
+    // Inject a foreign key violation into the authoritative SQLite database
+    conn.pragma_update(None, "foreign_keys", "OFF").unwrap();
+    conn.execute(
+        "INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES ('orphan-pl', 0, 't1')",
+        [],
+    )
+    .unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+    // 1. get_status transitions to non-destructive recovery-required while preserving all tracks
+    let corrupt_st = get_status(&mut conn).unwrap();
+    assert_eq!(corrupt_st.authority, "recovery-required");
+    assert!(!corrupt_st.integrity_ok);
+    assert_eq!(corrupt_st.track_count, 2);
+    assert!(corrupt_st
+        .recovery_guidance
+        .as_deref()
+        .unwrap_or("")
+        .contains("preserved"));
+
+    // 2. Automatic begin_idb_migration (even with force_reimport: true or false) MUST NOT wipe the corrupted authoritative DB
+    let auto_mig = begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-auto-attempt".into(),
+            expected_tracks: 1,
+            expected_checksum: cs,
+            force_reimport: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(auto_mig.authority, "recovery-required");
+    assert!(!auto_mig.integrity_ok);
+    assert_eq!(auto_mig.track_count, 2);
+    assert_eq!(list_tracks(&conn).unwrap().len(), 2);
+
+    // 3. mark_migration_failed also preserves the authoritative rows for diagnosis
+    let fail_st = mark_migration_failed(&mut conn, "diagnostic check").unwrap();
+    assert_eq!(fail_st.authority, "recovery-required");
+    assert_eq!(fail_st.track_count, 2);
+    assert_eq!(list_tracks(&conn).unwrap().len(), 2);
+}
+
+#[test]
+fn force_reimport_restores_authoritative_sqlite_database_if_migration_fails_or_is_interrupted() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("force_rollback.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+
+    let t1 = make_track("t1", "Authoritative Track 1");
+    let t2 = make_track("t2", "Authoritative Track 2");
+    let png = sample_png_bytes(55);
+    let png_sha = format!("{:x}", Sha256::digest(&png));
+
+    let mut temp_conn = Connection::open_in_memory().unwrap();
+    configure_connection(&temp_conn).unwrap();
+    apply_migrations(&mut temp_conn).unwrap();
+    put_tracks(&mut temp_conn, &[t1.clone(), t2.clone()]).unwrap();
+    let auth_cs = compute_library_checksum(&temp_conn).unwrap();
+
+    // 1. Establish initial authoritative SQLite database with 2 tracks and 1 artwork
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-init".into(),
+            expected_tracks: 2,
+            expected_artwork: 1,
+            expected_checksum: auth_cs.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-init".into(),
+            tracks: vec![t1.clone(), t2.clone()],
+            artwork: vec![ArtworkMigrationEntryDto {
+                track_id: "t1".into(),
+                mime_type: "image/png".into(),
+                bytes: png.clone(),
+                sha256: Some(png_sha),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let st = finalize_idb_migration(&mut conn, "mig-init").unwrap();
+    assert_eq!(st.authority, "sqlite");
+    assert_eq!(st.track_count, 2);
+    assert_eq!(st.artwork_count, 1);
+
+    // 2. Start explicit force_reimport that fails midway on finalize checksum/count mismatch
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-force-fail".into(),
+            expected_tracks: 5,
+            expected_checksum: "wrong-checksum".into(),
+            force_reimport: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-force-fail".into(),
+            tracks: vec![make_track("temp-track", "Should Be Rolled Back")],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let err = finalize_idb_migration(&mut conn, "mig-force-fail").unwrap_err();
+    assert!(err.contains("count mismatch"));
+
+    // Authoritative SQLite database must be 100% restored to 'sqlite' with original 2 tracks and artwork!
+    let restored_st = get_status(&mut conn).unwrap();
+    assert_eq!(restored_st.authority, "sqlite");
+    assert!(restored_st.integrity_ok);
+    assert_eq!(restored_st.track_count, 2);
+    assert_eq!(restored_st.artwork_count, 1);
+    assert!(get_track(&conn, "temp-track").unwrap().is_none());
+    assert_eq!(
+        get_track(&conn, "t1").unwrap().unwrap().title,
+        "Authoritative Track 1"
+    );
+    assert!(get_artwork(&conn, &art_dir, "t1").unwrap().is_some());
+
+    // 3. Start explicit force_reimport and simulate process crash before finalize
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-force-crash".into(),
+            expected_tracks: 1,
+            expected_checksum: "crash-cs".into(),
+            force_reimport: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    // Reopening database after crash during force_reimport restores authoritative SQLite library
+    let mut reopened = open_and_initialize_db(&db_path).unwrap();
+    let after_crash_st = get_status(&mut reopened).unwrap();
+    assert_eq!(after_crash_st.authority, "sqlite");
+    assert_eq!(after_crash_st.track_count, 2);
+    assert_eq!(after_crash_st.artwork_count, 1);
 }

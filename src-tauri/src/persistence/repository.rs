@@ -47,9 +47,149 @@ fn ensure_migration_state_row(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
-/// If a previous process exited while `authority = 'migrating'`, transition to
-/// `'recovery-required'` on fresh connection open so an incomplete SQLite
-/// database is never treated as ready.
+fn has_reimport_backup(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_reimport_bak_state'",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+fn is_or_was_sqlite_authoritative(conn: &Connection) -> Result<bool, String> {
+    let (auth, completed_at, verified_cs): (String, Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT authority, completed_at, verified_checksum FROM migration_state WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(auth == "sqlite"
+        || completed_at.is_some()
+        || verified_cs.is_some()
+        || has_reimport_backup(conn))
+}
+
+fn save_reimport_backup_tx(tx: &Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS _reimport_bak_tracks;
+        DROP TABLE IF EXISTS _reimport_bak_playlists;
+        DROP TABLE IF EXISTS _reimport_bak_playlist_tracks;
+        DROP TABLE IF EXISTS _reimport_bak_lyrics;
+        DROP TABLE IF EXISTS _reimport_bak_lyrics_meta;
+        DROP TABLE IF EXISTS _reimport_bak_prefs;
+        DROP TABLE IF EXISTS _reimport_bak_artwork_refs;
+        DROP TABLE IF EXISTS _reimport_bak_audio_blobs;
+        DROP TABLE IF EXISTS _reimport_bak_state;
+
+        CREATE TABLE _reimport_bak_tracks AS SELECT * FROM tracks;
+        CREATE TABLE _reimport_bak_playlists AS SELECT * FROM playlists;
+        CREATE TABLE _reimport_bak_playlist_tracks AS SELECT * FROM playlist_tracks;
+        CREATE TABLE _reimport_bak_lyrics AS SELECT * FROM lyrics;
+        CREATE TABLE _reimport_bak_lyrics_meta AS SELECT * FROM lyrics_meta;
+        CREATE TABLE _reimport_bak_prefs AS SELECT * FROM prefs;
+        CREATE TABLE _reimport_bak_artwork_refs AS SELECT * FROM artwork_refs;
+        CREATE TABLE _reimport_bak_audio_blobs AS SELECT * FROM audio_blobs;
+        CREATE TABLE _reimport_bak_state AS
+            SELECT authority, migration_id, started_at, completed_at, expected_tracks,
+                   expected_playlists, expected_lyrics, expected_lyrics_meta, expected_prefs,
+                   expected_artwork, expected_audio, expected_checksum, verified_checksum
+            FROM migration_state WHERE id = 1;
+        "#,
+    )
+    .map_err(|e| format!("Failed to save authoritative re-import backup snapshot: {e}"))
+}
+
+fn drop_reimport_backup_conn(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS _reimport_bak_tracks;
+        DROP TABLE IF EXISTS _reimport_bak_playlists;
+        DROP TABLE IF EXISTS _reimport_bak_playlist_tracks;
+        DROP TABLE IF EXISTS _reimport_bak_lyrics;
+        DROP TABLE IF EXISTS _reimport_bak_lyrics_meta;
+        DROP TABLE IF EXISTS _reimport_bak_prefs;
+        DROP TABLE IF EXISTS _reimport_bak_artwork_refs;
+        DROP TABLE IF EXISTS _reimport_bak_audio_blobs;
+        DROP TABLE IF EXISTS _reimport_bak_state;
+        "#,
+    )
+    .map_err(|e| format!("Failed to drop re-import backup snapshot: {e}"))
+}
+
+fn restore_reimport_backup_conn(conn: &Connection, reason: &str) -> Result<(), String> {
+    if !has_reimport_backup(conn) {
+        return Ok(());
+    }
+    let _ = conn.pragma_update(None, "foreign_keys", "OFF");
+    let res = conn.execute_batch(
+        r#"
+        BEGIN IMMEDIATE;
+        DELETE FROM playlist_tracks;
+        DELETE FROM playlists;
+        DELETE FROM lyrics;
+        DELETE FROM lyrics_meta;
+        DELETE FROM artwork_refs;
+        DELETE FROM audio_blobs;
+        DELETE FROM tracks;
+        DELETE FROM prefs;
+
+        INSERT INTO tracks SELECT * FROM _reimport_bak_tracks;
+        INSERT INTO playlists SELECT * FROM _reimport_bak_playlists;
+        INSERT INTO playlist_tracks SELECT * FROM _reimport_bak_playlist_tracks;
+        INSERT INTO lyrics SELECT * FROM _reimport_bak_lyrics;
+        INSERT INTO lyrics_meta SELECT * FROM _reimport_bak_lyrics_meta;
+        INSERT INTO prefs SELECT * FROM _reimport_bak_prefs;
+        INSERT INTO artwork_refs SELECT * FROM _reimport_bak_artwork_refs;
+        INSERT INTO audio_blobs SELECT * FROM _reimport_bak_audio_blobs;
+
+        UPDATE migration_state SET
+            authority = (SELECT authority FROM _reimport_bak_state LIMIT 1),
+            migration_id = (SELECT migration_id FROM _reimport_bak_state LIMIT 1),
+            started_at = (SELECT started_at FROM _reimport_bak_state LIMIT 1),
+            completed_at = (SELECT completed_at FROM _reimport_bak_state LIMIT 1),
+            expected_tracks = (SELECT expected_tracks FROM _reimport_bak_state LIMIT 1),
+            expected_playlists = (SELECT expected_playlists FROM _reimport_bak_state LIMIT 1),
+            expected_lyrics = (SELECT expected_lyrics FROM _reimport_bak_state LIMIT 1),
+            expected_lyrics_meta = (SELECT expected_lyrics_meta FROM _reimport_bak_state LIMIT 1),
+            expected_prefs = (SELECT expected_prefs FROM _reimport_bak_state LIMIT 1),
+            expected_artwork = (SELECT expected_artwork FROM _reimport_bak_state LIMIT 1),
+            expected_audio = (SELECT expected_audio FROM _reimport_bak_state LIMIT 1),
+            expected_checksum = (SELECT expected_checksum FROM _reimport_bak_state LIMIT 1),
+            verified_checksum = (SELECT verified_checksum FROM _reimport_bak_state LIMIT 1),
+            last_error = NULL
+        WHERE id = 1;
+
+        DROP TABLE IF EXISTS _reimport_bak_tracks;
+        DROP TABLE IF EXISTS _reimport_bak_playlists;
+        DROP TABLE IF EXISTS _reimport_bak_playlist_tracks;
+        DROP TABLE IF EXISTS _reimport_bak_lyrics;
+        DROP TABLE IF EXISTS _reimport_bak_lyrics_meta;
+        DROP TABLE IF EXISTS _reimport_bak_prefs;
+        DROP TABLE IF EXISTS _reimport_bak_artwork_refs;
+        DROP TABLE IF EXISTS _reimport_bak_audio_blobs;
+        DROP TABLE IF EXISTS _reimport_bak_state;
+        COMMIT;
+        "#,
+    );
+    let _ = conn.pragma_update(None, "foreign_keys", "ON");
+    res.map_err(|e| {
+        let _ = conn.execute_batch("ROLLBACK;");
+        format!("Failed to restore authoritative re-import backup snapshot: {e}")
+    })?;
+    let _ = conn.execute(
+        "UPDATE migration_state SET last_error = ?1 WHERE id = 1",
+        params![reason],
+    );
+    Ok(())
+}
+
+/// If a previous process exited while `authority = 'migrating'`, either restore
+/// the authoritative SQLite snapshot (if an explicit `force_reimport` was interrupted)
+/// or transition to `'recovery-required'` on fresh connection open so an incomplete
+/// SQLite database is never treated as ready.
 fn recover_interrupted_migration_on_open(conn: &Connection) -> Result<(), String> {
     let authority: String = conn
         .query_row(
@@ -59,11 +199,18 @@ fn recover_interrupted_migration_on_open(conn: &Connection) -> Result<(), String
         )
         .map_err(|e| format!("Failed to read migration_state authority: {e}"))?;
     if authority == "migrating" {
-        conn.execute(
-            "UPDATE migration_state SET authority = 'recovery-required', last_error = COALESCE(last_error, 'Previous IndexedDB to SQLite migration was interrupted before completion.') WHERE id = 1",
-            [],
-        )
-        .map_err(|e| format!("Failed to mark interrupted migration on open: {e}"))?;
+        if has_reimport_backup(conn) {
+            restore_reimport_backup_conn(
+                conn,
+                "Previous forced re-import was interrupted before completion; restored authoritative SQLite library.",
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE migration_state SET authority = 'recovery-required', last_error = COALESCE(last_error, 'Previous IndexedDB to SQLite migration was interrupted before completion.') WHERE id = 1",
+                [],
+            )
+            .map_err(|e| format!("Failed to mark interrupted migration on open: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -166,28 +313,46 @@ pub fn get_status(conn: &mut Connection) -> Result<PersistenceStatusDto, String>
     let artwork_count = count_table("artwork_refs")?;
     let audio_count = count_table("audio_blobs")?;
 
-    let (mut authority, migration_id, mut last_error): (String, Option<String>, Option<String>) =
-        conn.query_row(
-            "SELECT authority, migration_id, last_error FROM migration_state WHERE id = 1",
+    let (mut authority, migration_id, mut last_error, completed_at, verified_checksum): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT authority, migration_id, last_error, completed_at, verified_checksum FROM migration_state WHERE id = 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(|e| format!("Failed to read migration_state: {e}"))?;
+
+    let was_sqlite = authority == "sqlite"
+        || completed_at.is_some()
+        || verified_checksum.is_some()
+        || has_reimport_backup(conn);
 
     if !integrity_ok {
         authority = "recovery-required".into();
         let joined = integrity_errors.join("; ");
         last_error = Some(joined.clone());
+        let marker_ts = completed_at.or_else(|| if was_sqlite { Some(now_ms()) } else { None });
         let _ = conn.execute(
-            "UPDATE migration_state SET authority = 'recovery-required', last_error = ?1 WHERE id = 1",
-            params![joined],
+            "UPDATE migration_state SET authority = 'recovery-required', last_error = ?1, completed_at = COALESCE(completed_at, ?2) WHERE id = 1",
+            params![joined, marker_ts],
         );
     }
 
     let recovery_guidance = if authority == "recovery-required" {
-        Some(
-            "SQLite migration or integrity check requires recovery. Your original IndexedDB library is intact and active; retry migration to rebuild the SQLite database safely.".into(),
-        )
+        if was_sqlite && !integrity_ok {
+            Some(
+                "SQLite integrity check failed; authoritative database has been preserved in a non-destructive recovery state for diagnosis.".into(),
+            )
+        } else {
+            Some(
+                "SQLite migration or integrity check requires recovery. Your original IndexedDB library is intact and active; retry migration to rebuild the SQLite database safely.".into(),
+            )
+        }
     } else {
         None
     };
@@ -433,6 +598,17 @@ fn remove_unreferenced_persistent_artwork_blobs(conn: &Connection, artwork_cache
         if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
             for r in rows.flatten() {
                 referenced.insert(r);
+            }
+        }
+    }
+    if has_reimport_backup(conn) {
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT DISTINCT content_hash FROM _reimport_bak_artwork_refs")
+        {
+            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+                for r in rows.flatten() {
+                    referenced.insert(r);
+                }
             }
         }
     }
@@ -1325,25 +1501,29 @@ pub fn begin_idb_migration(
     req.validate()?;
     ensure_migration_state_row(conn)?;
 
-    let current_auth: String = conn
-        .query_row(
-            "SELECT authority FROM migration_state WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    if has_reimport_backup(conn) {
+        restore_reimport_backup_conn(
+            conn,
+            "Restored previous authoritative SQLite library before starting new migration.",
+        )?;
+    }
 
-    // P0 Data Integrity Guard: Once SQLite is authoritative, NEVER overwrite or wipe
-    // existing SQLite records during automatic migration—even if IndexedDB holds an older
-    // or divergent snapshot—unless `force_reimport` is explicitly requested and SQLite is healthy.
-    if current_auth == "sqlite" {
-        let status = get_status(conn)?;
-        if status.integrity_ok && !req.force_reimport {
-            return Ok(status);
-        }
+    let was_sqlite = is_or_was_sqlite_authoritative(conn)?;
+    let status = get_status(conn)?;
+
+    // P0 Data Integrity Guard:
+    // 1. If SQLite is or was authoritative and integrity checks fail, NEVER delete or reset
+    //    existing SQLite data; keep it in non-destructive 'recovery-required' state for diagnosis.
+    // 2. If SQLite is authoritative and healthy, never overwrite it during automatic migration
+    //    unless `force_reimport` is explicitly requested.
+    if was_sqlite && (!status.integrity_ok || !req.force_reimport) {
+        return Ok(status);
     }
 
     let tx = conn.transaction().map_err(|e| e.to_string())?;
+    if was_sqlite && req.force_reimport {
+        save_reimport_backup_tx(&tx)?;
+    }
     tx.execute_batch(
         r#"
         DELETE FROM playlist_tracks;
@@ -1415,6 +1595,7 @@ pub fn write_idb_migration_batch(
 
     if let Err(validation_err) = batch.validate() {
         let _ = mark_migration_failed(conn, &validation_err);
+        remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
         return Err(validation_err);
     }
 
@@ -1466,6 +1647,7 @@ pub fn write_idb_migration_batch(
 
     if let Err(ref err) = res {
         let _ = mark_migration_failed(conn, err);
+        remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
     }
     res
 }
@@ -1474,20 +1656,17 @@ pub fn mark_migration_failed(
     conn: &mut Connection,
     reason: &str,
 ) -> Result<PersistenceStatusDto, String> {
-    let current_auth: String = conn
-        .query_row(
-            "SELECT authority FROM migration_state WHERE id = 1",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
+    if has_reimport_backup(conn) {
+        restore_reimport_backup_conn(conn, reason)?;
+        return get_status(conn);
+    }
 
-    // Never wipe an already-verified authoritative SQLite database if mark_migration_failed is called
-    if current_auth == "sqlite" {
-        let status = get_status(conn)?;
-        if status.integrity_ok {
-            return Ok(status);
-        }
+    if is_or_was_sqlite_authoritative(conn)? {
+        let _ = conn.execute(
+            "UPDATE migration_state SET last_error = ?1 WHERE id = 1",
+            params![reason],
+        );
+        return get_status(conn);
     }
 
     let _ = conn.execute_batch(
@@ -1632,6 +1811,8 @@ pub fn finalize_idb_migration(
             return Err(err);
         }
     }
+
+    drop_reimport_backup_conn(conn)?;
 
     conn.execute(
         r#"

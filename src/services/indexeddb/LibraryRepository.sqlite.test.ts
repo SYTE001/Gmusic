@@ -68,29 +68,45 @@ function createMockSqliteBackend() {
     prefs: new Map<string, unknown>(),
     artwork: new Map<string, { mimeType: string; bytes: number[] }>(),
     audio: new Map<string, { mimeType: string; bytes: number[] }>(),
+    reimportBackup: null as {
+      tracks: Map<string, Track>;
+      playlists: Map<string, Playlist>;
+      lyrics: Map<string, TrackLyrics>;
+      lyricsMeta: Map<string, LyricsCacheMeta>;
+      prefs: Map<string, unknown>;
+      artwork: Map<string, { mimeType: string; bytes: number[] }>;
+      audio: Map<string, { mimeType: string; bytes: number[] }>;
+      verifiedChecksum: string | null;
+    } | null,
+    wasSqliteAuthoritative: false,
     failOnWriteBatch: false,
     failOnFinalize: false,
   };
 
-  const getStatus = (): PersistenceStatus => ({
-    authority: state.authority,
-    schemaVersion: state.schemaVersion,
-    integrityOk: state.integrityOk,
-    integrityErrors: state.integrityErrors,
-    trackCount: state.tracks.size,
-    playlistCount: state.playlists.size,
-    lyricsCount: state.lyrics.size,
-    lyricsMetaCount: state.lyricsMeta.size,
-    prefsCount: state.prefs.size,
-    artworkCount: state.artwork.size,
-    audioCount: state.audio.size,
-    migrationId: state.migrationId,
-    lastError: state.lastError,
-    recoveryGuidance:
-      state.authority === "recovery-required"
-        ? "SQLite migration requires recovery; IndexedDB remains active."
-        : null,
-  });
+  const getStatus = (): PersistenceStatus => {
+    const effectiveAuth = !state.integrityOk ? "recovery-required" : state.authority;
+    return {
+      authority: effectiveAuth,
+      schemaVersion: state.schemaVersion,
+      integrityOk: state.integrityOk,
+      integrityErrors: state.integrityErrors,
+      trackCount: state.tracks.size,
+      playlistCount: state.playlists.size,
+      lyricsCount: state.lyrics.size,
+      lyricsMetaCount: state.lyricsMeta.size,
+      prefsCount: state.prefs.size,
+      artworkCount: state.artwork.size,
+      audioCount: state.audio.size,
+      migrationId: state.migrationId,
+      lastError: state.lastError,
+      recoveryGuidance:
+        effectiveAuth === "recovery-required"
+          ? state.wasSqliteAuthoritative && !state.integrityOk
+            ? "SQLite integrity check failed; authoritative database has been preserved in a non-destructive recovery state for diagnosis."
+            : "SQLite migration requires recovery; IndexedDB remains active."
+          : null,
+    };
+  };
 
   const clearTables = () => {
     state.tracks.clear();
@@ -102,14 +118,44 @@ function createMockSqliteBackend() {
     state.audio.clear();
   };
 
+  const restoreReimportBackup = () => {
+    if (!state.reimportBackup) return false;
+    state.tracks = new Map(state.reimportBackup.tracks);
+    state.playlists = new Map(state.reimportBackup.playlists);
+    state.lyrics = new Map(state.reimportBackup.lyrics);
+    state.lyricsMeta = new Map(state.reimportBackup.lyricsMeta);
+    state.prefs = new Map(state.reimportBackup.prefs);
+    state.artwork = new Map(state.reimportBackup.artwork);
+    state.audio = new Map(state.reimportBackup.audio);
+    state.verifiedChecksum = state.reimportBackup.verifiedChecksum;
+    state.authority = "sqlite";
+    state.reimportBackup = null;
+    return true;
+  };
+
   const handler = async (cmd: string, args: Record<string, unknown> = {}) => {
     switch (cmd) {
       case "get_desktop_persistence_status":
         return getStatus();
       case "begin_desktop_idb_migration": {
         const req = args.request as Record<string, unknown>;
-        if (state.authority === "sqlite" && state.integrityOk && !req.forceReimport) {
-          return getStatus();
+        if (state.reimportBackup) {
+          restoreReimportBackup();
+        }
+        if (state.wasSqliteAuthoritative || state.authority === "sqlite") {
+          if (!state.integrityOk || !req.forceReimport) {
+            return getStatus();
+          }
+          state.reimportBackup = {
+            tracks: new Map(state.tracks),
+            playlists: new Map(state.playlists),
+            lyrics: new Map(state.lyrics),
+            lyricsMeta: new Map(state.lyricsMeta),
+            prefs: new Map(state.prefs),
+            artwork: new Map(state.artwork),
+            audio: new Map(state.audio),
+            verifiedChecksum: state.verifiedChecksum,
+          };
         }
         clearTables();
         state.authority = "migrating";
@@ -129,8 +175,10 @@ function createMockSqliteBackend() {
       }
       case "write_desktop_idb_migration_batch": {
         if (state.failOnWriteBatch) {
-          clearTables();
-          state.authority = "recovery-required";
+          if (!restoreReimportBackup()) {
+            clearTables();
+            state.authority = "recovery-required";
+          }
           state.lastError = "Simulated disk full during batch write";
           throw new Error(state.lastError);
         }
@@ -152,8 +200,10 @@ function createMockSqliteBackend() {
       }
       case "finalize_desktop_idb_migration": {
         if (state.failOnFinalize) {
-          clearTables();
-          state.authority = "recovery-required";
+          if (!restoreReimportBackup()) {
+            clearTables();
+            state.authority = "recovery-required";
+          }
           state.lastError = "Simulated checksum mismatch on finalize";
           throw new Error(state.lastError);
         }
@@ -168,17 +218,26 @@ function createMockSqliteBackend() {
           state.lyrics.size !== state.expectedCounts.lyrics ||
           actualCs !== state.expectedChecksum
         ) {
-          clearTables();
-          state.authority = "recovery-required";
+          if (!restoreReimportBackup()) {
+            clearTables();
+            state.authority = "recovery-required";
+          }
           state.lastError = "Verification failed";
           throw new Error(state.lastError);
         }
+        state.reimportBackup = null;
         state.authority = "sqlite";
+        state.wasSqliteAuthoritative = true;
         state.verifiedChecksum = actualCs;
         return getStatus();
       }
       case "fail_desktop_idb_migration": {
-        if (state.authority === "sqlite" && state.integrityOk) {
+        if (restoreReimportBackup()) {
+          state.lastError = String(args.reason ?? "Migration failed");
+          return getStatus();
+        }
+        if (state.wasSqliteAuthoritative || state.authority === "sqlite") {
+          state.lastError = String(args.reason ?? "Migration failed");
           return getStatus();
         }
         clearTables();
@@ -613,5 +672,99 @@ describe("LibraryRepository native SQLite migration & desktop runtime switching"
       (c) => c[0] === "write_desktop_idb_migration_batch" && Array.isArray((c[1] as { batch?: { audio?: unknown[] } })?.batch?.audio),
     );
     expect(audioBatches).toHaveLength(2);
+  });
+
+  it("preserves authoritative SQLite data in non-destructive recovery-required state when integrity checks fail", async () => {
+    const t1 = makeTrack({ id: "t1", title: "IDB Fallback Track" });
+    await repository.putTracks([t1]);
+
+    const backend = createMockSqliteBackend();
+    invoke.mockImplementation(backend.handler);
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    await repository.ensureDesktopPersistence();
+    await repository.putTracks([makeTrack({ id: "t2", title: "Desktop Only Track" })]);
+    expect(backend.state.tracks.size).toBe(2);
+
+    // Simulate integrity check failure on the authoritative SQLite database
+    backend.state.integrityOk = false;
+    backend.state.integrityErrors = ["foreign_key violation in playlist_tracks"];
+    backend.state.lastError = "foreign_key violation in playlist_tracks";
+    repository.resetDesktopAuthorityForTests();
+
+    // 1. ensureDesktopPersistence enters recovery-required without wiping SQLite data
+    const auth = await repository.ensureDesktopPersistence();
+    expect(auth).toBe("recovery-required");
+    expect(backend.state.tracks.size).toBe(2);
+    expect(backend.state.tracks.get("t2")?.title).toBe("Desktop Only Track");
+
+    // 2. Explicit migrateIndexedDbToSqlite rejects without wiping SQLite data
+    await expect(repository.migrateIndexedDbToSqlite()).rejects.toThrow("foreign_key violation");
+    expect(backend.state.tracks.size).toBe(2);
+  });
+
+  it("restores existing authoritative SQLite database when forceReimport fails midway", async () => {
+    const t1 = makeTrack({ id: "t1", title: "Stale IDB Track" });
+    await repository.putTracks([t1]);
+
+    const backend = createMockSqliteBackend();
+    invoke.mockImplementation(backend.handler);
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    await repository.ensureDesktopPersistence();
+    await repository.updateTrack("t1", { title: "Authoritative SQLite Title" });
+    await repository.putTracks([makeTrack({ id: "t2", title: "Second SQLite Track" })]);
+    expect(backend.state.tracks.size).toBe(2);
+
+    // Force a failure during forceReimport finalization
+    backend.state.failOnFinalize = true;
+    await expect(repository.migrateIndexedDbToSqlite({ forceReimport: true })).rejects.toThrow(
+      "Simulated checksum mismatch on finalize",
+    );
+
+    // Authoritative SQLite database is restored to 'sqlite' with all 2 tracks intact!
+    expect(repository.getPersistenceAuthority()).toBe("sqlite");
+    expect(backend.state.authority).toBe("sqlite");
+    expect(backend.state.tracks.size).toBe(2);
+    expect((await repository.getTrack("t1"))?.title).toBe("Authoritative SQLite Title");
+    expect((await repository.getTrack("t2"))?.title).toBe("Second SQLite Track");
+  });
+
+  it("detects concurrent binary content changes to IndexedDB artwork and audio records even when keys and counts are unchanged", async () => {
+    const t1 = makeTrack({
+      id: "t1",
+      title: "Track With Mutating Artwork",
+      desktopPath: undefined,
+      accessMode: "stored-copy",
+    });
+    await repository.putTrackWithFiles(t1, {
+      artwork: new Blob(["original-artwork-bytes"], { type: "image/png" }),
+      audio: new Blob(["original-audio-bytes"], { type: "audio/mpeg" }),
+    });
+
+    const backend = createMockSqliteBackend();
+    invoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "write_desktop_idb_migration_batch") {
+        const batch = (args?.batch ?? {}) as { artwork?: unknown[]; audio?: unknown[] };
+        // Mutate the binary content of the audio blob in IndexedDB (preserving key "t1" and count = 1)
+        // right when the artwork batch is written
+        if (Array.isArray(batch.artwork) && batch.artwork.length > 0) {
+          await withTransaction([STORES.audio], "readwrite", (tx) => {
+            tx.objectStore(STORES.audio).put({
+              trackId: "t1",
+              blob: new Blob(["concurrently-modified-audio-bytes"], { type: "audio/mpeg" }),
+            });
+          });
+        }
+      }
+      return backend.handler(cmd, args);
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    await expect(repository.migrateIndexedDbToSqlite()).rejects.toThrow(
+      /IndexedDB audio .* for track "t1" was modified concurrently during migration/,
+    );
+    expect(backend.state.authority).toBe("recovery-required");
+    expect(backend.state.tracks.size).toBe(0);
   });
 });

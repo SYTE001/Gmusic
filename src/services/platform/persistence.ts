@@ -50,7 +50,7 @@ export interface BinaryBlobPayload {
   trackId: string;
   mimeType: string;
   bytes: number[];
-  sha256?: string;
+  sha256: string;
 }
 
 export interface MigrationBatchRequest {
@@ -250,8 +250,38 @@ export async function beginDesktopIdbMigration(
   return res;
 }
 
+async function validateMigrationBlobDigest(
+  kind: "Artwork" | "Audio",
+  entry: BinaryBlobPayload,
+): Promise<void> {
+  if (!Array.isArray(entry.bytes) || entry.bytes.length === 0) {
+    throw new Error(`${kind} bytes in migration batch cannot be empty.`);
+  }
+  const rawDigest = typeof entry.sha256 === "string" ? entry.sha256.trim() : "";
+  if (!rawDigest) {
+    throw new Error(`Missing SHA-256 digest for ${kind} track ${entry.trackId}.`);
+  }
+  if (!/^[0-9a-fA-F]{64}$/.test(rawDigest)) {
+    throw new Error(
+      `Malformed SHA-256 digest for ${kind} track ${entry.trackId}: expected 64 hex characters.`,
+    );
+  }
+  const actual = await computeBytesSha256(entry.bytes);
+  if (actual.toLowerCase() !== rawDigest.toLowerCase()) {
+    throw new Error(
+      `${kind} SHA-256 mismatch for track ${entry.trackId} (expected ${rawDigest}, got ${actual}).`,
+    );
+  }
+}
+
 export async function writeDesktopIdbMigrationBatch(batch: MigrationBatchRequest): Promise<void> {
   if (!isTauriRuntime()) return;
+  for (const art of batch.artwork ?? []) {
+    await validateMigrationBlobDigest("Artwork", art);
+  }
+  for (const aud of batch.audio ?? []) {
+    await validateMigrationBlobDigest("Audio", aud);
+  }
   await invoke("write_desktop_idb_migration_batch", { batch });
 }
 

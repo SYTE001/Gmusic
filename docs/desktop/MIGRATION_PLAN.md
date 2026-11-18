@@ -78,10 +78,10 @@
 - Updated `src/services/backup/backupService.ts` so restoring a portable backup on desktop preserves surviving `desktopPath` links while never exporting `desktopPath` in backup JSON.
 - Rollback & recovery procedure:
   - Original IndexedDB data is preserved untouched during and after migration.
-  - Once `authority == 'sqlite'` is active and healthy, automatic migration never overwrites modified SQLite data with stale IndexedDB records.
-  - If migration or integrity verification fails at any point, partial SQLite rows are rolled back/cleared, `authority` enters `recovery-required`, and `LibraryRepository` continues serving from IndexedDB with zero user data loss.
-  - Calling `repository.migrateIndexedDbToSqlite()` retries recovery idempotently from the authoritative IndexedDB snapshot (or re-imports when `{ forceReimport: true }` is explicitly passed).
+  - Once `authority == 'sqlite'` has been reached, automatic migration and failure handlers never overwrite, delete, or reset SQLite data—even when integrity checks fail (preserving the SQLite database in a non-destructive `recovery-required` state for diagnosis while serving from IndexedDB).
+  - Explicit `{ forceReimport: true }` snapshots authoritative SQLite tables (`_reimport_bak_*`) before migration and transactionally restores the existing authoritative SQLite library if the re-import fails or is interrupted at any stage.
+  - Mandatory 64-character hex SHA-256 digests are required and verified on every artwork and audio entry in migration batches, and concurrent modification detection covers both metadata and binary artwork/audio content changes.
 - Quality gates:
-  - Rust: `cargo fmt --check` PASS, `cargo clippy --all-targets -- -D warnings` PASS, `cargo test` PASS (`55` tests passed, `0` failed).
-  - Frontend: `npm run typecheck` PASS, `npm run lint` PASS, `npm test` PASS (`74` test files, `939` tests passed), `npm run build` PASS.
+  - Rust: `cargo fmt --check` PASS, `cargo clippy --all-targets -- -D warnings` PASS, `cargo test` PASS (`57` tests passed, `0` failed).
+  - Frontend: `npm run typecheck` PASS, `npm run lint` PASS, `npm test` PASS (`74` test files, `943` tests passed), `npm run build` PASS.
   - Desktop build: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc` PASS (`gmusic.exe` built cleanly).
