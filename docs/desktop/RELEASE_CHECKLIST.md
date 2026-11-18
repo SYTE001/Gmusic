@@ -11,11 +11,26 @@ This is a release gate, not task tracking. Phase6A does **not** publish a releas
 | Baseline Rust fmt/Clippy/tests | PASS,61 tests |
 | Baseline frontend typecheck/lint/tests/build | PASS,947 tests/75 files |
 | Version/identity/lockfile/tag helper regressions | PASS,3 Node tests; mismatch/off-main/moved tag/stale artifact rejection |
-| Final local Rust/frontend quality gates | Pending completion; report executed outcomes before delivery |
-| Production MSI and NSIS build | Pending completion; release mode, x64 MSVC, locked Cargo |
-| Actual installer names/byte sizes/SHA256 | Record after generated files exist; no placeholder hashes |
-| Hosted PR CI | Record actual workflow runs after push/PR; local execution is not hosted evidence |
+| Final local Rust/frontend quality gates | PASS: fmt, Clippy `-D warnings`,61Rust tests, typecheck/lint/947Vitest tests75files/webbuild;3Node helper tests. Initial Node-test autodiscovery failure recorded below |
+| Production MSI and NSIS build | PASS, optimized release mode x64 MSVC with locked Cargo; release compilation20m55s on this host |
+| Actual installer names/byte sizes/SHA256 | Verified below; streaming Node hashes match independent PowerShell Get-FileHash |
+| Hosted PR CI | [44389353322](https://github.com/SYTE001/Gmusic/actions/runs/44389353322) SUCCESS, Web quality + Windows native quality incl Tauri compilation; implementation commitf27f020 |
 | Public release/tag publication | NOT EXECUTED; not authorized |
+
+## Production artifact evidence (2026-11-19 local)
+
+Windows11 10.0.26200 x64, i5-6300U/8GB, Rust1.100.0 MSVC, Node26.13.1, locked Tauri CLI2.12.4. Built from implementationf27f020 (same runtime sources as main9fe8936). Exact command: `npm run desktop:build -- --ci --target x86_64-pc-windows-msvc --bundles msi,nsis -- --locked`; exited0, `Finished release profile [optimized]`, two bundles. No debug substitute.
+
+| Artifact | Bytes | SHA-256 | Authenticode |
+|---|---:|---|---|
+| `Gmusic_1.1.0_x64_en-US.msi` |7,798,784|`01f60cd4199fd8efa07c41fb711bce05d86fdaee9e07d26c930c062fb4f9355d`|NotSigned|
+| `Gmusic_1.1.0_x64-setup.exe` |5,615,076|`e0ed420e49dc1d333e5aa524c941bec3141fd1be88a4d9e1ad2253850810fcbf`|NotSigned|
+
+Raw manifest: [phase6a-artifacts.json](benchmarks/phase6a-artifacts.json). Generated WXS/NSIS inspection confirms preserved manufacturer `gmusic`, MSI upgrade GUID, MSI perMachine/NSIS currentUser, Evergreen downloadBootstrapper and no added data-reset hooks. This is configuration/build evidence, not a successful upgrade/uninstall trial.
+
+Development failures retained: first baseline npmci EPERM due task-owned preview DLL lock; after stopping only those owned processes npmci passed (existing10audit findings). First final Vitest run reported No test suite found for new Node-runner `.test.mjs`, while947frontend tests passed. Renamed `.node-test.mjs` with explicit Node invocation; full rerun947/947 and3Node tests passed. No test disabled/excluded/assertion weakened. actionlint1.7.12 passed both workflows; shellcheck/pyflakes unavailable and not claimed. No disposable WindowsSandbox/VirtualBox command found; fresh-install/runtime/upgrade/uninstall not attempted on the user's live profile.
+
+No release tag, GitHub Release, signing secret, environment protection or updater was created/enabled. `music-lua` remains open.
 
 ## Required human gates before public publication
 
