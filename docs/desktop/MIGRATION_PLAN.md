@@ -65,3 +65,23 @@
   - Rust: `cargo fmt --check` PASS, `cargo clippy --all-targets -- -D warnings` PASS, `cargo test` PASS (`37` tests passed, `0` failed).
   - Frontend: `npm run typecheck` PASS, `npm run lint` PASS, `npm test` PASS (`72` test files, `926` tests passed), `npm run build` PASS.
   - Desktop build: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc` PASS (`gmusic.exe` built cleanly).
+
+## 7. Phase 4 Implementation Verification (2026-11-18)
+
+- Started from latest `main` (`24259d6`, including merged PR #8) on `feat/desktop-phase4-sqlite`; `main` was not modified.
+- Added `rusqlite` (`0.32`, features: `bundled`) to `src-tauri/Cargo.toml`. No UI components, `HTMLAudioElement` playback clock, or lyrics renderer files were modified.
+- Implemented native Rust SQLite persistence engine under `src-tauri/src/persistence/`:
+  - `schema.rs`: `PRAGMA user_version` schema migrations (v1), `foreign_keys = ON`, `journal_mode = WAL`, `busy_timeout = 5000ms`, transactional migration execution with rollback on error, and `PRAGMA quick_check` + `PRAGMA foreign_key_check` integrity verification.
+  - `models.rs`: Strict payload validation, per-blob SHA-256 verification on migration batches, and bounded batch limits (`MAX_BATCH_SIZE = 500`, `MAX_AUDIO_BLOB_BYTES = 128MiB`, `MAX_LYRICS_LINES = 20_000`) across tracks, playlists, lyrics, lyricsMeta, prefs, artwork, and audio blobs.
+  - `repository.rs` & `mod.rs`: Parameterized CRUD operations, normalized `playlist_tracks` position ordering, durable content-addressed artwork storage in `persistent-artwork-v1/blobs/` (isolated from Phase 3 disposable `artwork-v1` LRU cache pruning while sharing content-addressed hashes and reference-counted cleanup), transactional `replace_library` preserving surviving file links, and explicit migration authority state machine (`indexeddb` → `migrating` → `sqlite`, or `recovery-required` on interruption/mismatch/corruption) that protects authoritative SQLite data from stale IndexedDB snapshots unless `force_reimport` is explicitly requested.
+- Added `src/services/platform/persistence.ts` and integrated desktop SQLite routing and memory-bounded paginated IndexedDB → SQLite migration behind `src/services/indexeddb/LibraryRepository.ts` and `src/services/library/playbackSession.ts` without changing public repository contracts. Removed all synthetic byte fallbacks so unreadable or empty blobs fail fast without fabricating data.
+- Updated `src/services/backup/backupService.ts` so restoring a portable backup on desktop preserves surviving `desktopPath` links while never exporting `desktopPath` in backup JSON.
+- Rollback & recovery procedure:
+  - Original IndexedDB data is preserved untouched during and after migration.
+  - Once `authority == 'sqlite'` has been reached, automatic migration and failure handlers never overwrite, delete, or reset SQLite data—even when integrity checks fail (preserving the SQLite database in a non-destructive `recovery-required` state for diagnosis while serving from IndexedDB).
+  - Explicit `{ forceReimport: true }` snapshots authoritative SQLite tables (`_reimport_bak_*`) before migration and transactionally restores the existing authoritative SQLite library if the re-import fails or is interrupted at any stage.
+  - Mandatory 64-character hex SHA-256 digests are required and verified on every artwork and audio entry in migration batches, and concurrent modification detection covers both metadata and binary artwork/audio content changes.
+- Quality gates:
+  - Rust: `cargo fmt --check` PASS, `cargo clippy --all-targets -- -D warnings` PASS, `cargo test` PASS (`57` tests passed, `0` failed).
+  - Frontend: `npm run typecheck` PASS, `npm run lint` PASS, `npm test` PASS (`74` test files, `943` tests passed), `npm run build` PASS.
+  - Desktop build: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc` PASS (`gmusic.exe` built cleanly).

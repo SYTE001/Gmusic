@@ -6,6 +6,7 @@ use tauri::{AppHandle, Manager};
 
 mod artwork;
 mod lyrics;
+mod persistence;
 
 const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "m4a", "m4b", "aac", "wav", "wave", "ogg", "oga", "opus", "flac", "weba", "webm", "mp4",
@@ -274,6 +275,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(lyrics::LyricsEngine::new().expect("create lyrics engine"))
         .manage(artwork::ArtworkEngine::new().expect("create artwork engine"))
+        .manage(persistence::PersistenceEngine::new().expect("create persistence engine"))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             inspect_audio_paths,
@@ -286,7 +288,41 @@ pub fn run() {
             artwork::resolve_desktop_artwork,
             artwork::cache_desktop_remote_artwork,
             artwork::read_desktop_cached_artwork_bytes,
-            artwork::invalidate_desktop_artwork_cache
+            artwork::invalidate_desktop_artwork_cache,
+            persistence::get_desktop_persistence_status,
+            persistence::begin_desktop_idb_migration,
+            persistence::write_desktop_idb_migration_batch,
+            persistence::finalize_desktop_idb_migration,
+            persistence::fail_desktop_idb_migration,
+            persistence::sqlite_list_tracks,
+            persistence::sqlite_get_track,
+            persistence::sqlite_put_tracks,
+            persistence::sqlite_put_track_with_files,
+            persistence::sqlite_delete_tracks,
+            persistence::sqlite_get_artwork,
+            persistence::sqlite_put_artwork,
+            persistence::sqlite_delete_artwork,
+            persistence::sqlite_list_artwork_track_ids,
+            persistence::sqlite_get_audio_blob,
+            persistence::sqlite_put_audio_blob,
+            persistence::sqlite_delete_audio_blob,
+            persistence::sqlite_count_stored_audio,
+            persistence::sqlite_list_audio_track_ids,
+            persistence::sqlite_list_playlists,
+            persistence::sqlite_get_playlist,
+            persistence::sqlite_put_playlist,
+            persistence::sqlite_delete_playlist,
+            persistence::sqlite_get_lyrics,
+            persistence::sqlite_put_lyrics,
+            persistence::sqlite_delete_lyrics,
+            persistence::sqlite_get_lyrics_cache_meta,
+            persistence::sqlite_put_lyrics_cache_meta,
+            persistence::sqlite_get_pref_json,
+            persistence::sqlite_put_pref_json,
+            persistence::sqlite_delete_pref,
+            persistence::sqlite_clear_library,
+            persistence::sqlite_replace_library,
+            persistence::sqlite_clear_all_data
         ])
         .run(tauri::generate_context!())
         .expect("error while running Gmusic desktop application");
