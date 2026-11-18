@@ -44,11 +44,16 @@ export function PlaylistDetailPage() {
   const [dragOver, setDragOver] = useState<number | null>(null);
   const [addToPlaylistOpen, setAddToPlaylistOpen] = useState(false);
 
-  const resolved: (Track | undefined)[] = useMemo(
-    () => (playlist ? playlist.trackIds.map((trackId) => tracks.find((track) => track.id === trackId)) : []),
-    [playlist, tracks],
+  const resolved: (Track | undefined)[] = useMemo(() => {
+    if (!playlist) return [];
+    const tracksById = new Map(tracks.map((track) => [track.id, track]));
+    return playlist.trackIds.map((trackId) => tracksById.get(trackId));
+  }, [playlist, tracks]);
+  const available = useMemo(
+    () => resolved.filter((track): track is Track => track !== undefined),
+    [resolved],
   );
-  const available = resolved.filter((track): track is Track => track !== undefined);
+  const contextTrackIds = useMemo(() => available.map((track) => track.id), [available]);
   const missingCount = resolved.length - available.length;
   const totalDurationMs = available.reduce((sum, track) => sum + (track.durationMs ?? 0), 0);
 
@@ -183,7 +188,7 @@ export function PlaylistDetailPage() {
                   key={`${track.id}-${index}`}
                   track={track}
                   playlistId={playlist.id}
-                  contextTrackIds={available.map((item) => item.id)}
+                  contextTrackIds={contextTrackIds}
                   canMoveUp={index > 0}
                   canMoveDown={index < resolved.length - 1}
                   onMoveUp={() => void reorderPlaylist(playlist.id, index, index - 1)}

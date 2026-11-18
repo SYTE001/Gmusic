@@ -85,3 +85,12 @@
   - Rust: `cargo fmt --check` PASS, `cargo clippy --all-targets -- -D warnings` PASS, `cargo test` PASS (`57` tests passed, `0` failed).
   - Frontend: `npm run typecheck` PASS, `npm run lint` PASS, `npm test` PASS (`74` test files, `943` tests passed), `npm run build` PASS.
   - Desktop build: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc` PASS (`gmusic.exe` built cleanly).
+
+## 8. Phase 5 Measured Profiling Increment (2026-11-19)
+
+- Based on latest `origin/main`096d1cf including merged PR#9; branch `feat/desktop-phase5-perf`, Beads `music-6h4`. Baseline Rust57 tests and frontend943 tests/74 files plus fmt/Clippy/typecheck/lint/web build/Windows x64 debug no-bundle build passed.
+- Added dependency-free test-only native profiling, opt-in jsdom playlist profiling and process sampler. [PHASE5_BENCHMARKS.md](PHASE5_BENCHMARKS.md) includes raw before/after samples, query plans, hardware, CPU/memory sampling caveats and every unverified requested workload.
+- Measured native debug10k metadata insert p50 decreased1,537.7→607.2ms by bounded prepared-statement reuse; cold artwork store2,918.0→2,424.5ms by one bounded decode for paired thumbnail sizes. Playlist per-row context copies and repeated lookup work became linear, with deterministic work/allocation regressions. No SQLite schema/index/migration change, new dependency, UI design change, second audio clock or lyrics renderer modification.
+- Rollback: revert these local code changes; SQLite schema/data/authority state are unchanged. Existing cache format/output and portable backups remain compatible. Profiling never targets user data.
+- Final gates: Rust fmt/Clippy all-targets `-D warnings`/61 tests PASS; frontend typecheck/lint/947 tests in75 files/web build PASS; `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc` PASS. No tests ignored. Remaining runtime certification is tracked in `music-lua`.
+- This increment is not complete Phase5 runtime certification: actual desktop startup/import/control timings, WebView2 memory/scrolling, offline restart and long playback soak remain manual QA. Track separate acceptance work before performance certification; do not merge automatically.

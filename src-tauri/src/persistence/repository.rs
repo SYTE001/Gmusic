@@ -381,8 +381,9 @@ fn upsert_track_tx(tx: &Transaction<'_>, track: &TrackDto) -> Result<(), String>
         Some(ref b) => Some(serde_json::to_string(b).map_err(|e| e.to_string())?),
         None => None,
     };
-    tx.execute(
-        r#"
+    let mut statement = tx
+        .prepare_cached(
+            r#"
         INSERT INTO tracks (
             id, title, artist, album, track_number, album_track_count, duration_ms,
             file_name, file_size, mime_type, added_at, last_played_at, play_count,
@@ -424,7 +425,10 @@ fn upsert_track_tx(tx: &Transaction<'_>, track: &TrackDto) -> Result<(), String>
             cloud_status = excluded.cloud_status,
             last_synced_at = excluded.last_synced_at
         "#,
-        params![
+        )
+        .map_err(|e| format!("Failed to prepare track upsert: {e}"))?;
+    statement
+        .execute(params![
             track.id,
             track.title,
             track.artist,
@@ -456,9 +460,8 @@ fn upsert_track_tx(tx: &Transaction<'_>, track: &TrackDto) -> Result<(), String>
             track.storage_provider,
             track.cloud_status,
             track.last_synced_at,
-        ],
-    )
-    .map_err(|e| format!("Failed to upsert track {}: {e}", track.id))?;
+        ])
+        .map_err(|e| format!("Failed to upsert track {}: {e}", track.id))?;
     Ok(())
 }
 
