@@ -376,6 +376,34 @@ pub fn blob_path_for_record(record: &CachedArtworkRecord, size: u32) -> Option<P
     chosen.map(PathBuf::from).filter(|p| p.is_file())
 }
 
+pub fn measure_cache_bytes(cache_dir: &Path) -> u64 {
+    let mut sum = 0u64;
+    for sub in ["blobs", "index"] {
+        if let Ok(entries) = fs::read_dir(cache_dir.join(sub)) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        sum = sum.saturating_add(meta.len());
+                    }
+                }
+            }
+        }
+    }
+    sum
+}
+
+fn remove_file_and_account(path: &Path, byte_len: u64, total_bytes: &mut u64) {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            *total_bytes = total_bytes.saturating_sub(byte_len);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            *total_bytes = total_bytes.saturating_sub(byte_len);
+        }
+        Err(_) => {}
+    }
+}
+
 pub fn prune_cache(cache_dir: &Path, max_bytes: u64) -> Result<(), String> {
     let blobs_dir = cache_dir.join("blobs");
     let index_dir = cache_dir.join("index");
@@ -512,12 +540,10 @@ pub fn prune_cache(cache_dir: &Path, max_bytes: u64) -> Result<(), String> {
             break;
         }
         for (idx_path, idx_len) in group.index_files {
-            let _ = fs::remove_file(idx_path);
-            total_bytes = total_bytes.saturating_sub(idx_len);
+            remove_file_and_account(&idx_path, idx_len, &mut total_bytes);
         }
         for (blob_path, blob_len) in group.blob_files {
-            let _ = fs::remove_file(blob_path);
-            total_bytes = total_bytes.saturating_sub(blob_len);
+            remove_file_and_account(&blob_path, blob_len, &mut total_bytes);
         }
     }
 
@@ -528,9 +554,15 @@ pub fn prune_cache(cache_dir: &Path, max_bytes: u64) -> Result<(), String> {
             if total_bytes <= max_bytes {
                 break;
             }
-            let _ = fs::remove_file(idx_path);
-            total_bytes = total_bytes.saturating_sub(idx_len);
+            remove_file_and_account(&idx_path, idx_len, &mut total_bytes);
         }
+    }
+
+    let actual_bytes = measure_cache_bytes(cache_dir);
+    if actual_bytes > max_bytes {
+        return Err(format!(
+            "Artwork cache exceeds budget after pruning ({actual_bytes} > {max_bytes} bytes)."
+        ));
     }
 
     Ok(())
@@ -756,5 +788,58 @@ mod tests {
             "untouched newer entry should be evicted by LRU prune"
         );
         assert!(total_cache_bytes(dir.path()) <= budget);
+    }
+
+    #[test]
+    fn returns_error_when_failed_file_removal_leaves_cache_above_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = sample_image(300, 300, 77);
+        let rec = store_artwork_blob(
+            dir.path(),
+            &["track::locked".into()],
+            Some("locked"),
+            &img,
+            "itunes",
+            CachedArtworkRecord::default(),
+        )
+        .unwrap();
+
+        let orig_path = PathBuf::from(rec.original_path.unwrap());
+        #[cfg(windows)]
+        let lock_guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&orig_path)
+                .unwrap()
+        };
+        #[cfg(not(windows))]
+        let blobs_dir = {
+            let bdir = dir.path().join("blobs");
+            let mut perms = fs::metadata(&bdir).unwrap().permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&bdir, perms).unwrap();
+            bdir
+        };
+
+        let prune_res = prune_cache(dir.path(), 1);
+        assert!(
+            prune_res.is_err(),
+            "prune_cache must return Err when disk usage still exceeds max_bytes"
+        );
+
+        #[cfg(windows)]
+        drop(lock_guard);
+        #[cfg(not(windows))]
+        {
+            #[allow(clippy::permissions_set_readonly_false)]
+            let mut perms = fs::metadata(&blobs_dir).unwrap().permissions();
+            perms.set_readonly(false);
+            fs::set_permissions(&blobs_dir, perms).unwrap();
+        }
+
+        prune_cache(dir.path(), 1).unwrap();
+        assert_eq!(total_cache_bytes(dir.path()), 0);
     }
 }
