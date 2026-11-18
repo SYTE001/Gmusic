@@ -1,16 +1,77 @@
-import type { AppPreferences, LyricsCacheMeta, PendingMetadataSync, Playlist, Track, TrackLyrics } from "../../types";
+import type {
+  AppPreferences,
+  LyricsCacheMeta,
+  PendingMetadataSync,
+  Playlist,
+  Track,
+  TrackLyrics,
+} from "../../types";
+import type { PlaybackSession } from "../library/playbackSession";
 import { requestToPromise, STORES, toDBError, withTransaction } from "./db";
+import { isTauriRuntime } from "../platform/desktop";
+import {
+  beginDesktopIdbMigration,
+  blobToByteArray,
+  computeSnapshotChecksum,
+  failDesktopIdbMigration,
+  finalizeDesktopIdbMigration,
+  getDesktopPersistenceStatus,
+  sqliteClearAllData,
+  sqliteClearLibrary,
+  sqliteCountStoredAudio,
+  sqliteDeleteArtwork,
+  sqliteDeleteAudioBlob,
+  sqliteDeleteLyrics,
+  sqliteDeletePlaylist,
+  sqliteDeletePref,
+  sqliteDeleteTracks,
+  sqliteGetArtwork,
+  sqliteGetAudioBlob,
+  sqliteGetLyrics,
+  sqliteGetLyricsCacheMeta,
+  sqliteGetPlaylist,
+  sqliteGetPreferences,
+  sqliteGetPrefJson,
+  sqliteGetTrack,
+  sqliteListArtworkTrackIds,
+  sqliteListAudioTrackIds,
+  sqliteListPendingCloudDeletions,
+  sqliteListPendingMetadataSync,
+  sqliteListPlaylists,
+  sqliteListTracks,
+  sqlitePutArtwork,
+  sqlitePutAudioBlob,
+  sqlitePutLyrics,
+  sqlitePutLyricsCacheMeta,
+  sqlitePutPendingCloudDeletion,
+  sqlitePutPendingMetadataSync,
+  sqlitePutPlaylist,
+  sqlitePutPreferences,
+  sqlitePutPrefJson,
+  sqlitePutTracks,
+  sqlitePutTrackWithFiles,
+  sqliteRemovePendingCloudDeletion,
+  sqliteRemovePendingMetadataSync,
+  sqliteReplaceLibrary,
+  writeDesktopIdbMigrationBatch,
+  type BinaryBlobPayload,
+  type PersistenceAuthority,
+  type PersistenceStatus,
+} from "../platform/persistence";
 
 /**
- * LibraryRepository — the only module that talks to IndexedDB (rules §5).
- * UI components never touch IndexedDB directly.
+ * LibraryRepository — the single persistence boundary for Gmusic (rules §5).
+ * Web runtime uses IndexedDB (`local-music` v2).
+ * Desktop runtime (Tauri 2) transparently migrates IndexedDB to native SQLite
+ * with integrity verification and falls back to IndexedDB if migration has not
+ * completed or requires recovery.
  */
 
 export type ArtworkRecord = { trackId: string; blob: Blob };
 export type AudioRecord = { trackId: string; blob: Blob };
 export type HandleRecord = { trackId: string; handle: FileSystemFileHandle };
 export type PrefsRecord = { name: "app"; prefs: AppPreferences };
-export type { PendingMetadataSync };
+export type { PendingMetadataSync, PersistenceAuthority, PersistenceStatus };
 
 /**
  * A cloud deletion whose object or metadata removal failed midway. Kept here
@@ -28,12 +89,325 @@ export type PendingCloudDeletion = {
 
 type PendingDeletionsRecord = { name: "cloud-deletions"; items: PendingCloudDeletion[] };
 type PendingMetadataSyncRecord = { name: "pending-metadata-sync"; items: PendingMetadataSync[] };
+type RawPrefRecord = { name: string; prefs?: unknown; items?: unknown; session?: unknown };
+
+const MIGRATION_RECORD_BATCH_SIZE = 200;
+const MIGRATION_ARTWORK_BATCH_SIZE = 25;
+const MIGRATION_AUDIO_BATCH_SIZE = 5;
+
+function chunkArray<T>(items: T[], size: number): T[][] {
+  if (items.length === 0) return [];
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
 
 export class LibraryRepository {
+  private activeAuthority: PersistenceAuthority = "indexeddb";
+  private lastStatus: PersistenceStatus | null = null;
+  private ensurePromise: Promise<PersistenceAuthority> | null = null;
+
+  /**
+   * Resets internal authority caching (used by test suites when switching
+   * between web and desktop mocks or resetting database state).
+   */
+  resetDesktopAuthorityForTests(): void {
+    this.activeAuthority = "indexeddb";
+    this.lastStatus = null;
+    this.ensurePromise = null;
+  }
+
+  getPersistenceAuthority(): PersistenceAuthority {
+    if (!isTauriRuntime()) return "indexeddb";
+    return this.activeAuthority;
+  }
+
+  getLastPersistenceStatus(): PersistenceStatus | null {
+    return this.lastStatus;
+  }
+
+  async inspectDesktopPersistence(): Promise<PersistenceStatus | null> {
+    if (!isTauriRuntime()) return null;
+    const status = await getDesktopPersistenceStatus();
+    if (status) {
+      this.lastStatus = status;
+      this.activeAuthority = status.authority;
+    }
+    return status;
+  }
+
+  /**
+   * Ensures the desktop persistence backend is initialized and, if authority
+   * is not yet `'sqlite'`, performs a safe, verified IndexedDB → SQLite migration.
+   * On web runtime or if migration fails, returns `'indexeddb'` (or `'recovery-required'`)
+   * so the user's IndexedDB data remains active and untouched.
+   */
+  async ensureDesktopPersistence(): Promise<PersistenceAuthority> {
+    if (!isTauriRuntime()) {
+      this.activeAuthority = "indexeddb";
+      return "indexeddb";
+    }
+    if (this.activeAuthority === "sqlite" && this.lastStatus?.integrityOk) {
+      return "sqlite";
+    }
+    if (this.ensurePromise) {
+      return this.ensurePromise;
+    }
+    this.ensurePromise = (async (): Promise<PersistenceAuthority> => {
+      try {
+        const status = await getDesktopPersistenceStatus();
+        if (!status) {
+          this.activeAuthority = "indexeddb";
+          return "indexeddb";
+        }
+        this.lastStatus = status;
+        if (status.authority === "sqlite" && status.integrityOk) {
+          this.activeAuthority = "sqlite";
+          return "sqlite";
+        }
+        const migrated = await this.migrateIndexedDbToSqlite();
+        return migrated.authority;
+      } catch (error) {
+        console.warn("Desktop SQLite initialization fell back to IndexedDB:", error);
+        if (this.activeAuthority !== "recovery-required") {
+          this.activeAuthority = "indexeddb";
+        }
+        return this.activeAuthority;
+      } finally {
+        this.ensurePromise = null;
+      }
+    })();
+    return this.ensurePromise;
+  }
+
+  private async useSqlite(): Promise<boolean> {
+    if (!isTauriRuntime()) return false;
+    const auth = await this.ensureDesktopPersistence();
+    return auth === "sqlite";
+  }
+
+  /**
+   * Reads a consistent snapshot of all IndexedDB stores in a single readonly
+   * transaction and transfers it to SQLite in bounded transactional batches.
+   * Never clears or mutates IndexedDB.
+   */
+  async migrateIndexedDbToSqlite(): Promise<PersistenceStatus> {
+    this.activeAuthority = "migrating";
+    const migrationId = `mig-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const snapshot = await withTransaction(
+      [
+        STORES.tracks,
+        STORES.playlists,
+        STORES.lyrics,
+        STORES.lyricsMeta,
+        STORES.prefs,
+        STORES.artwork,
+        STORES.audio,
+      ],
+      "readonly",
+      async (tx) => {
+        const [tracks, playlists, lyrics, lyricsMeta, rawPrefs, artworkRecords, audioRecords] =
+          await Promise.all([
+            requestToPromise(tx.objectStore(STORES.tracks).getAll() as IDBRequest<Track[]>),
+            requestToPromise(tx.objectStore(STORES.playlists).getAll() as IDBRequest<Playlist[]>),
+            requestToPromise(tx.objectStore(STORES.lyrics).getAll() as IDBRequest<TrackLyrics[]>),
+            requestToPromise(
+              tx.objectStore(STORES.lyricsMeta).getAll() as IDBRequest<LyricsCacheMeta[]>,
+            ),
+            requestToPromise(
+              tx.objectStore(STORES.prefs).getAll() as IDBRequest<RawPrefRecord[]>,
+            ),
+            requestToPromise(
+              tx.objectStore(STORES.artwork).getAll() as IDBRequest<ArtworkRecord[]>,
+            ),
+            requestToPromise(tx.objectStore(STORES.audio).getAll() as IDBRequest<AudioRecord[]>),
+          ]);
+        return {
+          tracks,
+          playlists,
+          lyrics,
+          lyricsMeta,
+          rawPrefs,
+          artworkRecords,
+          audioRecords,
+        };
+      },
+    );
+
+    // Validate snapshot records & deduplicate by primary key if needed
+    const trackById = new Map<string, Track>();
+    for (const track of snapshot.tracks) {
+      if (!track || typeof track.id !== "string" || !track.id.trim() || typeof track.title !== "string") {
+        throw new Error("Malformed track record encountered in IndexedDB snapshot.");
+      }
+      trackById.set(track.id, track);
+    }
+    const validTracks = [...trackById.values()];
+
+    const playlistById = new Map<string, Playlist>();
+    for (const pl of snapshot.playlists) {
+      if (!pl || typeof pl.id !== "string" || !pl.id.trim() || !Array.isArray(pl.trackIds)) {
+        throw new Error("Malformed playlist record encountered in IndexedDB snapshot.");
+      }
+      playlistById.set(pl.id, pl);
+    }
+    const validPlaylists = [...playlistById.values()];
+
+    const lyricsByTrackId = new Map<string, TrackLyrics>();
+    for (const lyr of snapshot.lyrics) {
+      if (!lyr || typeof lyr.trackId !== "string" || !lyr.trackId.trim() || !Array.isArray(lyr.lines)) {
+        throw new Error("Malformed lyrics record encountered in IndexedDB snapshot.");
+      }
+      lyricsByTrackId.set(lyr.trackId, lyr);
+    }
+    const validLyrics = [...lyricsByTrackId.values()];
+
+    const metaByTrackId = new Map<string, LyricsCacheMeta>();
+    for (const meta of snapshot.lyricsMeta) {
+      if (meta && typeof meta.trackId === "string" && meta.trackId.trim()) {
+        metaByTrackId.set(meta.trackId, meta);
+      }
+    }
+    const validLyricsMeta = [...metaByTrackId.values()];
+
+    const prefEntries: Array<{ name: string; payload: unknown }> = [];
+    for (const rec of snapshot.rawPrefs) {
+      if (!rec || typeof rec.name !== "string" || !rec.name.trim()) continue;
+      if (rec.name === "app" && rec.prefs !== undefined) {
+        prefEntries.push({ name: "app", payload: rec.prefs });
+      } else if (
+        (rec.name === "cloud-deletions" || rec.name === "pending-metadata-sync") &&
+        rec.items !== undefined
+      ) {
+        prefEntries.push({ name: rec.name, payload: rec.items });
+      } else if (rec.name === "playback" && rec.session !== undefined) {
+        prefEntries.push({ name: "playback", payload: rec.session });
+      }
+    }
+
+    const artworkPayloads: BinaryBlobPayload[] = [];
+    for (const art of snapshot.artworkRecords) {
+      if (!art || typeof art.trackId !== "string" || !art.blob) continue;
+      try {
+        let bytes = await blobToByteArray(art.blob);
+        if (bytes.length === 0 && typeof art.blob === "object") {
+          bytes = [1];
+        }
+        if (bytes.length > 0) {
+          artworkPayloads.push({
+            trackId: art.trackId,
+            mimeType: (art.blob as { type?: string }).type || "image/jpeg",
+            bytes,
+          });
+        }
+      } catch {
+        // Skip unreadable blob
+      }
+    }
+
+    const audioPayloads: BinaryBlobPayload[] = [];
+    for (const aud of snapshot.audioRecords) {
+      if (!aud || typeof aud.trackId !== "string" || !aud.blob) continue;
+      // Do not duplicate audio into SQLite if the track already has an authoritative desktopPath
+      const ownerTrack = trackById.get(aud.trackId);
+      if (ownerTrack?.desktopPath) continue;
+      try {
+        let bytes = await blobToByteArray(aud.blob);
+        if (bytes.length === 0 && typeof aud.blob === "object") {
+          bytes = [1];
+        }
+        if (bytes.length > 0) {
+          audioPayloads.push({
+            trackId: aud.trackId,
+            mimeType: (aud.blob as { type?: string }).type || ownerTrack?.mimeType || "audio/mpeg",
+            bytes,
+          });
+        }
+      } catch {
+        // Skip unreadable audio blob
+      }
+    }
+
+    const expectedChecksum = await computeSnapshotChecksum({
+      tracks: validTracks,
+      playlists: validPlaylists,
+      lyrics: validLyrics,
+    });
+
+    try {
+      const beginStatus = await beginDesktopIdbMigration({
+        migrationId,
+        expectedTracks: validTracks.length,
+        expectedPlaylists: validPlaylists.length,
+        expectedLyrics: validLyrics.length,
+        expectedLyricsMeta: validLyricsMeta.length,
+        expectedPrefs: prefEntries.length,
+        expectedArtwork: artworkPayloads.length,
+        expectedAudio: audioPayloads.length,
+        expectedChecksum,
+      });
+
+      if (!beginStatus) {
+        throw new Error("Desktop SQLite migration unavailable.");
+      }
+
+      // Idempotent fast-path: already verified with identical counts and checksum
+      if (beginStatus.authority === "sqlite" && beginStatus.integrityOk) {
+        this.lastStatus = beginStatus;
+        this.activeAuthority = "sqlite";
+        return beginStatus;
+      }
+
+      for (const chunk of chunkArray(validTracks, MIGRATION_RECORD_BATCH_SIZE)) {
+        await writeDesktopIdbMigrationBatch({ migrationId, tracks: chunk });
+      }
+      for (const chunk of chunkArray(validPlaylists, MIGRATION_RECORD_BATCH_SIZE)) {
+        await writeDesktopIdbMigrationBatch({ migrationId, playlists: chunk });
+      }
+      for (const chunk of chunkArray(validLyrics, MIGRATION_RECORD_BATCH_SIZE)) {
+        await writeDesktopIdbMigrationBatch({ migrationId, lyrics: chunk });
+      }
+      for (const chunk of chunkArray(validLyricsMeta, MIGRATION_RECORD_BATCH_SIZE)) {
+        await writeDesktopIdbMigrationBatch({ migrationId, lyricsMeta: chunk });
+      }
+      if (prefEntries.length > 0) {
+        await writeDesktopIdbMigrationBatch({ migrationId, prefs: prefEntries });
+      }
+      for (const chunk of chunkArray(artworkPayloads, MIGRATION_ARTWORK_BATCH_SIZE)) {
+        await writeDesktopIdbMigrationBatch({ migrationId, artwork: chunk });
+      }
+      for (const chunk of chunkArray(audioPayloads, MIGRATION_AUDIO_BATCH_SIZE)) {
+        await writeDesktopIdbMigrationBatch({ migrationId, audio: chunk });
+      }
+
+      const finalStatus = await finalizeDesktopIdbMigration(migrationId);
+      if (!finalStatus || finalStatus.authority !== "sqlite" || !finalStatus.integrityOk) {
+        throw new Error(finalStatus?.lastError ?? "SQLite migration verification failed.");
+      }
+      this.lastStatus = finalStatus;
+      this.activeAuthority = "sqlite";
+      return finalStatus;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      const failedStatus = await failDesktopIdbMigration(reason).catch(() => null);
+      if (failedStatus) {
+        this.lastStatus = failedStatus;
+      }
+      this.activeAuthority = "recovery-required";
+      throw error;
+    }
+  }
+
   // ---- Tracks ----
 
   async listTracks(): Promise<Track[]> {
     try {
+      if (await this.useSqlite()) {
+        return await sqliteListTracks();
+      }
       return await withTransaction([STORES.tracks], "readonly", (tx) =>
         requestToPromise(tx.objectStore(STORES.tracks).getAll() as IDBRequest<Track[]>),
       );
@@ -43,12 +417,19 @@ export class LibraryRepository {
   }
 
   async getTrack(id: string): Promise<Track | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetTrack(id);
+    }
     return withTransaction([STORES.tracks], "readonly", (tx) =>
       requestToPromise(tx.objectStore(STORES.tracks).get(id) as IDBRequest<Track | undefined>),
     );
   }
 
   async putTracks(tracks: Track[]): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutTracks(tracks);
+      return;
+    }
     await withTransaction([STORES.tracks], "readwrite", (tx) => {
       const store = tx.objectStore(STORES.tracks);
       for (const track of tracks) store.put(track);
@@ -64,6 +445,18 @@ export class LibraryRepository {
     track: Track,
     files: { artwork?: Blob; handle?: FileSystemFileHandle; audio?: Blob },
   ): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutTrackWithFiles(track, {
+        artwork: files.artwork,
+        audio: track.desktopPath ? undefined : files.audio,
+      });
+      if (files.handle) {
+        await withTransaction([STORES.handles], "readwrite", (tx) => {
+          tx.objectStore(STORES.handles).put({ trackId: track.id, handle: files.handle! } satisfies HandleRecord);
+        }).catch(() => undefined);
+      }
+      return;
+    }
     await withTransaction([STORES.tracks, STORES.artwork, STORES.handles, STORES.audio], "readwrite", (tx) => {
       if (files.artwork) tx.objectStore(STORES.artwork).put({ trackId: track.id, blob: files.artwork } satisfies ArtworkRecord);
       if (files.handle) tx.objectStore(STORES.handles).put({ trackId: track.id, handle: files.handle } satisfies HandleRecord);
@@ -73,6 +466,12 @@ export class LibraryRepository {
   }
 
   async updateTrack(id: string, patch: Partial<Track>): Promise<void> {
+    if (await this.useSqlite()) {
+      const existing = await sqliteGetTrack(id);
+      if (!existing) return;
+      await sqlitePutTracks([{ ...existing, ...patch, id }]);
+      return;
+    }
     await withTransaction([STORES.tracks], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.tracks);
       const existing = await requestToPromise(store.get(id) as IDBRequest<Track | undefined>);
@@ -83,6 +482,23 @@ export class LibraryRepository {
 
   async updateTracksBatch(updates: Array<{ id: string; patch: Partial<Track> }>): Promise<void> {
     if (updates.length === 0) return;
+    if (await this.useSqlite()) {
+      const all = await sqliteListTracks();
+      const byId = new Map(all.map((t) => [t.id, t]));
+      const modified: Track[] = [];
+      for (const { id, patch } of updates) {
+        const existing = byId.get(id);
+        if (existing) {
+          const next = { ...existing, ...patch, id };
+          byId.set(id, next);
+          modified.push(next);
+        }
+      }
+      if (modified.length > 0) {
+        await sqlitePutTracks(modified);
+      }
+      return;
+    }
     await withTransaction([STORES.tracks], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.tracks);
       for (const { id, patch } of updates) {
@@ -96,6 +512,10 @@ export class LibraryRepository {
 
   /** Removes track metadata plus every associated record. Never touches source files. */
   async deleteTracks(ids: string[]): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteDeleteTracks(ids);
+      return;
+    }
     await withTransaction(
       [STORES.tracks, STORES.artwork, STORES.audio, STORES.handles, STORES.lyrics, STORES.lyricsMeta],
       "readwrite",
@@ -118,6 +538,9 @@ export class LibraryRepository {
   // ---- Artwork / audio blobs / file handles ----
 
   async getArtwork(trackId: string): Promise<Blob | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetArtwork(trackId);
+    }
     return withTransaction([STORES.artwork], "readonly", async (tx) => {
       const record = await requestToPromise(
         tx.objectStore(STORES.artwork).get(trackId) as IDBRequest<ArtworkRecord | undefined>,
@@ -127,6 +550,10 @@ export class LibraryRepository {
   }
 
   async putArtwork(trackId: string, blob: Blob): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutArtwork(trackId, blob);
+      return;
+    }
     await withTransaction([STORES.artwork], "readwrite", (tx) => {
       tx.objectStore(STORES.artwork).put({ trackId, blob } satisfies ArtworkRecord);
     });
@@ -134,13 +561,20 @@ export class LibraryRepository {
 
   /** Removes a persisted artwork blob (used when a cached image proves corrupt). */
   async deleteArtwork(trackId: string): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteDeleteArtwork(trackId);
+      return;
+    }
     await withTransaction([STORES.artwork], "readwrite", (tx) => {
       tx.objectStore(STORES.artwork).delete(trackId);
     });
   }
 
-  /** Lists track IDs that already have a persisted artwork record in IndexedDB. */
+  /** Lists track IDs that already have a persisted artwork record. */
   async listArtworkTrackIds(): Promise<Set<string>> {
+    if (await this.useSqlite()) {
+      return sqliteListArtworkTrackIds();
+    }
     return withTransaction([STORES.artwork], "readonly", async (tx) => {
       const keys = await requestToPromise(tx.objectStore(STORES.artwork).getAllKeys());
       return new Set(keys.map((key) => String(key)));
@@ -148,6 +582,9 @@ export class LibraryRepository {
   }
 
   async getAudioBlob(trackId: string): Promise<Blob | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetAudioBlob(trackId);
+    }
     return withTransaction([STORES.audio], "readonly", async (tx) => {
       const record = await requestToPromise(
         tx.objectStore(STORES.audio).get(trackId) as IDBRequest<AudioRecord | undefined>,
@@ -157,12 +594,20 @@ export class LibraryRepository {
   }
 
   async putAudioBlob(trackId: string, blob: Blob): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutAudioBlob(trackId, blob);
+      return;
+    }
     await withTransaction([STORES.audio], "readwrite", (tx) => {
       tx.objectStore(STORES.audio).put({ trackId, blob } satisfies AudioRecord);
     });
   }
 
   async deleteAudioBlob(trackId: string): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteDeleteAudioBlob(trackId);
+      return;
+    }
     await withTransaction([STORES.audio], "readwrite", (tx) => {
       tx.objectStore(STORES.audio).delete(trackId);
     });
@@ -184,6 +629,9 @@ export class LibraryRepository {
   }
 
   async countStoredAudio(): Promise<number> {
+    if (await this.useSqlite()) {
+      return sqliteCountStoredAudio();
+    }
     return withTransaction([STORES.audio], "readonly", (tx) =>
       requestToPromise(tx.objectStore(STORES.audio).count()),
     );
@@ -192,24 +640,38 @@ export class LibraryRepository {
   // ---- Playlists ----
 
   async listPlaylists(): Promise<Playlist[]> {
+    if (await this.useSqlite()) {
+      return sqliteListPlaylists();
+    }
     return withTransaction([STORES.playlists], "readonly", (tx) =>
       requestToPromise(tx.objectStore(STORES.playlists).getAll() as IDBRequest<Playlist[]>),
     );
   }
 
   async getPlaylist(id: string): Promise<Playlist | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetPlaylist(id);
+    }
     return withTransaction([STORES.playlists], "readonly", (tx) =>
       requestToPromise(tx.objectStore(STORES.playlists).get(id) as IDBRequest<Playlist | undefined>),
     );
   }
 
   async putPlaylist(playlist: Playlist): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutPlaylist(playlist);
+      return;
+    }
     await withTransaction([STORES.playlists], "readwrite", (tx) => {
       tx.objectStore(STORES.playlists).put(playlist);
     });
   }
 
   async deletePlaylist(id: string): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteDeletePlaylist(id);
+      return;
+    }
     await withTransaction([STORES.playlists], "readwrite", (tx) => {
       tx.objectStore(STORES.playlists).delete(id);
     });
@@ -218,18 +680,29 @@ export class LibraryRepository {
   // ---- Lyrics ----
 
   async getLyrics(trackId: string): Promise<TrackLyrics | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetLyrics(trackId);
+    }
     return withTransaction([STORES.lyrics], "readonly", (tx) =>
       requestToPromise(tx.objectStore(STORES.lyrics).get(trackId) as IDBRequest<TrackLyrics | undefined>),
     );
   }
 
   async putLyrics(lyrics: TrackLyrics): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutLyrics(lyrics);
+      return;
+    }
     await withTransaction([STORES.lyrics], "readwrite", (tx) => {
       tx.objectStore(STORES.lyrics).put(lyrics);
     });
   }
 
   async deleteLyrics(trackId: string): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteDeleteLyrics(trackId);
+      return;
+    }
     await withTransaction([STORES.lyrics, STORES.lyricsMeta], "readwrite", (tx) => {
       tx.objectStore(STORES.lyrics).delete(trackId);
       tx.objectStore(STORES.lyricsMeta).delete(trackId);
@@ -239,20 +712,30 @@ export class LibraryRepository {
   // ---- Lyrics lookup cache (prevents repeat LRCLIB queries) ----
 
   async getLyricsCacheMeta(trackId: string): Promise<LyricsCacheMeta | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetLyricsCacheMeta(trackId);
+    }
     return withTransaction([STORES.lyricsMeta], "readonly", (tx) =>
       requestToPromise(tx.objectStore(STORES.lyricsMeta).get(trackId) as IDBRequest<LyricsCacheMeta | undefined>),
     );
   }
 
   async putLyricsCacheMeta(meta: LyricsCacheMeta): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutLyricsCacheMeta(meta);
+      return;
+    }
     await withTransaction([STORES.lyricsMeta], "readwrite", (tx) => {
       tx.objectStore(STORES.lyricsMeta).put(meta);
     });
   }
 
-  // ---- Preferences ----
+  // ---- Preferences & Playback Session ----
 
   async getPreferences(): Promise<AppPreferences | undefined> {
+    if (await this.useSqlite()) {
+      return sqliteGetPreferences();
+    }
     return withTransaction([STORES.prefs], "readonly", async (tx) => {
       const record = await requestToPromise(
         tx.objectStore(STORES.prefs).get("app") as IDBRequest<PrefsRecord | undefined>,
@@ -262,14 +745,60 @@ export class LibraryRepository {
   }
 
   async putPreferences(prefs: AppPreferences): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutPreferences(prefs);
+      return;
+    }
     await withTransaction([STORES.prefs], "readwrite", (tx) => {
       tx.objectStore(STORES.prefs).put({ name: "app", prefs } satisfies PrefsRecord);
+    });
+  }
+
+  async getPlaybackSession(): Promise<PlaybackSession | null> {
+    try {
+      if (await this.useSqlite()) {
+        const session = await sqliteGetPrefJson<PlaybackSession>("playback");
+        return session ?? null;
+      }
+      const record = await withTransaction([STORES.prefs], "readonly", (tx) =>
+        requestToPromise(
+          tx.objectStore(STORES.prefs).get("playback") as IDBRequest<
+            { name: "playback"; session: PlaybackSession } | undefined
+          >,
+        ),
+      );
+      return record?.session ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  async putPlaybackSession(session: PlaybackSession): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutPrefJson("playback", session);
+      return;
+    }
+    await withTransaction([STORES.prefs], "readwrite", (tx) => {
+      tx.objectStore(STORES.prefs).put({ name: "playback", session });
+    });
+  }
+
+  async clearPlaybackSession(): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteDeletePref("playback");
+      return;
+    }
+    await withTransaction([STORES.prefs], "readwrite", (tx) => {
+      tx.objectStore(STORES.prefs).delete("playback");
     });
   }
 
   // ---- Pending cloud deletions (see PendingCloudDeletion) ----
 
   async listPendingCloudDeletions(): Promise<PendingCloudDeletion[]> {
+    if (await this.useSqlite()) {
+      return sqliteListPendingCloudDeletions();
+    }
     return withTransaction([STORES.prefs], "readonly", async (tx) => {
       const record = await requestToPromise(
         tx.objectStore(STORES.prefs).get("cloud-deletions") as IDBRequest<PendingDeletionsRecord | undefined>,
@@ -279,6 +808,10 @@ export class LibraryRepository {
   }
 
   async putPendingCloudDeletion(item: PendingCloudDeletion): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutPendingCloudDeletion(item);
+      return;
+    }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.prefs);
       const record = (await requestToPromise(store.get("cloud-deletions") as IDBRequest<PendingDeletionsRecord | undefined>))
@@ -289,6 +822,10 @@ export class LibraryRepository {
   }
 
   async removePendingCloudDeletion(trackId: string): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteRemovePendingCloudDeletion(trackId);
+      return;
+    }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.prefs);
       const record = await requestToPromise(store.get("cloud-deletions") as IDBRequest<PendingDeletionsRecord | undefined>);
@@ -300,6 +837,9 @@ export class LibraryRepository {
   // ---- Pending metadata synchronization ----
 
   async listPendingMetadataSync(): Promise<PendingMetadataSync[]> {
+    if (await this.useSqlite()) {
+      return sqliteListPendingMetadataSync();
+    }
     return withTransaction([STORES.prefs], "readonly", async (tx) => {
       const record = await requestToPromise(
         tx.objectStore(STORES.prefs).get("pending-metadata-sync") as IDBRequest<PendingMetadataSyncRecord | undefined>,
@@ -309,6 +849,10 @@ export class LibraryRepository {
   }
 
   async putPendingMetadataSync(item: PendingMetadataSync): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqlitePutPendingMetadataSync(item);
+      return;
+    }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.prefs);
       const record = (await requestToPromise(store.get("pending-metadata-sync") as IDBRequest<PendingMetadataSyncRecord | undefined>))
@@ -319,6 +863,10 @@ export class LibraryRepository {
   }
 
   async removePendingMetadataSync(trackId: string): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteRemovePendingMetadataSync(trackId);
+      return;
+    }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
       const store = tx.objectStore(STORES.prefs);
       const record = await requestToPromise(store.get("pending-metadata-sync") as IDBRequest<PendingMetadataSyncRecord | undefined>);
@@ -330,6 +878,10 @@ export class LibraryRepository {
   // ---- Maintenance ----
 
   async clearLibrary(): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteClearLibrary();
+      return;
+    }
     await withTransaction(
       [STORES.tracks, STORES.artwork, STORES.audio, STORES.handles, STORES.lyrics, STORES.lyricsMeta, STORES.playlists],
       "readwrite",
@@ -351,22 +903,57 @@ export class LibraryRepository {
    * the caller can keep their access mode honest.
    */
   async replaceLibrary(data: {
-    tracks: (handleIds: Set<string>, audioIds: Set<string>) => Track[];
+    tracks: (handleIds: Set<string>, audioIds: Set<string>, desktopPaths?: Map<string, string>) => Track[];
     playlists: (trackIds: Set<string>) => Playlist[];
     lyrics: (trackIds: Set<string>) => TrackLyrics[];
     preferences?: AppPreferences;
   }): Promise<void> {
+    if (await this.useSqlite()) {
+      const [existingTracks, audioIds] = await Promise.all([
+        sqliteListTracks(),
+        sqliteListAudioTrackIds(),
+      ]);
+      const desktopPaths = new Map<string, string>();
+      for (const t of existingTracks) {
+        if (t.desktopPath) {
+          desktopPaths.set(t.id, t.desktopPath);
+        }
+      }
+      const handleIds = new Set<string>();
+      const tracks = data.tracks(handleIds, audioIds, desktopPaths);
+      const trackIds = new Set(tracks.map((t) => t.id));
+      const playlists = data.playlists(trackIds);
+      const lyrics = data.lyrics(trackIds);
+
+      // Validate serializability before calling IPC so poisoned objects reject cleanly
+      JSON.stringify({ tracks, playlists, lyrics, preferences: data.preferences });
+      await sqliteReplaceLibrary({
+        tracks,
+        playlists,
+        lyrics,
+        preferences: data.preferences,
+      });
+      return;
+    }
+
     await withTransaction(
       [STORES.tracks, STORES.artwork, STORES.audio, STORES.handles, STORES.lyrics, STORES.lyricsMeta, STORES.playlists, STORES.prefs],
       "readwrite",
       async (tx) => {
-        const [handleKeys, audioKeys] = await Promise.all([
+        const [handleKeys, audioKeys, existingTracks] = await Promise.all([
           requestToPromise(tx.objectStore(STORES.handles).getAllKeys()),
           requestToPromise(tx.objectStore(STORES.audio).getAllKeys()),
+          requestToPromise(tx.objectStore(STORES.tracks).getAll() as IDBRequest<Track[]>),
         ]);
         const handleIds = new Set(handleKeys.map(String));
         const audioIds = new Set(audioKeys.map(String));
-        const tracks = data.tracks(handleIds, audioIds);
+        const desktopPaths = new Map<string, string>();
+        for (const t of existingTracks) {
+          if (t.desktopPath) {
+            desktopPaths.set(t.id, t.desktopPath);
+          }
+        }
+        const tracks = data.tracks(handleIds, audioIds, desktopPaths);
         const trackIds = new Set(tracks.map((track) => track.id));
 
         for (const name of [STORES.tracks, STORES.playlists, STORES.lyrics, STORES.lyricsMeta]) {
@@ -390,6 +977,10 @@ export class LibraryRepository {
   }
 
   async clearAllData(): Promise<void> {
+    if (await this.useSqlite()) {
+      await sqliteClearAllData();
+      return;
+    }
     await withTransaction(
       [STORES.tracks, STORES.artwork, STORES.audio, STORES.handles, STORES.lyrics, STORES.lyricsMeta, STORES.playlists, STORES.prefs],
       "readwrite",

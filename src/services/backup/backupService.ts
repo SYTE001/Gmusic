@@ -166,15 +166,30 @@ const numOrNull = (value: unknown): number | null => (typeof value === "number" 
 const str = (value: unknown, fallback: string): string => (typeof value === "string" ? value : fallback);
 
 /** Fills defaults for fields an older or hand-edited backup may lack, so a restored track can never crash the UI. */
-function normalizeTrack(track: Track, hasHandle: boolean, hasStoredCopy: boolean): Track {
+function normalizeTrack(
+  track: Track,
+  hasHandle: boolean,
+  hasStoredCopy: boolean,
+  existingDesktopPath?: string,
+): Track {
   const cloud = Boolean(track.objectKey);
+  const hasDesktopPath = Boolean(existingDesktopPath);
   // Local file access survives only where the device still owns the record;
   // otherwise the track needs re-import/relink (or its cloud copy).
-  const accessMode: Track["accessMode"] = hasStoredCopy ? "stored-copy" : hasHandle ? "handle" : cloud ? "cloud" : "session-only";
+  const accessMode: Track["accessMode"] = hasDesktopPath
+    ? "desktop-path"
+    : hasStoredCopy
+      ? "stored-copy"
+      : hasHandle
+        ? "handle"
+        : cloud
+          ? "cloud"
+          : "session-only";
   const { desktopPath: _desktopPath, ...portableTrack } = track;
   void _desktopPath;
   return {
     ...portableTrack,
+    ...(existingDesktopPath ? { desktopPath: existingDesktopPath } : {}),
     artist: str(track.artist, "Unknown Artist"),
     album: str(track.album, ""),
     description: str(track.description, ""),
@@ -189,7 +204,7 @@ function normalizeTrack(track: Track, hasHandle: boolean, hasStoredCopy: boolean
     isLiked: track.isLiked === true,
     fingerprint: typeof track.fingerprint === "string" ? track.fingerprint : null,
     metadataFromFilename: track.metadataFromFilename === true,
-    availability: hasHandle || hasStoredCopy ? "available" : cloud ? "offline" : "missing",
+    availability: hasDesktopPath || hasHandle || hasStoredCopy ? "available" : cloud ? "offline" : "missing",
     accessMode,
   };
 }
@@ -220,8 +235,15 @@ function sanitizePreferences(raw: Partial<AppPreferences>): AppPreferences {
  */
 export async function restoreBackup(backup: BackupFile): Promise<void> {
   await repository.replaceLibrary({
-    tracks: (handleIds, audioIds) =>
-      backup.tracks.map((track) => normalizeTrack(track, handleIds.has(track.id), audioIds.has(track.id))),
+    tracks: (handleIds, audioIds, desktopPaths) =>
+      backup.tracks.map((track) =>
+        normalizeTrack(
+          track,
+          handleIds.has(track.id),
+          audioIds.has(track.id),
+          desktopPaths?.get(track.id),
+        ),
+      ),
     playlists: (trackIds) =>
       backup.playlists.map((playlist) => ({
         ...playlist,

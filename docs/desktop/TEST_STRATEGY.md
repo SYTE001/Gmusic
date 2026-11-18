@@ -63,3 +63,19 @@ The PR #7 final verification results, actual Tauri runtime observations, install
 - Frontend platform & integration tests:
   - `src/services/platform/artwork.test.ts`: web runtime no-op guard, IPC payload validation, typed `Blob` materialization, malformed IPC rejection, and cache invalidation forwarding.
   - `src/services/artwork/artworkService.native.test.ts`: desktop native resolution and IndexedDB persistence, offline disk-cache recovery without web calls, native embedded artwork extraction fallback during desktop audio import, and album-preserving single-track invalidation.
+
+## 6. Phase 4 Deterministic Coverage
+
+- Rust unit & integration tests (`src-tauri/src/persistence/tests.rs`):
+  - `fresh_database_initialization_sets_pragmas_and_schema_v1`: verifies `PRAGMA user_version = 1`, `PRAGMA foreign_keys = 1`, initial `indexeddb` authority state, and clean integrity check.
+  - `schema_upgrade_and_transactional_rollback_on_failure`: verifies multi-step schema upgrades and proves a failing SQL statement rolls back the entire migration transaction and leaves `user_version` unchanged.
+  - `track_playlist_lyrics_prefs_and_artwork_crud_preserves_ordering_and_relationships`: verifies track CRUD, playlist track ordering and reordering, accepted/manual word-synced lyrics and user offsets, content-addressed artwork deduplication with Phase 3 `artwork-v1` disk cache, and cascade cleanup (including `pending-metadata-sync`) on track deletion.
+  - `idb_migration_verifies_counts_and_checksum_and_is_idempotent`: verifies bounded batch migration, record count and deterministic SHA-256 checksum verification, transition to `sqlite` authority, and idempotent repeat migration calls.
+  - `interrupted_or_failed_migration_falls_back_to_recovery_required_and_recovers_cleanly`: simulates an interrupted migration on connection reopen (`authority == 'migrating'` → `'recovery-required'`) as well as count/checksum mismatch rollback, then verifies clean recovery on retry.
+  - `large_library_migration_and_backup_replace_library_preserve_surviving_links`: migrates 1,200 tracks across bounded batches and verifies `replace_library` preserves surviving audio blobs while dropping removed tracks' blobs.
+  - `detects_database_corruption_and_transitions_to_recovery_required`: verifies foreign-key violation detection via `PRAGMA foreign_key_check` and automatic transition to `recovery-required`.
+  - `persistence_engine_handles_concurrent_access_without_blocking_runtime`: verifies concurrent async writes through `PersistenceEngine::with_conn`.
+  - `rejects_duplicate_ids_and_malformed_records_and_preserves_missing_availability`: verifies strict payload validation, duplicate track ID rejection during backup replacement, and `"missing"` availability state preservation.
+- Frontend platform & repository integration tests:
+  - `src/services/platform/persistence.test.ts`: verifies web runtime zero-IPC guarantee, status validation, deterministic SHA-256 snapshot checksum ordering invariance, lossless `Blob` ↔ byte array conversion, and pending cloud deletion / metadata sync queues.
+  - `src/services/indexeddb/LibraryRepository.sqlite.test.ts`: verifies automatic IndexedDB → SQLite migration on desktop, non-destructive IndexedDB preservation, transparent fallback to IndexedDB on migration failure (`recovery-required`), idempotent repeat migration, bounded batching for large libraries (450+ tracks), malformed record rejection, and portable backup export/restore round-trip preserving surviving `desktopPath` links without leaking paths into exported JSON.
