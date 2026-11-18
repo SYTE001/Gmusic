@@ -25,6 +25,8 @@ futures-util = "0.3"
 sha2 = "0.10"
 tempfile = "3"
 httpdate = "1"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["net", "io-util", "test-util"] }

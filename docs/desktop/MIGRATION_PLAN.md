@@ -50,3 +50,18 @@
 - Windows executable build passed: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc`. Available packaging targets are `msi` and `nsis`; only x64 MSVC is installed. Installers/signing and other architectures were not verified.
 - Browser smoke could not run: the host returned `browser guest not attached (webview not ready)` twice. A Vite `EBUSY` watcher error on Rust build executables was fixed by ignoring `src-tauri` in frontend watching; the dev server then started cleanly. Real WebView2 playback/seek/pause/lyrics/offline acceptance remains tracked by Beads `music-82d` before approval.
 - Rollback: the native cache is disposable discovery data; removing/disabling the adapter restores the existing web service path without migrating or deleting accepted lyrics, manual edits or offsets. Phase 3 must wait for human approval of Phase 2.
+
+## 6. Phase 3 Implementation Verification (2026-11-18)
+
+- Started from latest `main` (`c49f055`, including merged Phase 2) on `feat/desktop-phase3-artwork`; `main` was not modified.
+- Added `image` (`0.25`, features: `jpeg`, `png`, `webp`, `gif`, `bmp`) and `base64` (`0.22`) to `src-tauri/Cargo.toml`. No lyrics engine files or UI components were redesigned or broken.
+- Implemented native Rust artwork modules under `src-tauri/src/artwork/`:
+  - `extract.rs`: embedded cover extraction for MP3 (`ID3v2.2`/`2.3`/`2.4`), FLAC (`PICTURE`), M4A/MP4 (`covr`), and OGG/Opus (`METADATA_BLOCK_PICTURE` and `COVERART`), with magic-byte sniffing and `[64B..16MiB]` bounds.
+  - `process.rs`: bounded image decoding (`8192x8192`, `48MP`, `192MiB` limit) and aspect-ratio-preserving multi-resolution thumbnail generation (`500px`, `256px`) without upscaling.
+  - `matching.rs` & `providers.rs`: metadata noise cleaning, MusicBrainz Release Group / Release candidate scoring, Cover Art Archive lookup, and iTunes Search API fallback with rate-limiting gates, `Retry-After` handling, and host allowlisting.
+  - `cache.rs` & `mod.rs`: content-addressed SHA-256 disk cache (`artwork-v1/`) deduplicating identical artwork across tracks/albums, atomic replacement, corruption detection/recovery, offline stale-positive reuse, cache invalidation, and `256MiB` LRU pruning.
+- Added `src/services/platform/artwork.ts` and integrated desktop artwork extraction, discovery, caching, and invalidation into `importService.ts` and `artworkService.ts` while preserving 100% of web behavior.
+- Quality gates:
+  - Rust: `cargo fmt --check` PASS, `cargo clippy --all-targets -- -D warnings` PASS, `cargo test` PASS (`37` tests passed, `0` failed).
+  - Frontend: `npm run typecheck` PASS, `npm run lint` PASS, `npm test` PASS (`72` test files, `926` tests passed), `npm run build` PASS.
+  - Desktop build: `npx tauri build --debug --no-bundle --target x86_64-pc-windows-msvc` PASS (`gmusic.exe` built cleanly).

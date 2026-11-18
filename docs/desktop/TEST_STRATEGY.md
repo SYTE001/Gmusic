@@ -51,3 +51,15 @@ Run frontend gates from the repository root; run `cargo fmt --check`, `cargo cli
 Check the shared web shell, navigation and lyrics screen in a browser, then desktop import/play/seek/pause/resume with a local audio track and genuine LRC/enhanced-LRC fixture. Disable connectivity and verify saved lyrics remain usable; retry a missing result online. Do not report a browser/runtime smoke test as passed if the host cannot attach the browser or the desktop window was only built, not exercised.
 
 The PR #7 final verification results, actual Tauri runtime observations, installer-build results and remaining human acceptance blockers are recorded in [PHASE2_VERIFICATION.md](PHASE2_VERIFICATION.md). That report distinguishes read-only runtime evidence from visual/audible acceptance and records the initial full-suite failure as well as the passing rerun.
+
+## 5. Phase 3 Deterministic Coverage
+
+- Rust unit & integration tests (`src-tauri/src/artwork/`):
+  - `extract::tests`: embedded cover extraction across MP3 (`ID3v2.3` `APIC` and `ID3v2.4` unsynchronized `APIC`), FLAC (`PICTURE` with `>1KB` description), M4A (`covr` atom), and OGG/Opus (`METADATA_BLOCK_PICTURE`); safe handling of missing, undersized, compressed/encrypted, and overflowing `u32::MAX`/`u64::MAX` headers.
+  - `process::tests`: full image decode validation, rejection of HTML/JSON/corrupted payloads, aspect-ratio-preserving `500px` and `256px` thumbnail generation, and no-upscale preservation for smaller images.
+  - `matching::tests`: YouTube/promoter noise cleaning, artist extraction, MusicBrainz Release Group confidence scoring (rejecting wrong artists and compilations), and iTunes candidate ranking (rejecting mismatched artists and durations).
+  - `providers::tests`: trusted artwork host validation/HTTPS upgrade (`coverartarchive.org`, `archive.org`, `mzstatic.com`), untrusted redirect blocking, transient `503` image retry, `429 Retry-After` rate-limit handling, and local mock TCP server verification of MusicBrainz → CAA → iTunes fallback.
+  - `cache::tests` & `artwork::tests`: SHA-256 content-addressed deduplication across tracks/albums, corruption detection and automatic eviction, strict `max_bytes` budget enforcement across shared content-addressed blobs, genuine `last_accessed_at` LRU eviction (with backward compatibility for legacy index records), `query_fingerprint` metadata-change invalidation, shared album cache preservation on single-track invalidation, strict `artwork-v1/blobs` path containment, and end-to-end online-to-offline disk cache serving.
+- Frontend platform & integration tests:
+  - `src/services/platform/artwork.test.ts`: web runtime no-op guard, IPC payload validation, typed `Blob` materialization, malformed IPC rejection, and cache invalidation forwarding.
+  - `src/services/artwork/artworkService.native.test.ts`: desktop native resolution and IndexedDB persistence, offline disk-cache recovery without web calls, native embedded artwork extraction fallback during desktop audio import, and album-preserving single-track invalidation.

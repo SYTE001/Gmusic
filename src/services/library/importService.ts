@@ -5,6 +5,7 @@ import { isCorruptedOrSuspiciousMetadata, type ParsedTags } from "../metadata/ty
 import { normalizeTrackMetadata } from "../metadata/normalization";
 import { repository } from "../indexeddb/LibraryRepository";
 import { rememberSessionFile } from "../file-access/FileAccessService";
+import { extractDesktopEmbeddedArtwork } from "../platform/artwork";
 import {
   createDesktopSliceFile,
   isDesktopImportItem,
@@ -479,6 +480,10 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
 
       if (matchedCandidate) {
         const matchedTrack = matchedCandidate.match;
+        if (isDesktop && !tags.artwork) {
+          const nativeArt = await extractDesktopEmbeddedArtwork(item.path, matchedTrack.id, "500");
+          if (nativeArt) tags.artwork = nativeArt;
+        }
         const comparison = evaluateMetadataImprovement(matchedTrack, tags, fallback, effectiveDurationMs);
         const wasBroken = matchedTrack.availability === "broken" || Boolean(matchedTrack.broken?.isBroken);
         // A matching file for a track that currently has no usable audio (broken,
@@ -569,9 +574,15 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
         }
 
         const accessMode: Track["accessMode"] = isDesktop ? "desktop-path" : isHandle ? "handle" : options.storeCopies ? "stored-copy" : "session-only";
+        const newTrackId = createId();
+
+        if (isDesktop && !tags.artwork) {
+          const nativeArt = await extractDesktopEmbeddedArtwork(item.path, newTrackId, "500");
+          if (nativeArt) tags.artwork = nativeArt;
+        }
 
         const track: Track = {
-          id: createId(),
+          id: newTrackId,
           title: rawTitle,
           artist: rawArtist,
           album: (normalized.album && !isCorruptedOrSuspiciousMetadata(normalized.album)) ? normalized.album : initialAlbum,

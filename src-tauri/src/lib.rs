@@ -4,6 +4,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
+mod artwork;
 mod lyrics;
 
 const SUPPORTED_AUDIO_EXTENSIONS: &[&str] = &[
@@ -58,7 +59,7 @@ pub fn mime_type_for_path(path: &Path) -> &'static str {
 
 /// Strips Windows `\\?\` verbatim prefix after canonicalization so paths remain
 /// compatible with WebView2 asset URLs and standard path checks.
-fn normalize_fs_path(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn normalize_fs_path(path: &Path) -> Result<PathBuf, String> {
     let canonical = fs::canonicalize(path)
         .map_err(|err| format!("Failed to resolve path {}: {err}", path.display()))?;
     #[cfg(windows)]
@@ -75,6 +76,12 @@ fn normalize_fs_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn build_audio_info(path: &Path) -> Result<Option<DesktopAudioFileInfo>, String> {
+    let Ok(sym_meta) = fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if sym_meta.file_type().is_symlink() || !sym_meta.is_file() {
+        return Ok(None);
+    }
     let normalized = normalize_fs_path(path)?;
     let metadata = fs::metadata(&normalized)
         .map_err(|err| format!("Failed to inspect {}: {err}", normalized.display()))?;
@@ -218,7 +225,10 @@ fn authorize_desktop_paths(
     let mut statuses = Vec::with_capacity(paths.len());
     for raw_path in paths {
         let candidate = Path::new(&raw_path);
-        let exists = if candidate.is_file() && is_supported_audio_extension(candidate) {
+        let is_regular = fs::symlink_metadata(candidate)
+            .map(|m| !m.file_type().is_symlink() && m.is_file())
+            .unwrap_or(false);
+        let exists = if is_regular && is_supported_audio_extension(candidate) {
             if let Ok(normalized) = normalize_fs_path(candidate) {
                 scope.allow_file(&normalized).is_ok()
             } else {
@@ -242,7 +252,13 @@ fn read_audio_file_slice(
     offset: u64,
     length: u64,
 ) -> Result<tauri::ipc::Response, String> {
-    let normalized = normalize_fs_path(Path::new(&path))?;
+    let raw_path = Path::new(&path);
+    let sym_meta = fs::symlink_metadata(raw_path)
+        .map_err(|err| format!("Failed to inspect {}: {err}", raw_path.display()))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("Symlink audio paths are not permitted.".to_string());
+    }
+    let normalized = normalize_fs_path(raw_path)?;
     if !is_supported_audio_extension(&normalized) {
         return Err("Unsupported audio file extension.".to_string());
     }
@@ -257,6 +273,7 @@ fn read_audio_file_slice(
 pub fn run() {
     tauri::Builder::default()
         .manage(lyrics::LyricsEngine::new().expect("create lyrics engine"))
+        .manage(artwork::ArtworkEngine::new().expect("create artwork engine"))
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             inspect_audio_paths,
@@ -264,7 +281,12 @@ pub fn run() {
             authorize_desktop_paths,
             read_audio_file_slice,
             lyrics::discover_desktop_lyrics,
-            lyrics::parse_desktop_lyrics
+            lyrics::parse_desktop_lyrics,
+            artwork::extract_desktop_embedded_artwork,
+            artwork::resolve_desktop_artwork,
+            artwork::cache_desktop_remote_artwork,
+            artwork::read_desktop_cached_artwork_bytes,
+            artwork::invalidate_desktop_artwork_cache
         ])
         .run(tauri::generate_context!())
         .expect("error while running Gmusic desktop application");
