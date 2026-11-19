@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { SidebarContent, focusVisibleSearch } from "./Sidebar";
 import { CloudBadge, MobileTopBar, OfflineBadge } from "./TopBar";
@@ -13,6 +13,7 @@ import { useToastStore } from "../stores/toastStore";
 import { ChevronLeftIcon, ChevronRightIcon, CloseIcon, HeartIcon, HomeIcon, LibraryIcon, PlaylistIcon, SettingsIcon } from "./Icons";
 import { DynamicIslandNotification } from "./DynamicIslandNotification";
 import { TrackActionsProvider } from "../features/library/useTrackActions";
+import { recordComponentRender } from "../utils/perf";
 import { APP_NAME } from "../types";
 
 const mobileNavClass = ({ isActive }: { isActive: boolean }) =>
@@ -30,22 +31,21 @@ const SIDEBAR_COLLAPSED_KEY = "lm-sidebar-collapsed";
  * On desktop the sidebar collapses to an icon rail; the preference persists.
  */
 export function AppShell() {
+  recordComponentRender("AppShell");
   const [queueOpen, setQueueOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [creatingPlaylist, setCreatingPlaylist] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "1");
-  const location = useLocation();
+  const closeDrawer = useCallback(() => setDrawerOpen(false), []);
 
   const applySidebarCollapsed = (collapsed: boolean) => {
     localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? "1" : "0");
     setSidebarCollapsed(collapsed);
   };
 
-  // Close the mobile drawer on navigation.
-  useEffect(() => {
-    setDrawerOpen(false);
-  }, [location.pathname]);
+  // Route observation is isolated below so navigating replaces only the page
+  // outlet; persistent chrome and playback controls keep their render work.
 
   useGlobalKeyboardShortcuts(
     () => setQueueOpen((open) => !open),
@@ -58,6 +58,8 @@ export function AppShell() {
       <a href="#main-content" className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:rounded-lg focus:bg-surface-raised focus:px-4 focus:py-2 focus:text-sm">
         Skip to content
       </a>
+
+      <CloseDrawerOnNavigation onNavigate={closeDrawer} />
 
       <div className="flex min-h-0 flex-1">
         {/* Desktop sidebar (collapsible to an icon rail) */}
@@ -206,6 +208,16 @@ export function AppShell() {
       <AriaLiveAnnouncer />
     </div>
   );
+}
+
+function CloseDrawerOnNavigation({ onNavigate }: { onNavigate: () => void }) {
+  const location = useLocation();
+
+  useEffect(() => {
+    onNavigate();
+  }, [location.pathname, onNavigate]);
+
+  return null;
 }
 
 /**

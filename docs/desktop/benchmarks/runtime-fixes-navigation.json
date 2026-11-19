@@ -1,0 +1,48 @@
+{
+  "capturedOn": "2026-11-19",
+  "baselineCommit": "1ed7c8315994fc17f39175619f5b79f847dcc3ff",
+  "scope": "Node/jsdom parent route with ArtworkCard and modal mocked. Includes React mount and playlist summary computation; excludes WebView paint, image decode, SQLite and Tauri IPC.",
+  "method": {
+    "samplesPerWorkload": 15,
+    "percentile": "nearest rank",
+    "controls": "Same host, fixture shape, test file, React/jsdom mount path, mocks, and sample count before and after. Samples include fixture creation, store update, summary computation, React parent mount and cleanup scheduling; they exclude unmocked artwork and modal children."
+  },
+  "results": [
+    {
+      "workload": "playlists_route_parent_mount_jsdom",
+      "librarySize": 1000,
+      "playlistCount": 20,
+      "tracksPerPlaylist": 50,
+      "before": {
+        "samples_ms": [148.8249, 97.6142, 75.6384, 83.9812, 83.1631, 102.9776, 95.0413, 70.8601, 68.0255, 93.1721, 83.2849, 75.4896, 81.7023, 68.5875, 74.1826],
+        "p50_ms": 83.1631,
+        "p95_ms": 148.8249,
+        "track_id_reads": 500520
+      },
+      "after": {
+        "samples_ms": [90.6914, 16.2208, 8.0715, 20.7124, 19.2823, 13.1343, 16.5552, 14.3187, 15.5982, 30.3091, 27.2154, 18.9762, 8.1561, 25.2496, 17.1692],
+        "p50_ms": 17.1692,
+        "p95_ms": 90.6914,
+        "track_id_reads": 1020
+      }
+    },
+    {
+      "workload": "playlists_route_parent_mount_jsdom",
+      "librarySize": 10000,
+      "playlistCount": 40,
+      "tracksPerPlaylist": 100,
+      "before": {
+        "samples_ms": [1672.3017, 1020.8782, 2451.0283, 1761.4393, 1771.9085, 1718.0369, 1836.6798, 1983.514, 1181.1316, 1122.2551, 1735.7736, 1525.5157, 2065.9316, 1587.1132, 1757.7987],
+        "p50_ms": 1735.7736,
+        "p95_ms": 2451.0283,
+        "track_id_reads": 8002040
+      },
+      "after": {
+        "samples_ms": [84.0261, 103.3411, 88.7822, 38.8032, 61.4954, 66.7518, 88.7787, 65.5617, 36.4715, 71.1811, 84.4158, 51.9177, 77.5528, 100.8075, 120.0411],
+        "p50_ms": 77.5528,
+        "p95_ms": 120.0411,
+        "track_id_reads": 10040
+      }
+    }
+  ]
+}

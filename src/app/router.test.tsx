@@ -8,6 +8,7 @@ import { SettingsPage } from "../features/settings/SettingsPage";
 import { usePlaybackStore, bindPlaybackHelpers } from "../stores/playbackStore";
 import { useLibraryStore } from "../stores/libraryStore";
 import { repository } from "../services/indexeddb/LibraryRepository";
+import { getRenderCounts, resetPerfMetrics, setPerfEnabled } from "../utils/perf";
 import type { Track } from "../types";
 
 function seedTrack(): Track {
@@ -109,6 +110,37 @@ describe("persistent playback across route changes", () => {
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeTruthy();
     expect(usePlaybackStore.getState().isPlaying).toBe(true);
     expect(usePlaybackStore.getState().currentTimeMs).toBe(30000);
+  });
+
+  it("keeps persistent shell components from rerendering on primary route changes", async () => {
+    setPerfEnabled(true);
+    resetPerfMetrics();
+    try {
+      render(
+        <MemoryRouter initialEntries={["/"]}>
+          <Routes>
+            <Route element={<AppShell />}>
+              <Route index element={<HomePage />} />
+              <Route path="library" element={<LibraryPage />} />
+              <Route path="settings" element={<SettingsPage />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>,
+      );
+      const before = getRenderCounts();
+
+      fireEvent.click((await screen.findAllByRole("link", { name: /^Library$/ }))[0]);
+      expect(await screen.findByRole("heading", { name: "Library" })).toBeTruthy();
+      fireEvent.click((await screen.findAllByRole("link", { name: /^Settings$/ }))[0]);
+      expect(await screen.findByRole("heading", { name: "Settings" })).toBeTruthy();
+
+      const after = getRenderCounts();
+      expect(after.AppShell).toBe(before.AppShell);
+      expect(after.MiniPlayer).toBe(before.MiniPlayer);
+    } finally {
+      setPerfEnabled(false);
+      resetPerfMetrics();
+    }
   });
 
   it("renders Home and Settings routes inside the shell", async () => {

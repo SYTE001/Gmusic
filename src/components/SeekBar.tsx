@@ -54,10 +54,14 @@ export function SeekBar({ compact = false, stackedLabels = false }: { compact?: 
     [durationMs],
   );
 
-  // Smooth interpolation while playing; static otherwise.
+  // Smooth interpolation while playing; static otherwise. Every mount and
+  // play-state transition first reconciles the store with the media element:
+  // timeupdate is intentionally coarse, so its last value can lag at pause.
   useEffect(() => {
     lastSecRef.current = -1;
     lastFracRef.current = -1;
+    const playback = usePlaybackStore.getState();
+    playback.syncFromEngine(true);
     applyVisualPosition(usePlaybackStore.getState().currentTimeMs, true);
     if (!isPlaying) {
       return;

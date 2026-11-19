@@ -98,7 +98,7 @@ function sessionPayload(): ReturnType<typeof savePlaybackSession> | null {
   if (!playback.currentTrackId) return null;
   // The store clock may lag real playback in throttled tabs; correct it from
   // the audio element before anything is saved or shown.
-  playback.syncFromEngine();
+  playback.syncFromEngine(true);
   const fresh = usePlaybackStore.getState();
   return savePlaybackSession({
     queueTrackIds: fresh.queueTrackIds,

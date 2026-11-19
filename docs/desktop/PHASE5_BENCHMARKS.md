@@ -102,12 +102,33 @@ Unverified workloads: cold/warm **desktop application** startup p50/p95; complet
 
 A baseline and final production web preview successfully rendered the empty-library shell and reported exactly one audio element, non-Tauri runtime, and a single baseline navigation DCL observation of433.2ms. This is **one observation**, not cold/warm startup percentiles. Browser file upload is unsupported by the host. Native runtime/human listening remains manual QA; no real user data was seeded or overwritten.
 
+## Runtime-fix navigation follow-up (2026-11-19)
+
+Windows Sandbox testing reported sluggish switches among Library, Settings and Playlists. Focused code profiling found no route-transition SQLite query or Tauri IPC: pages read the already-hydrated Zustand library. Two synchronous frontend bottlenecks were confirmed instead:
+
+- `PlaylistsPage` resolved every playlist membership with `tracks.find`, producing quadratic work against library size.
+- `AppShell` subscribed directly to `useLocation`, rerendering persistent sidebar/player chrome on every primary route switch.
+
+The playlist index now builds one memoized track lookup and resolves all summaries in linear library-plus-membership work. The persistent shell delegates route observation to a zero-DOM drawer-closing child, so route changes replace the outlet without rerendering `AppShell` or `MiniPlayer`. Sidebar playlist artwork reuses one memoized track-ID set rather than scanning all tracks for each membership. No virtualization, persistence contract, schema, IPC, artwork decode path or playback owner changed.
+
+Identical Node/jsdom parent-route workload, 15 nearest-rank samples per case on the same host and fixture shape (raw measurements summarized in [runtime-fixes-navigation.json](benchmarks/runtime-fixes-navigation.json)):
+
+| Library / playlist fixture | Before p50 / p95 | After p50 / p95 | Track-ID reads before → after |
+|---|---:|---:|---:|
+| 1,000 tracks / 20×50 memberships | 83.2 / 148.8 ms | 17.2 / 90.7 ms | 500,520 → 1,020 |
+| 10,000 tracks / 40×100 memberships | 1,735.8 / 2,451.0 ms | 77.6 / 120.0 ms | 8,002,040 → 10,040 |
+
+These are React parent mount plus playlist summary-computation measurements with `ArtworkCard` and the create modal mocked. They do **not** measure WebView2 paint, image decoding, SQLite, Tauri IPC, GC pauses or installed desktop interaction latency. The deterministic work-count reduction is the strongest evidence. An in-app browser smoke confirmed the shared shell and empty-library routes render, but its locator transport was not reliable enough for timing evidence. Installed NSIS/WebView2 performance remains manual runtime QA; no overall 40% desktop claim is made.
+
 ## Reproduction
 
 ```bash
 # Ordinary regression (benchmark exits immediately without opt-in)
 cargo test --manifest-path src-tauri/Cargo.toml
 npm test -- src/features/playlists/PlaylistDetailPage.performance.test.tsx
+
+# Runtime-fix playlist route timings, choose a NEW output filename
+GMUSIC_BENCH=1 GMUSIC_BENCH_OUTPUT='C:/absolute/new-navigation.json' npm test -- src/features/playlists/PlaylistsPage.performance.test.tsx
 
 # Native raw timings, choose a NEW output filename
 GMUSIC_BENCH=1 GMUSIC_BENCH_OUTPUT='C:/absolute/new-native.json' cargo test --manifest-path src-tauri/Cargo.toml performance_tests::desktop_performance_workloads -- --exact --test-threads=1

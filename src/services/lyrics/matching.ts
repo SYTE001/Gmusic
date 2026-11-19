@@ -191,7 +191,9 @@ export function evaluateMatch(
   let artistSim =
     track.artist && record.artistName ? artistSimilarity(track.artist, record.artistName) : null;
 
-  // Support reversed track metadata (where track.title holds artist and track.artist holds song title)
+  // Recover genuinely reversed local tags only when both fields independently
+  // validate in the swapped orientation. A one-field hit (for example a
+  // candidate title equal to the local artist) can never trigger this path.
   if ((titleSim < 0.5 || (artistSim !== null && artistSim < 0.5)) && track.artist && record.artistName) {
     const swappedTitleSim = titleSimilarityWithArtistPrefixStripped(
       track.artist,
@@ -216,16 +218,14 @@ export function evaluateMatch(
   // Check version qualifiers (Case D: Live Acoustic vs Studio)
   const trackQualifiers = extractVersionQualifiers(track.title);
   const recordQualifiers = extractVersionQualifiers(recordTrackName);
-  let versionMismatch = false;
+  const versionMismatch =
+    trackQualifiers.size !== recordQualifiers.size ||
+    Array.from(trackQualifiers).some((qualifier) => !recordQualifiers.has(qualifier));
 
-  if (trackQualifiers.size > 0) {
-    const hasSharedQualifier = Array.from(trackQualifiers).some((q) => recordQualifiers.has(q));
-    if (!hasSharedQualifier) {
-      // The local track is an alternate version (e.g. Live or Acoustic),
-      // but the candidate does not have this distinction.
-      versionMismatch = true;
-      titleSim = Math.min(titleSim, 0.6);
-    }
+  if (versionMismatch) {
+    // Studio/live/acoustic/remix/etc. are distinct recordings even when their
+    // base titles and durations happen to align.
+    titleSim = Math.min(titleSim, 0.6);
   }
 
   // Weighted matching strategy:
@@ -284,21 +284,30 @@ export function decideMatch(
 ): MatchDecision {
   const quality = evaluateMatch(track, record);
 
-  // Auto-accept only if not rejected, no version mismatch, and passes decision thresholds
+  const hasLocalArtist = Boolean(track.artist.trim());
+  const hasRecordArtist = Boolean(record.artistName?.trim());
+  // Without both artist identities, an exact title remains useful for the
+  // manual chooser but is never safe to attach automatically.
+  const hasArtistIdentity = hasLocalArtist && hasRecordArtist && quality.artistSimilarity !== null;
   const autoAccept =
     !quality.rejected &&
     !quality.versionMismatch &&
-    ((quality.score >= MATCH_THRESHOLDS.STRONG_MATCH_SCORE &&
-      quality.titleSimilarity >= MATCH_THRESHOLDS.AUTO_ACCEPT_TITLE &&
-      (quality.artistSimilarity === null || quality.artistSimilarity >= MATCH_THRESHOLDS.AUTO_ACCEPT_ARTIST)) ||
-      (quality.score >= MATCH_THRESHOLDS.VALIDATED_MATCH_SCORE &&
-        quality.titleSimilarity >= MATCH_THRESHOLDS.AUTO_ACCEPT_TITLE &&
-        (quality.artistSimilarity === null || quality.artistSimilarity >= MATCH_THRESHOLDS.AUTO_ACCEPT_ARTIST)));
+    hasArtistIdentity &&
+    quality.score >= MATCH_THRESHOLDS.VALIDATED_MATCH_SCORE &&
+    quality.titleSimilarity >= MATCH_THRESHOLDS.AUTO_ACCEPT_TITLE &&
+    quality.artistSimilarity! >= MATCH_THRESHOLDS.AUTO_ACCEPT_ARTIST &&
+    (quality.durationDeltaSeconds === null || quality.durationDeltaSeconds <= 5);
 
   const candidate =
     !quality.rejected &&
+    !quality.versionMismatch &&
     quality.titleSimilarity >= MATCH_THRESHOLDS.CANDIDATE_TITLE &&
-    quality.score >= MATCH_THRESHOLDS.CANDIDATE_SCORE;
+    quality.score >= MATCH_THRESHOLDS.CANDIDATE_SCORE &&
+    (quality.artistSimilarity === null ||
+      quality.artistSimilarity >= 0.75 ||
+      quality.durationDeltaSeconds === null ||
+      quality.durationDeltaSeconds <= 5) &&
+    (quality.durationDeltaSeconds === null || quality.durationDeltaSeconds <= 60);
 
   return { quality, autoAccept, candidate };
 }
@@ -340,7 +349,7 @@ export function rankCandidates(
         hasPlain: Boolean(record.plainLyrics),
       };
     })
-    .filter((entry) => !entry.quality.rejected && entry.capability !== "none")
+    .filter((entry) => decideMatch(track, entry.record).candidate && entry.capability !== "none")
     .sort((a, b) => {
       const acceptDiff = Number(b.autoAcceptable) - Number(a.autoAcceptable);
       if (acceptDiff !== 0) return acceptDiff;

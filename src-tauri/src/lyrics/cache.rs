@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const POSITIVE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const NEGATIVE_TTL_MS: u64 = 60 * 60 * 1000;
 const MAX_ENTRY_BYTES: u64 = 8 * 1024 * 1024;

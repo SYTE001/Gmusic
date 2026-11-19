@@ -42,7 +42,7 @@ describe("evaluateMatch", () => {
     expect(decision.autoAccept).toBe(true);
   });
 
-  it("accepts a match when the local track has no album or artist", () => {
+  it("keeps exact-title candidates manually choosable when local artist metadata is missing", () => {
     const bare: Pick<Track, "title" | "artist" | "album" | "durationMs"> = {
       title: "Gentle Rise",
       artist: "",
@@ -51,7 +51,8 @@ describe("evaluateMatch", () => {
     };
     const decision = decideMatch(bare, record());
     expect(decision.quality.artistSimilarity).toBeNull();
-    expect(decision.autoAccept).toBe(true);
+    expect(decision.autoAccept).toBe(false);
+    expect(decision.candidate).toBe(true);
   });
 
   it("rejects a clearly different title", () => {
@@ -120,6 +121,65 @@ describe("evaluateMatch", () => {
   it("still rejects a wildly different recording whose qualifiers were stripped", () => {
     const decision = decideMatch(track, record({ trackName: "Gentle Rise (Live 12 Minute Version)", duration: 721 }));
     expect(decision.quality.rejected).toBe(true);
+  });
+});
+
+describe("identity guards", () => {
+  const adelaTrack: Pick<Track, "title" | "artist" | "album" | "durationMs"> = {
+    title: "Ain't In LA",
+    artist: "ADÉLA",
+    album: "PRIMA",
+    durationMs: 184000,
+  };
+
+  it.each([
+    ["Babasha", "Adela", 192],
+    ["Smile / Happy Accidents", "Adela", 243],
+    ["Francesco de Galdeano", "Adela", 146],
+  ])("rejects a candidate whose title is only the local artist: %s — %s", (artistName, trackName, duration) => {
+    const unrelated = record({ trackName, artistName, duration });
+    const decision = decideMatch(adelaTrack, unrelated);
+    expect(decision.quality.rejected).toBe(true);
+    expect(decision.autoAccept).toBe(false);
+    expect(decision.candidate).toBe(false);
+    expect(rankCandidates(adelaTrack, [unrelated])).toHaveLength(0);
+  });
+
+  it("matches Unicode accents safely without weakening title identity", () => {
+    const decision = decideMatch(
+      adelaTrack,
+      record({ trackName: "Ain’t In LA", artistName: "Adela", albumName: "Ain't In LA", duration: 187 }),
+    );
+    expect(decision.quality.titleSimilarity).toBe(1);
+    expect(decision.quality.artistSimilarity).toBe(1);
+    expect(decision.autoAccept).toBe(true);
+  });
+
+  it("keeps compound and collaborating artists credible", () => {
+    const compoundTrack = { title: "Sweet / I Thought You Wanted to Dance", artist: "Tyler, The Creator", album: "", durationMs: 588000 };
+    const compound = decideMatch(compoundTrack, record({ trackName: compoundTrack.title, artistName: "Tyler, The Creator", duration: 588 }));
+    expect(compound.autoAccept).toBe(true);
+
+    const collaborationTrack = { title: "Lovely", artist: "Billie Eilish feat. Khalid", album: "", durationMs: 200000 };
+    const collaboration = decideMatch(collaborationTrack, record({ trackName: "Lovely", artistName: "Billie Eilish & Khalid", duration: 200 }));
+    expect(collaboration.quality.rejected).toBe(false);
+    expect(collaboration.candidate).toBe(true);
+  });
+
+  it("does not auto-attach artistless metadata, but preserves an exact title as a manual candidate", () => {
+    const bare = { title: "Ain't In LA", artist: "", album: "", durationMs: 184000 };
+    const decision = decideMatch(bare, record({ trackName: "Ain't In LA", artistName: "ADÉLA", duration: 184 }));
+    expect(decision.autoAccept).toBe(false);
+    expect(decision.candidate).toBe(true);
+  });
+
+  it("keeps credible results from multiple providers and drops unrelated filler", () => {
+    const ranked = rankCandidates(adelaTrack, [
+      { ...record({ id: 51, trackName: "Ain't In LA", artistName: "ADÉLA", duration: 187 }), provider: "lrclib" },
+      { ...record({ id: 52, trackName: "Ain't In LA", artistName: "Adela", duration: 184 }), provider: "lrcmux" },
+      { ...record({ id: 53, trackName: "Adela", artistName: "Babasha", duration: 192 }), provider: "lyricsdb" },
+    ]);
+    expect(ranked.map((entry) => entry.record.id)).toEqual([52, 51]);
   });
 });
 

@@ -224,12 +224,9 @@ describe("PRD §9: Mandatory Test Cases", () => {
     expect(decision.autoAccept).toBe(false);
 
     const result = await resolveLyricsForTrack(track);
-    // Not auto-accepted — offered in chooser (needs-selection) rather than silent attach
-    expect(result.outcome).toBe("needs-selection");
-    if (result.outcome === "needs-selection") {
-      expect(result.candidates.length).toBeGreaterThan(0);
-      expect(result.candidates[0].autoAcceptable).toBe(false);
-    }
+    // Version identity is a hard guard: an unrelated recording should not be
+    // offered merely to fill the chooser.
+    expect(result.outcome).toBe("not-found");
   });
 
   /**

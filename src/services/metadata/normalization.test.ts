@@ -318,6 +318,21 @@ describe("normalizeTrackMetadata", () => {
     expect(normalized.artist).toBe("Justin Bieber");
   });
 
+  it("preserves valid title and artist tags when an ambiguous filename uses title - artist order", () => {
+    const normalized = normalizeTrackMetadata(
+      makeTrack({
+        title: "Ain't In LA",
+        artist: "ADÉLA",
+        album: "PRIMA",
+        durationMs: 184000,
+        fileName: "Ain't In LA - ADÉLA.mp3",
+        metadataFromFilename: false,
+      }),
+    );
+    expect(normalized.title).toBe("Ain't In LA");
+    expect(normalized.artist).toBe("ADÉLA");
+  });
+
   it("does not overwrite valid artist when title contains a hyphenated subtitle", () => {
     const normalized = normalizeTrackMetadata(
       makeTrack({
