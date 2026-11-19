@@ -1,0 +1,16 @@
+{
+  "version": "1.1.0",
+  "target": "x86_64-pc-windows-msvc",
+  "artifacts": [
+    {
+      "file": "Gmusic_1.1.0_x64_en-US.msi",
+      "bytes": 7798784,
+      "sha256": "01f60cd4199fd8efa07c41fb711bce05d86fdaee9e07d26c930c062fb4f9355d"
+    },
+    {
+      "file": "Gmusic_1.1.0_x64-setup.exe",
+      "bytes": 5615076,
+      "sha256": "e0ed420e49dc1d333e5aa524c941bec3141fd1be88a4d9e1ad2253850810fcbf"
+    }
+  ]
+}

@@ -1,0 +1,145 @@
+name: Draft Windows release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: draft-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate trusted release tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Require maintainer release enablement
+        env:
+          ENABLED: ${{ vars.DESKTOP_DRAFT_RELEASE_ENABLED }}
+        run: test "$ENABLED" = "true" || { printf '%s\n' 'Draft releases disabled. Configure protected desktop-release environment and approval, then enable repository variable.'; exit 1; }
+      - name: Require protected human approval environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$GH_REPO" == SYTE001/Gmusic ]]
+          protection=$(gh api "repos/$GH_REPO/environments/desktop-release")
+          jq -e '.can_admins_bypass == false and .deployment_branch_policy.custom_branch_policies == true and any(.protection_rules[]; .type == "required_reviewers" and .prevent_self_review == true and (.reviewers | length) > 0)' <<< "$protection"
+          policies=$(gh api "repos/$GH_REPO/environments/desktop-release/deployment-branch-policies")
+          jq -e '.branch_policies | length == 1 and .[0].type == "tag" and .[0].name == "v*"' <<< "$policies"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26.13.1
+      - name: Validate version, event commit and main ancestry
+        env:
+          GMUSIC_RELEASE_VERIFY_GIT: '1'
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/validate-desktop-release.mjs "$RELEASE_TAG"
+
+  quality:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  package:
+    name: Build production installers
+    needs: [validate, quality]
+    runs-on: windows-2022
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26.13.1
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: windows-2022-rust-1.100.0-release-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.ref }}
+      - run: npm ci
+      - name: Validate version again
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/validate-desktop-release.mjs "$env:RELEASE_TAG"
+      - name: Build both unsigned production formats
+        run: npm run desktop:build -- --ci --target x86_64-pc-windows-msvc --bundles msi,nsis -- --locked
+      - name: Stage and checksum installers
+        run: node scripts/collect-desktop-artifacts.mjs src-tauri/target/x86_64-pc-windows-msvc/release/bundle release-artifacts
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installers-${{ github.sha }}
+          path: release-artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft:
+    name: Human-approved draft only
+    needs: [validate, quality, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: desktop-release
+    permissions:
+      contents: write
+    steps:
+      # No source checkout, package installation or repository code with a write token.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-installers-${{ github.sha }}
+          path: release-artifacts
+      - name: Verify artifacts and create draft (never publish or replace)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GH_REPO" == SYTE001/Gmusic ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          version="${RELEASE_TAG#v}"
+          msi="Gmusic_${version}_x64_en-US.msi"
+          nsis="Gmusic_${version}_x64-setup.exe"
+          cd release-artifacts
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
+          test -s "$msi" && test -s "$nsis"
+          awk -v msi="$msi" -v nsis="$nsis" 'NF != 2 || length($1) != 64 || $1 ~ /[^0-9a-f]/ || ($2 != msi && $2 != nsis) {bad=1} $2 == msi {m++} $2 == nsis {n++} END {if (bad || NR != 2 || m != 1 || n != 1) exit 1}' SHA256SUMS.txt
+          sha256sum --strict --check SHA256SUMS.txt
+          jq -e --arg version "$version" --arg msi "$msi" --arg nsis "$nsis" '.version == $version and .target == "x86_64-pc-windows-msvc" and (.artifacts | length == 2) and (.artifacts | map(.file) | sort == ([$msi, $nsis] | sort))' artifacts.json
+          for installer in "$msi" "$nsis"; do
+            hash=$(sha256sum "$installer" | cut -d ' ' -f 1)
+            bytes=$(stat -c '%s' "$installer")
+            jq -e --arg file "$installer" --arg hash "$hash" --argjson bytes "$bytes" 'any(.artifacts[]; .file == $file and .sha256 == $hash and .bytes == $bytes)' artifacts.json
+          done
+          # Recheck live tag/main ancestry before using contents:write.
+          compare=$(gh api "repos/$GH_REPO/compare/$RELEASE_TAG...main")
+          status=$(jq -r .status <<< "$compare")
+          [[ "$status" == ahead || "$status" == identical ]]
+          [[ "$(jq -r .base_commit.sha <<< "$compare")" == "$RELEASE_SHA" ]]
+          releases=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fxq "$RELEASE_TAG" <<< "$releases"; then
+            printf '%s\n' 'Release already exists. Refusing publication, replacement or mutation.'
+            exit 1
+          fi
+          printf '%s\n' 'Unsigned Windows installers. Draft only: signing, installer acceptance and music-lua runtime certification remain required before manual publication.' > "$RUNNER_TEMP/release-notes.md"
+          gh release create "$RELEASE_TAG" "$msi" "$nsis" SHA256SUMS.txt artifacts.json --verify-tag --target "$RELEASE_SHA" --draft --title "Gmusic $version (draft)" --notes-file "$RUNNER_TEMP/release-notes.md"

@@ -31,7 +31,28 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["msi", "nsis"],
+    "publisher": "gmusic",
+    "shortDescription": "Offline-first personal music player",
+    "longDescription": "A local-first personal music player with native lyrics, artwork and SQLite storage.",
+    "license": "MIT",
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "upgradeCode": "a3fbb68b-561c-5177-b577-1b65d5af5bbc"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "displayLanguageSelector": false,
+        "languages": ["English"]
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
