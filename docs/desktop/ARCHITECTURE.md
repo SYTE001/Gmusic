@@ -111,3 +111,10 @@ React 19 UI (src/components/, src/features/)
 - Tag pipeline rejects version drift/moved or off-main tags, requires all quality gates, builds release-mode MSI+NSIS and streams SHA256 evidence with `collect-desktop-artifacts.mjs`.
 - Draft-only writer is separate from repository code execution, has the only `contents:write` grant and uses same-run checked artifacts after protected `desktop-release` human approval. Repository opt-in plus verified environment controls fail closed; no release is published by this change.
 - [RELEASE.md](RELEASE.md) and [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) document signing, protection setup, build provenance/limits, WebView2/install/upgrade/rollback and outstanding actual installer/runtime certification (`music-lua` remains open).
+
+## 9. Runtime Reliability Follow-up Boundary
+
+- Seek presentation and pause persistence take exact snapshots from the shared `HTMLAudioElement` only at mount/pause/seek/persist lifecycle boundaries; active playback retains the existing drift tolerance and no second clock or frame-driven store updates exist.
+- TypeScript and Rust lyrics matchers require strong title identity, verified artist identity and ≤5-second duration alignment for auto-attachment. Recording-version mismatches and low-identity duration outliers are removed rather than used as chooser filler. Native discovery cache version 2 invalidates candidates ranked under the earlier policy, and the frontend revalidates all native IPC/cache records before attaching or presenting them.
+- Track-row equalizers remain decorative CSS transforms. Only active playback owns the compositor animation; pause and reduced motion use a deterministic static transform.
+- Primary route navigation stays in-memory after library hydration. Playlist summaries and sidebar artwork identity use memoized O(n + memberships) lookup structures; route observation is isolated from persistent shell/player rendering. No navigation-specific SQLite read, Tauri IPC, schema, virtualization or telemetry path was added.

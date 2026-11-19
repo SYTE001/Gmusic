@@ -1,11 +1,10 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useLibraryStore } from "../../stores/libraryStore";
 import { ArtworkCard } from "../../components/ArtworkCard";
 import { EmptyState } from "../../components/EmptyState";
 import { PlaylistIcon, PlusIcon } from "../../components/Icons";
 import { formatDurationLong } from "../../utils/misc";
-import type { Track } from "../../types";
 
 /** Playlist index (PRD §7.4). */
 export function PlaylistsPage() {
@@ -13,6 +12,22 @@ export function PlaylistsPage() {
   const tracks = useLibraryStore((state) => state.tracks);
   const [creating, setCreating] = useState(false);
   const navigate = useNavigate();
+  const playlistSummaries = useMemo(() => {
+    const tracksById = new Map(tracks.map((track) => [track.id, track]));
+    return playlists.map((playlist) => {
+      let durationMs = 0;
+      let artworkKey: string | null = null;
+      let trackCount = 0;
+      for (const trackId of playlist.trackIds) {
+        const track = tracksById.get(trackId);
+        if (!track) continue;
+        artworkKey ??= track.id;
+        durationMs += track.durationMs ?? 0;
+        trackCount += 1;
+      }
+      return { playlist, artworkKey, durationMs, trackCount };
+    });
+  }, [playlists, tracks]);
 
   return (
     <div className="space-y-5">
@@ -45,22 +60,16 @@ export function PlaylistsPage() {
         />
       ) : (
         <div className="grid grid-cols-2 gap-1 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6">
-          {playlists.map((playlist) => {
-            const playlistTracks = playlist.trackIds
-              .map((id) => tracks.find((track) => track.id === id))
-              .filter((track): track is Track => Boolean(track));
-            const durationMs = playlistTracks.reduce((sum, track) => sum + (track.durationMs ?? 0), 0);
-            return (
-              <ArtworkCard
-                key={playlist.id}
-                artworkKey={playlistTracks[0]?.id ?? null}
-                title={playlist.name}
-                subtitle={`${playlistTracks.length} song${playlistTracks.length === 1 ? "" : "s"} · ${formatDurationLong(durationMs)}`}
-                ariaLabel={`Open playlist ${playlist.name}`}
-                onOpen={() => navigate(`/playlist/${playlist.id}`)}
-              />
-            );
-          })}
+          {playlistSummaries.map(({ playlist, artworkKey, durationMs, trackCount }) => (
+            <ArtworkCard
+              key={playlist.id}
+              artworkKey={artworkKey}
+              title={playlist.name}
+              subtitle={`${trackCount} song${trackCount === 1 ? "" : "s"} · ${formatDurationLong(durationMs)}`}
+              ariaLabel={`Open playlist ${playlist.name}`}
+              onOpen={() => navigate(`/playlist/${playlist.id}`)}
+            />
+          ))}
         </div>
       )}
 

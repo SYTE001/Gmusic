@@ -250,9 +250,20 @@ pub fn rank(track: &TrackQuery, records: Vec<Record>) -> Vec<Candidate> {
         parser::normalize_record(&mut record);
         let quality = evaluate(track, &record);
         let capability = parser::capability(&record).to_string();
+        let credible_artist_or_duration = quality.artist_similarity.is_none_or(|artist| {
+            artist >= 0.75
+                || quality
+                    .duration_delta_seconds
+                    .is_none_or(|delta| delta <= 5.0)
+        });
         if quality.rejected
+            || quality.version_mismatch
             || quality.title_similarity < 0.55
             || quality.score < 40.0
+            || !credible_artist_or_duration
+            || quality
+                .duration_delta_seconds
+                .is_some_and(|delta| delta > 60.0)
             || capability == "none"
         {
             continue;
@@ -394,10 +405,96 @@ mod tests {
         live.id = 2.into();
         live.track_name = Some("Gentle Rise (Live)".into());
         let ranked = rank(&track(), vec![record(), live]);
-        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked.len(), 1);
         assert!(ranked[0].auto_acceptable);
-        assert!(!ranked[1].auto_acceptable);
     }
+    #[test]
+    fn rejects_cross_field_artist_as_title_candidates() {
+        let track = TrackQuery {
+            id: "adela-aint-in-la".into(),
+            title: "Ain't In LA".into(),
+            artist: "ADÉLA".into(),
+            album: "PRIMA".into(),
+            duration_ms: Some(184_000),
+        };
+        let records = [
+            ("Babasha", 192.0),
+            ("Smile / Happy Accidents", 243.0),
+            ("Francesco de Galdeano", 146.0),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (artist, duration))| Record {
+            id: (index + 1).into(),
+            provider: ["lrcmux", "lrclib", "lyricsdb"][index].into(),
+            track_name: Some("Adela".into()),
+            artist_name: Some(artist.into()),
+            duration: Some(duration),
+            synced_lyrics: Some("[00:01]wrong lyrics".into()),
+            ..Default::default()
+        })
+        .collect();
+
+        assert!(rank(&track, records).is_empty());
+    }
+
+    #[test]
+    fn unicode_artist_identity_and_missing_metadata_guards() {
+        let exact = Record {
+            track_name: Some("Ain’t In LA".into()),
+            artist_name: Some("Adela".into()),
+            duration: Some(187.0),
+            synced_lyrics: Some("[00:01]lyrics".into()),
+            ..record()
+        };
+        let track = TrackQuery {
+            id: "adela-aint-in-la".into(),
+            title: "Ain't In LA".into(),
+            artist: "ADÉLA".into(),
+            album: "PRIMA".into(),
+            duration_ms: Some(184_000),
+        };
+        assert!(rank(&track, vec![exact.clone()])[0].auto_acceptable);
+
+        let mut artistless = track;
+        artistless.artist.clear();
+        let ranked = rank(&artistless, vec![exact]);
+        assert_eq!(ranked.len(), 1);
+        assert!(!ranked[0].auto_acceptable);
+    }
+
+    #[test]
+    fn compound_artists_covers_and_version_guards_remain_distinct() {
+        let compound = TrackQuery {
+            id: "compound".into(),
+            title: "Sweet / I Thought You Wanted to Dance".into(),
+            artist: "Tyler, The Creator".into(),
+            album: String::new(),
+            duration_ms: Some(588_000),
+        };
+        let exact = Record {
+            track_name: Some(compound.title.clone()),
+            artist_name: Some(compound.artist.clone()),
+            duration: Some(588.0),
+            synced_lyrics: Some("[00:01]lyrics".into()),
+            ..record()
+        };
+        assert!(rank(&compound, vec![exact])[0].auto_acceptable);
+
+        let mut close_cover = record();
+        close_cover.artist_name = Some("Cover Band".into());
+        close_cover.duration = Some(214.0);
+        let ranked = rank(&track(), vec![close_cover]);
+        assert_eq!(ranked.len(), 1);
+        assert!(!ranked[0].auto_acceptable);
+
+        let mut studio_track = track();
+        studio_track.title = "Gentle Rise".into();
+        let mut live = record();
+        live.track_name = Some("Gentle Rise (Live)".into());
+        assert!(rank(&studio_track, vec![live]).is_empty());
+    }
+
     #[test]
     fn conflicting_cross_provider_payloads_require_selection() {
         let mut other = record();

@@ -93,7 +93,7 @@ type PlaybackActions = {
   /** Re-reads the audio clock into the store — used when the tab becomes
    * visible again and before persisting, so displays and saved positions
    * never lag behind real playback. */
-  syncFromEngine(): void;
+  syncFromEngine(exact?: boolean): void;
   setVolume(volume: number): void;
   toggleMute(): void;
   toggleShuffle(): void;
@@ -298,6 +298,9 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
       if (isPlaying) {
         usePlaybackStore.setState({ isPlaying: true, autoplayBlocked: false, status: "ready" });
       } else if (usePlaybackStore.getState().status !== "loading") {
+        // pause can land between the element's coarse timeupdate events; copy
+        // the authoritative media position before observers freeze their UI.
+        get().syncFromEngine(true);
         usePlaybackStore.setState({ isPlaying: false });
       }
     },
@@ -307,7 +310,7 @@ function makeEngineEvents(get: () => PlaybackStore): EngineEvents {
     // A completed seek is the moment of truth: re-read the element so a
     // clamped or dropped seek can never leave the store showing a position
     // the audio is not actually at.
-    onSeeked: () => get().syncFromEngine(),
+    onSeeked: () => get().syncFromEngine(true),
     onEnded: () => get().handleEngineEnded(),
     onError: (failure) => get().handleEngineError(failure),
     onDispose: () => {
@@ -828,15 +831,29 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     get().seek(positionMs + deltaMs);
   },
 
-  syncFromEngine: () => {
+  syncFromEngine: (exact = false) => {
     const state = get();
     if (!state.currentTrackId || state.status !== "ready") return;
     const engine = state.getEngine();
     if (!engine.element) return;
+    // A restored session intentionally has no media source until the next user
+    // play gesture. Its newly created element reports 0, which must not erase
+    // the saved resume position displayed by paused controls.
+    if (
+      typeof HTMLMediaElement !== "undefined" &&
+      engine.element instanceof HTMLMediaElement &&
+      !engine.element.currentSrc &&
+      !engine.element.getAttribute("src")
+    ) {
+      return;
+    }
     const engineMs = engine.currentTimeSec * 1000;
-    // Only correct meaningful drift: timeupdate already keeps this fresh.
-    if (Math.abs(engineMs - state.currentTimeMs) > 750) {
-    usePlaybackStore.setState({ currentTimeMs: engineMs });
+    if (!Number.isFinite(engineMs) || engineMs < 0) return;
+    // The media clock is authoritative. Periodic playback checks retain a
+    // tolerance to avoid redundant high-frequency store writes; settled
+    // lifecycle boundaries request an exact snapshot.
+    if (exact || Math.abs(engineMs - state.currentTimeMs) > 750) {
+      usePlaybackStore.setState({ currentTimeMs: engineMs });
       syncMediaSession();
     }
   },

@@ -1,6 +1,7 @@
-import { memo, useEffect, useState, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import { NavLink, useLocation, useNavigate } from "react-router-dom";
 import { useLibraryStore } from "../stores/libraryStore";
+import { useShallow } from "zustand/react/shallow";
 import { SearchField } from "./TopBar";
 import { Menu, type MenuItemSpec } from "./Menu";
 import { Modal } from "./Modal";
@@ -83,8 +84,18 @@ export function SidebarContent({
 }) {
   recordComponentRender("SidebarContent");
   const playlists = useLibraryStore((state) => state.playlists);
-  const likedCount = useLibraryStore((state) => state.tracks.filter((track) => track.isLiked).length);
-  const brokenCount = useLibraryStore((state) => state.tracks.filter((track) => track.broken?.isBroken || track.availability === "broken").length);
+  const [likedCount, brokenCount, ...trackIdList] = useLibraryStore(
+    useShallow((state): [number, number, ...string[]] => {
+      const summary: [number, number, ...string[]] = [0, 0];
+      for (const track of state.tracks) {
+        summary.push(track.id);
+        if (track.isLiked) summary[0] += 1;
+        if (track.broken?.isBroken || track.availability === "broken") summary[1] += 1;
+      }
+      return summary;
+    }),
+  );
+  const trackIds = useMemo(() => new Set(trackIdList), [trackIdList]);
   const [creating, setCreating] = useState(false);
 
   const activateSearch = () => {
@@ -210,7 +221,7 @@ export function SidebarContent({
               <p className="px-3 pb-2 pt-1 text-xs text-text-muted">Playlists you create appear here.</p>
             )}
             {playlists.map((playlist) => (
-              <SidebarPlaylistRow key={playlist.id} playlist={playlist} />
+              <SidebarPlaylistRow key={playlist.id} playlist={playlist} trackIds={trackIds} />
             ))}
           </div>
         </div>
@@ -236,7 +247,7 @@ export function SidebarContent({
             <HeartIcon size={19} filled={likedCount > 0} className={likedCount > 0 ? "text-text-primary" : ""} />
           </NavLink>
           {playlists.map((playlist) => (
-            <CollapsedPlaylistThumb key={playlist.id} playlist={playlist} />
+            <CollapsedPlaylistThumb key={playlist.id} playlist={playlist} trackIds={trackIds} />
           ))}
         </div>
       )}
@@ -266,11 +277,9 @@ export function SidebarContent({
 }
 
 /** Actual first-track artwork where available, neutral tile otherwise. */
-function PlaylistThumb({ playlist, className }: { playlist: Playlist; className?: string }) {
+function PlaylistThumb({ playlist, trackIds, className }: { playlist: Playlist; trackIds: ReadonlySet<string>; className?: string }) {
   recordComponentRender("PlaylistThumb");
-  const firstTrackId = useLibraryStore(
-    (state) => playlist.trackIds.find((id) => state.tracks.some((track) => track.id === id)) ?? null,
-  );
+  const firstTrackId = playlist.trackIds.find((id) => trackIds.has(id)) ?? null;
   const url = useArtworkUrl(firstTrackId);
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
 
@@ -306,7 +315,7 @@ function PlaylistThumb({ playlist, className }: { playlist: Playlist; className?
 }
 
 /** Collapsed-rail playlist shortcut: artwork square with tooltip. */
-const CollapsedPlaylistThumb = memo(function CollapsedPlaylistThumb({ playlist }: { playlist: Playlist }) {
+const CollapsedPlaylistThumb = memo(function CollapsedPlaylistThumb({ playlist, trackIds }: { playlist: Playlist; trackIds: ReadonlySet<string> }) {
   return (
     <NavLink
       to={`/playlist/${playlist.id}`}
@@ -314,13 +323,13 @@ const CollapsedPlaylistThumb = memo(function CollapsedPlaylistThumb({ playlist }
       aria-label={playlist.name}
       title={playlist.name}
     >
-      <PlaylistThumb playlist={playlist} className="size-7" />
+      <PlaylistThumb playlist={playlist} trackIds={trackIds} className="size-7" />
     </NavLink>
   );
 });
 
 /** One playlist row: navigates, and reveals a "…" menu (rename/delete) on hover. */
-const SidebarPlaylistRow = memo(function SidebarPlaylistRow({ playlist }: { playlist: Playlist }) {
+const SidebarPlaylistRow = memo(function SidebarPlaylistRow({ playlist, trackIds }: { playlist: Playlist; trackIds: ReadonlySet<string> }) {
   const location = useLocation();
   const navigate = useNavigate();
   const renamePlaylist = useLibraryStore((state) => state.renamePlaylist);
@@ -359,7 +368,7 @@ const SidebarPlaylistRow = memo(function SidebarPlaylistRow({ playlist }: { play
             : "text-text-secondary hover:bg-surface-hover hover:text-text-primary"
         }`}
       >
-        <PlaylistThumb playlist={playlist} className="size-7" />
+        <PlaylistThumb playlist={playlist} trackIds={trackIds} className="size-7" />
         <span className="min-w-0 flex-1 truncate">{playlist.name}</span>
       </NavLink>
       <div

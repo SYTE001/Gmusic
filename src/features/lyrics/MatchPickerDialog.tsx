@@ -22,7 +22,7 @@ export function MatchPickerDialog({
   return (
     <Modal open={open} title={`Choose lyrics for “${trackTitle}”`} onClose={onDismiss} width="max-w-lg">
       <p className="mb-3 text-sm text-text-secondary">
-        No clear match was found automatically. These are the closest candidates from lrcmux — pick the one that matches
+        No clear match was found automatically. These are the closest credible candidates from the configured lyrics providers — pick the one that matches
         your file, or dismiss to keep looking manually.
       </p>
       <div className="max-h-80 space-y-1 overflow-y-auto pr-1">

@@ -313,8 +313,8 @@ input[type="range"].app-range-vertical::-moz-range-thumb {
   }
 }
 
-/* Animated equalizer for the currently playing row. Bars freeze (animation
-   paused) when playback is paused so the state is never falsely animated. */
+/* Animated equalizer for the currently playing row. The static transform is
+   the paused/reduced-motion state; only active playback owns an animation. */
 .eq {
   display: inline-flex;
   align-items: flex-end;
@@ -326,18 +326,18 @@ input[type="range"].app-range-vertical::-moz-range-thumb {
   height: 100%;
   border-radius: 1px;
   background: var(--accent);
-  transform-origin: bottom;
-  animation: eq-bounce 1s ease-in-out infinite;
-}
-.eq i:nth-child(2) {
-  animation-delay: 0.18s;
-}
-.eq i:nth-child(3) {
-  animation-delay: 0.36s;
-}
-.eq[data-playing="false"] i {
-  animation-play-state: paused;
   transform: scaleY(0.35);
+  transform-origin: bottom;
+}
+.eq[data-playing="true"] i {
+  animation: eq-bounce 0.9s ease-in-out infinite;
+  will-change: transform;
+}
+.eq[data-playing="true"] i:nth-child(2) {
+  animation-delay: -0.3s;
+}
+.eq[data-playing="true"] i:nth-child(3) {
+  animation-delay: -0.6s;
 }
 @keyframes eq-bounce {
   0%,
@@ -349,6 +349,19 @@ input[type="range"].app-range-vertical::-moz-range-thumb {
   }
   65% {
     transform: scaleY(0.55);
+  }
+}
+
+/* Match the global motion preference semantics: data-motion="on" means
+   reduced motion, while data-motion="off" explicitly permits animation. */
+html[data-motion="on"] .eq[data-playing="true"] i {
+  animation: none;
+  will-change: auto;
+}
+@media (prefers-reduced-motion: reduce) {
+  html:not([data-motion="off"]) .eq[data-playing="true"] i {
+    animation: none;
+    will-change: auto;
   }
 }
 

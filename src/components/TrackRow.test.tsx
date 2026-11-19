@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { TrackRow } from "./TrackRow";
 import { useLibraryStore } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
@@ -188,6 +188,24 @@ describe("TrackRow component", () => {
 
     const title = screen.getByText("Midnight City");
     expect(title.className).toContain("text-accent");
+  });
+
+  it("toggles the CSS-only equalizer state without changing its three-bar structure", () => {
+    const track = createTrack();
+    usePlaybackStore.setState({ currentTrackId: track.id, isPlaying: true });
+    const { container } = render(
+      <TrackRow track={track} contextTrackIds={[track.id]} context={mockContext} />,
+    );
+
+    const equalizer = container.querySelector(".eq");
+    expect(equalizer?.getAttribute("data-playing")).toBe("true");
+    expect(equalizer?.querySelectorAll("i")).toHaveLength(3);
+
+    act(() => {
+      usePlaybackStore.setState({ isPlaying: false });
+    });
+    expect(equalizer?.getAttribute("data-playing")).toBe("false");
+    expect(equalizer?.querySelectorAll("i")).toHaveLength(3);
   });
 
   it("handles re-render when context is omitted or undefined without crashing", () => {

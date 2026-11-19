@@ -63,6 +63,24 @@ describe("native lyrics integration", () => {
     expect((await repository.getLyrics(track.id))?.origin?.kind).toBe("manual");
   });
 
+  it("revalidates native candidates and returns zero choices for unrelated cross-field results", async () => {
+    const localTrack = { ...track, id: "adela-aint-in-la", title: "Ain't In LA", artist: "ADÉLA", album: "PRIMA", durationMs: 184000 };
+    const unrelatedRows: Array<{ artistName: string; duration: number; provider: "lrcmux" | "lrclib" | "lyricsdb" }> = [
+      { artistName: "Babasha", duration: 192, provider: "lrcmux" },
+      { artistName: "Smile / Happy Accidents", duration: 243, provider: "lrclib" },
+      { artistName: "Francesco de Galdeano", duration: 146, provider: "lyricsdb" },
+    ];
+    const unrelated = unrelatedRows.map(({ artistName, duration, provider }, index) => ({
+      ...candidate,
+      autoAcceptable: false,
+      record: { ...record, id: index + 1, provider, trackName: "Adela", artistName, duration },
+    }));
+    vi.mocked(discoverDesktopLyrics).mockResolvedValue({ ...native(), candidates: unrelated });
+
+    expect((await resolveLyricsForTrack(localTrack)).outcome).toBe("not-found");
+    expect(await repository.getLyrics(localTrack.id)).toBeUndefined();
+  });
+
   it("shows ambiguity in the existing chooser instead of auto-attaching", async () => {
     vi.mocked(discoverDesktopLyrics).mockResolvedValue({ ...native(), candidates: [{ ...candidate, autoAcceptable: false }] });
     expect((await resolveLyricsForTrack(track)).outcome).toBe("needs-selection");

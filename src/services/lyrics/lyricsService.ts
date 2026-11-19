@@ -842,7 +842,7 @@ export const TOTAL_SEARCH_BUDGET_MS = 14_000;
 let totalSearchBudgetMs = TOTAL_SEARCH_BUDGET_MS;
 
 function desktopDiscoveryIdentity(track: Track, options: ResolveLyricsOptions): string {
-  return JSON.stringify([1, track.title, track.artist, track.album, track.durationMs, [...(options.providers ?? defaultProviders)].sort()]);
+  return JSON.stringify([2, track.title, track.artist, track.album, track.durationMs, [...(options.providers ?? defaultProviders)].sort()]);
 }
 
 async function resolveNativeLyrics(
@@ -865,7 +865,27 @@ async function resolveNativeLyrics(
     return { outcome: "cached", lyrics: latest };
   }
   const cached = latest ?? context.cached;
-  for (const candidate of native.candidates) {
+  // Treat native IPC/cache candidates as untrusted input at this boundary.
+  // Re-run the shared identity policy so an older cache or backend cannot keep
+  // offering records that no longer meet the current title/artist/version and
+  // duration guards.
+  const nativeAutoAccept = new Map(
+    native.candidates.map((candidate) => [
+      `${candidate.record.provider ?? ""}:${String(candidate.record.id)}`,
+      candidate.autoAcceptable,
+    ]),
+  );
+  const candidates = rankCandidates(canonicalTrack, native.candidates.map((candidate) => candidate.record)).map(
+    (candidate) => ({
+      ...candidate,
+      // Keep a stricter native ambiguity decision, but never let a permissive
+      // backend override the freshly evaluated shared identity policy.
+      autoAcceptable:
+        candidate.autoAcceptable &&
+        nativeAutoAccept.get(`${candidate.record.provider ?? ""}:${String(candidate.record.id)}`) === true,
+    }),
+  );
+  for (const candidate of candidates) {
     if (!candidate.autoAcceptable) continue;
     const floor = Math.max(context.minCapabilityRank, cached ? CAPABILITY_RANK[detectLyricsCapability(cached)] : 0);
     const considered = considerRecord(canonicalTrack, candidate.record, cached, floor);
@@ -875,9 +895,9 @@ async function resolveNativeLyrics(
     return { outcome: "attached", lyrics };
   }
   if (cached && context.keepOnMiss) return { outcome: "cached", lyrics: cached };
-  if (native.candidates.length > 0) {
+  if (candidates.length > 0) {
     await repository.putLyricsCacheMeta({ trackId: track.id, status: "needs-selection", checkedAt: Date.now(), recordId: null, schemaVersion: DB_SCHEMA_VERSION, discoveryIdentity: identity });
-    return { outcome: "needs-selection", candidates: native.candidates };
+    return { outcome: "needs-selection", candidates };
   }
   if (native.offline) return { outcome: "offline" };
   if (native.errors.length > 0) return { outcome: "error", message: native.errors.join(" ") };
