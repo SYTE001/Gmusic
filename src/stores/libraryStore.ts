@@ -29,10 +29,11 @@ import {
   clearPlaybackSession,
   loadPlaybackSession,
   savePlaybackSession,
+  type PlaybackSession,
 } from "../services/library/playbackSession";
 import { createId, debounce, deriveArtistTitleFromFileName } from "../utils/misc";
 import { isCorruptedOrSuspiciousMetadata } from "../services/metadata/types";
-import { bindPlaybackHelpers, usePlaybackStore } from "./playbackStore";
+import { bindPlaybackHelpers, resetPlaybackRuntime, usePlaybackStore } from "./playbackStore";
 import { useSettingsStore } from "./settingsStore";
 import { toast } from "./toastStore";
 import { bindLyricsTrackLookup, useLyricsStore } from "./lyricsStore";
@@ -40,7 +41,6 @@ import { currentAuthState } from "../services/cloud/cloudAuthService";
 import { syncTrackMetadata } from "../services/cloud/cloudMetadataSyncService";
 import { removeTrackFromCloud } from "../services/cloud/cloudDeletionService";
 import { getPlayUrl, invalidatePlayUrl } from "../services/cloud/r2StorageService";
-import { releaseActiveTrackSource } from "../services/file-access/FileAccessService";
 import { requestPersistentStorage } from "../services/offline/offlineService";
 import { perfMark, perfMeasure } from "../utils/perf";
 
@@ -93,14 +93,14 @@ type LibraryState = {
   ) => Promise<{ syncStatus: "synced" | "queued" | "local"; error?: string }>;
 };
 
-function sessionPayload(): ReturnType<typeof savePlaybackSession> | null {
+function playbackSessionSnapshot(): PlaybackSession | null {
   const playback = usePlaybackStore.getState();
   if (!playback.currentTrackId) return null;
   // The store clock may lag real playback in throttled tabs; correct it from
   // the audio element before anything is saved or shown.
   playback.syncFromEngine(true);
   const fresh = usePlaybackStore.getState();
-  return savePlaybackSession({
+  return {
     queueTrackIds: fresh.queueTrackIds,
     queueIndex: fresh.queueIndex,
     contextTrackIds: fresh.contextTrackIds,
@@ -108,51 +108,59 @@ function sessionPayload(): ReturnType<typeof savePlaybackSession> | null {
     currentTrackId: fresh.currentTrackId,
     positionMs: Math.round(fresh.currentTimeMs),
     savedAt: Date.now(),
-  }).catch((error) => {
-    // Best-effort save: a storage failure must not become an unhandled rejection.
+  };
+}
+
+let sessionWriteQueue: Promise<void> = Promise.resolve();
+
+function queuePlaybackSessionWrite(snapshot: PlaybackSession | null): Promise<void> {
+  const write = async () => {
+    if (snapshot) await savePlaybackSession(snapshot);
+    else await clearPlaybackSession();
+  };
+  const queued = sessionWriteQueue.catch(() => undefined).then(write);
+  sessionWriteQueue = queued.catch((error) => {
     console.warn("Failed to save the playback session", error);
   });
+  return queued;
+}
+
+function sessionPayload(): Promise<void> {
+  return queuePlaybackSessionWrite(playbackSessionSnapshot());
 }
 
 const persistSession = debounce(() => {
-  const payload = sessionPayload();
-  if (!payload) void clearPlaybackSession().catch(() => undefined);
+  void sessionPayload().catch(() => undefined);
 }, 1200);
 
 /** Called on pause/track change; flushes immediately rather than debounced. */
-function persistSessionNow(): void {
+function persistSessionNow(): Promise<void> {
   persistSession.cancel();
-  const payload = sessionPayload();
-  if (!payload) void clearPlaybackSession().catch(() => undefined);
+  return sessionPayload();
 }
 
 export function schedulePlaybackSessionPersist(): void {
   persistSession();
 }
 
-export function flushPlaybackSessionNow(): void {
-  persistSessionNow();
+export function flushPlaybackSessionNow(): Promise<void> {
+  return persistSessionNow();
+}
+
+export function startPlaybackSessionCheckpointing(intervalMs = 15000): () => void {
+  const timer = window.setInterval(() => {
+    if (usePlaybackStore.getState().isPlaying) {
+      void persistSessionNow().catch(() => undefined);
+    }
+  }, intervalMs);
+  return () => window.clearInterval(timer);
 }
 
 /** Stops playback and drops the queue and the saved session (their track references are stale). */
 export async function resetPlaybackState(): Promise<void> {
+  resetPlaybackRuntime();
   persistSession.cancel();
-  await clearPlaybackSession();
-  const playback = usePlaybackStore.getState();
-  playback.getEngine().pause();
-  playback.getEngine().setSource(null);
-  releaseActiveTrackSource();
-  usePlaybackStore.setState({
-    currentTrackId: null,
-    isPlaying: false,
-    status: "idle",
-    queueTrackIds: [],
-    queueIndex: -1,
-    contextTrackIds: [],
-    context: null,
-    currentTimeMs: 0,
-    durationMs: null,
-  });
+  await queuePlaybackSessionWrite(null);
 }
 
 let queueSubscribed = false;
@@ -309,7 +317,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       }
 
       // Re-check file availability after a reload.
-      const availabilityUpdates = await revalidateAccess(sanitizedTracks);
+      const availabilityUpdates = await revalidateAccess(sanitizedTracks, { changedOnly: true });
       const effectiveTracks =
         availabilityUpdates.size > 0
           ? sanitizedTracks.map((track) => (availabilityUpdates.has(track.id) ? { ...track, availability: availabilityUpdates.get(track.id)! } : track))
@@ -460,8 +468,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     await Promise.all(get().playlists.map((playlist) => repository.putPlaylist(playlist)));
     const playback = usePlaybackStore.getState();
     if (playback.currentTrackId && idSet.has(playback.currentTrackId)) {
-      usePlaybackStore.setState({ currentTrackId: null, isPlaying: false, status: "idle", queueTrackIds: [], queueIndex: -1 });
-      playback.getEngine().pause();
+      await resetPlaybackState();
     } else if (playback.queueTrackIds.some((id) => idSet.has(id)) || playback.contextTrackIds.some((id) => idSet.has(id))) {
       // Removed tracks must not stay queued: advancing onto one would stop playback with "Track not found".
       const queueTrackIds = playback.queueTrackIds.filter((id) => !idSet.has(id));

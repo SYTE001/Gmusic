@@ -8,6 +8,7 @@ import {
   haveConflictingVersions,
   isGenericTitleOrArtist,
   evaluateMetadataImprovement,
+  createImportMatchIndex,
   findMatchingExistingTrack,
 } from "./importService";
 
@@ -55,6 +56,29 @@ vi.mock("../indexeddb/LibraryRepository", () => ({
 vi.mock("../file-access/FileAccessService", () => ({
   rememberSessionFile: vi.fn(),
 }));
+
+function makeIndexedTrack(id: string, fingerprint: string): Track {
+  return {
+    id,
+    title: "Shared Title",
+    artist: "Shared Artist",
+    album: "Album",
+    trackNumber: null,
+    albumTrackCount: null,
+    durationMs: 180000,
+    fileName: "same.mp3",
+    fileSize: 4,
+    mimeType: "audio/mpeg",
+    addedAt: 1,
+    lastPlayedAt: null,
+    playCount: 0,
+    isLiked: false,
+    availability: "available",
+    accessMode: "stored-copy",
+    fingerprint,
+    metadataFromFilename: false,
+  };
+}
 
 function audioFile(name: string, content: string): File {
   return new File([content], name, { type: "audio/mpeg" });
@@ -486,6 +510,28 @@ describe("importAudioItems intelligent re-import & duplicate reconciliation", ()
       expect(improved.hasImprovement).toBe(true);
       expect(improved.improvedAlbum).toBe("New Album 2");
       expect(improved.improvedTrackNumber).toBe(6);
+    });
+
+    it("keeps original first-match ordering when an indexed track is updated", () => {
+      const first = makeIndexedTrack("first", "fp-first");
+      const second = makeIndexedTrack("second", "fp-second");
+      const index = createImportMatchIndex([first, second]);
+      index.upsert({ ...first, title: "Updated First" });
+
+      const match = findMatchingExistingTrack({
+        file: new File(["same"], "same.mp3", { type: "audio/mpeg" }),
+        fingerprint: null,
+        tailHash: null,
+        durationMs: 180000,
+        normalizedTitle: "shared title",
+        normalizedArtist: "shared artist",
+        rawTitle: "Shared Title",
+        rawArtist: "Shared Artist",
+        tracks: [first, second],
+        index,
+      });
+
+      expect(match?.match.id).toBe("first");
     });
 
     it("findMatchingExistingTrack performs Level 1, 2, and 3 matching", () => {

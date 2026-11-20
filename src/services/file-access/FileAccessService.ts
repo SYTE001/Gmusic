@@ -393,36 +393,57 @@ export async function resolveTrackSource(track: Track): Promise<ResolvedSource> 
  * pending or denied handle permission, or even a gone handle record, does
  * not make a track unplayable while a stored copy (or session file) exists.
  */
-export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Track["availability"]>> {
+export async function revalidateAccess(
+  tracks: Track[],
+  options?: { changedOnly?: boolean },
+): Promise<Map<string, Track["availability"]>> {
   const updates = new Map<string, Track["availability"]>();
+  const record = (track: Track, availability: Track["availability"]) => {
+    if (!options?.changedOnly || track.availability !== availability) {
+      updates.set(track.id, availability);
+    }
+  };
   const desktopPaths = isTauriRuntime()
     ? tracks.map((t) => t.desktopPath).filter((p): p is string => typeof p === "string" && p.length > 0)
     : [];
-  const desktopStatuses = desktopPaths.length > 0
-    ? await authorizeDesktopPaths(desktopPaths).catch(() => new Map<string, boolean>())
+  const desktopValidationAttempted = desktopPaths.length > 0;
+  let desktopValidationSucceeded = false;
+  const desktopStatuses = desktopValidationAttempted
+    ? await authorizeDesktopPaths(desktopPaths).then(
+        (statuses) => {
+          desktopValidationSucceeded = true;
+          return statuses;
+        },
+        () => new Map<string, boolean>(),
+      )
     : new Map<string, boolean>();
   for (const track of tracks) {
     // Broken tracks stay broken across reloads until retried or restored.
     if (track.broken?.isBroken || track.availability === "broken") {
-      updates.set(track.id, "broken");
+      record(track, "broken");
       continue;
     }
     if (track.accessMode === "desktop-path") {
+      if (desktopValidationAttempted && !desktopValidationSucceeded) {
+        continue;
+      }
+      if (isTauriRuntime() && track.desktopPath && desktopStatuses.get(track.desktopPath)) {
+        record(track, "available");
+        continue;
+      }
       const storedCopy = await repository.getAudioBlob(track.id);
       const playableFallback = Boolean(storedCopy) || sessionFiles.has(track.id);
-      if (isTauriRuntime() && track.desktopPath && desktopStatuses.get(track.desktopPath)) {
-        updates.set(track.id, "available");
-      } else if (playableFallback) {
-        updates.set(track.id, "available");
+      if (playableFallback) {
+        record(track, "available");
       } else {
-        updates.set(track.id, track.objectKey ? (deviceIsOffline() ? "offline" : "available") : "missing");
+        record(track, track.objectKey ? (deviceIsOffline() ? "offline" : "available") : "missing");
       }
       continue;
     }
     // Cloud-backed tracks with a live local copy are validated by the local
     // branch below; a cloud-only track is as good as its connectivity.
     if (track.accessMode === "cloud" && !(await hasLocalCopy(track.id))) {
-      updates.set(track.id, track.objectKey ? (deviceIsOffline() ? "offline" : "available") : "missing");
+      record(track, track.objectKey ? (deviceIsOffline() ? "offline" : "available") : "missing");
       continue;
     }
     if (track.accessMode === "handle") {
@@ -438,28 +459,28 @@ export async function revalidateAccess(tracks: Track[]): Promise<Map<string, Tra
           // (moved, renamed or deleted): open it once so the status is honest.
           try {
             await handle.getFile();
-            updates.set(track.id, "available");
+            record(track, "available");
           } catch {
-            updates.set(track.id, playableWithoutHandle ? "available" : "missing");
+            record(track, playableWithoutHandle ? "available" : "missing");
           }
         }
         // Not granted — but a stored copy plays without any permission.
-        else updates.set(track.id, playableWithoutHandle ? "available" : "permission-required");
+        else record(track, playableWithoutHandle ? "available" : "permission-required");
         continue;
       }
       // Handle record gone: the stored copy or session file still plays.
-      updates.set(track.id, playableWithoutHandle ? "available" : "missing");
+      record(track, playableWithoutHandle ? "available" : "missing");
       continue;
     }
     if (track.accessMode === "stored-copy") {
       const blob = await repository.getAudioBlob(track.id);
-      updates.set(track.id, blob ? "available" : "missing");
+      record(track, blob ? "available" : "missing");
       continue;
     }
     // session-only tracks cannot survive a reload; the cloud copy decides
     // what is honest: playable online, offline while disconnected.
-    updates.set(
-      track.id,
+    record(
+      track,
       sessionFiles.has(track.id)
         ? "available"
         : track.objectKey

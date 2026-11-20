@@ -69,6 +69,28 @@ fn fresh_database_initialization_sets_pragmas_and_schema_v1() {
 }
 
 #[test]
+fn newer_schema_refusal_preserves_the_database_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("newer.sqlite3");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+    let track = make_track("newer", "Newer Schema Track");
+    put_tracks(&mut conn, std::slice::from_ref(&track)).unwrap();
+    conn.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+        .unwrap();
+    drop(conn);
+
+    let err = open_and_initialize_db(&db_path).unwrap_err();
+    assert!(err.contains("newer than supported"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    assert_eq!(
+        read_user_version(&conn).unwrap(),
+        CURRENT_SCHEMA_VERSION + 1
+    );
+    assert_eq!(list_tracks(&conn).unwrap(), vec![track]);
+}
+
+#[test]
 fn schema_upgrade_and_transactional_rollback_on_failure() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("upgrade.sqlite3");
@@ -529,6 +551,173 @@ async fn persistence_engine_handles_concurrent_access_without_blocking_runtime()
         .await
         .unwrap();
     assert_eq!(tracks.len(), 10);
+}
+
+#[test]
+fn failed_atomic_track_import_removes_new_unreferenced_artwork_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("atomic_import.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+    let track = make_track("atomic-fail", "Atomic Failure");
+    let png = sample_png_bytes(91);
+
+    conn.execute_batch(
+        "CREATE TRIGGER reject_audio BEFORE INSERT ON audio_blobs BEGIN SELECT RAISE(ABORT, 'audio failure'); END;",
+    )
+    .unwrap();
+    let result = put_track_with_files(
+        &mut conn,
+        &art_dir,
+        &track,
+        Some(&ArtworkMigrationEntryDto {
+            track_id: track.id.clone(),
+            mime_type: "image/png".into(),
+            bytes: png,
+            sha256: None,
+        }),
+        Some(&AudioMigrationEntryDto {
+            track_id: track.id.clone(),
+            mime_type: "audio/mpeg".into(),
+            bytes: b"audio".to_vec(),
+            sha256: None,
+        }),
+    );
+    assert!(result.is_err());
+    assert!(get_track(&conn, &track.id).unwrap().is_none());
+    assert!(get_artwork(&conn, &art_dir, &track.id).unwrap().is_none());
+
+    let persistent = dir.path().join("persistent-artwork-v1").join("blobs");
+    assert_eq!(std::fs::read_dir(persistent).unwrap().count(), 0);
+    assert_eq!(crate::artwork::cache::measure_cache_bytes(&art_dir), 0);
+}
+
+#[test]
+fn failed_standalone_artwork_write_removes_disk_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("artwork_failure.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_artwork BEFORE INSERT ON artwork_refs BEGIN SELECT RAISE(ABORT, 'artwork failure'); END;",
+    )
+    .unwrap();
+
+    assert!(put_artwork(&mut conn, &art_dir, "art-fail", &sample_png_bytes(77)).is_err());
+    assert!(list_artwork_track_ids(&conn).unwrap().is_empty());
+    assert_eq!(crate::artwork::cache::measure_cache_bytes(&art_dir), 0);
+    let persistent = dir.path().join("persistent-artwork-v1").join("blobs");
+    assert_eq!(std::fs::read_dir(persistent).unwrap().count(), 0);
+}
+
+#[test]
+fn failed_migration_batch_removes_uncommitted_artwork_cache_entries() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("migration_artwork_failure.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+    let png = sample_png_bytes(83);
+    begin_idb_migration(
+        &mut conn,
+        &MigrationBeginRequest {
+            migration_id: "mig-art-fail".into(),
+            expected_artwork: 1,
+            expected_audio: 1,
+            expected_checksum: "empty".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_migration_audio BEFORE INSERT ON audio_blobs BEGIN SELECT RAISE(ABORT, 'audio failure'); END;",
+    )
+    .unwrap();
+
+    assert!(write_idb_migration_batch(
+        &mut conn,
+        &art_dir,
+        &MigrationBatchRequest {
+            migration_id: "mig-art-fail".into(),
+            artwork: vec![ArtworkMigrationEntryDto {
+                track_id: "migration-art".into(),
+                mime_type: "image/png".into(),
+                sha256: Some(format!("{:x}", Sha256::digest(&png))),
+                bytes: png,
+            }],
+            audio: vec![AudioMigrationEntryDto {
+                track_id: "migration-art".into(),
+                mime_type: "audio/mpeg".into(),
+                sha256: Some(format!("{:x}", Sha256::digest(b"audio"))),
+                bytes: b"audio".to_vec(),
+            }],
+            ..Default::default()
+        },
+    )
+    .is_err());
+    assert_eq!(crate::artwork::cache::measure_cache_bytes(&art_dir), 0);
+}
+
+#[test]
+fn failed_artwork_replacement_preserves_previous_cache_mapping() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("atomic_replace.sqlite3");
+    let art_dir = dir.path().join("artwork-v1");
+    let mut conn = open_and_initialize_db(&db_path).unwrap();
+    let track = make_track("replace-fail", "Replacement Failure");
+    let original = sample_png_bytes(41);
+    let replacement = sample_png_bytes(142);
+    put_track_with_files(
+        &mut conn,
+        &art_dir,
+        &track,
+        Some(&ArtworkMigrationEntryDto {
+            track_id: track.id.clone(),
+            mime_type: "image/png".into(),
+            bytes: original.clone(),
+            sha256: None,
+        }),
+        None,
+    )
+    .unwrap();
+
+    conn.execute_batch(
+        "CREATE TRIGGER reject_audio_replace BEFORE INSERT ON audio_blobs BEGIN SELECT RAISE(ABORT, 'audio failure'); END;",
+    )
+    .unwrap();
+    assert!(put_track_with_files(
+        &mut conn,
+        &art_dir,
+        &track,
+        Some(&ArtworkMigrationEntryDto {
+            track_id: track.id.clone(),
+            mime_type: "image/png".into(),
+            bytes: replacement,
+            sha256: None,
+        }),
+        Some(&AudioMigrationEntryDto {
+            track_id: track.id.clone(),
+            mime_type: "audio/mpeg".into(),
+            bytes: b"audio".to_vec(),
+            sha256: None,
+        }),
+    )
+    .is_err());
+
+    let cached = crate::artwork::cache::read_cached_artwork(
+        &art_dir,
+        &format!("track::{}", track.id),
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        cached.content_hash.unwrap(),
+        format!("{:x}", Sha256::digest(&original))
+    );
 }
 
 #[test]

@@ -136,6 +136,7 @@ let mediaSession: MediaSessionController | null = null;
 let stopMediaSession: (() => void) | null = null;
 let stopMediaArtwork: (() => void) | null = null;
 let playRequestToken = 0;
+let autoSourceRetryUsed = false;
 
 function clearMediaArtwork(): void {
   stopMediaArtwork?.();
@@ -355,30 +356,59 @@ function describeFailureForTrack(failure: MediaFailure, track: Track | undefined
  * Bounded to one attempt per track start so a genuinely unreachable source
  * surfaces as an error rather than a loop.
  */
-async function retryWithFreshSource(): Promise<void> {
-  const state = usePlaybackStore.getState();
+function autoRetryIsCurrent(failedTrackId: string, retryToken: number): boolean {
+  return (
+    usePlaybackStore.getState().currentTrackId === failedTrackId &&
+    loadToken === retryToken &&
+    autoSourceRetryUsed
+  );
+}
+
+async function retryWithFreshSource(
+  resumePlayback: boolean,
+  failedTrackId: string,
+  resumeAtMs: number,
+  retryToken: number,
+  playToken: number,
+): Promise<void> {
   const track = playbackHelpers.currentTrack();
-  if (!track) return;
-  if (!track.objectKey) return;
-  if (!state.isPlaying && state.status !== "error") return;
+  if (!track || track.id !== failedTrackId || !track.objectKey) return;
 
   invalidatePlayUrl(track.objectKey);
-  const resolved = await resolveTrackSource({ ...track });
-  if (!resolved.ok) return; // let the existing error stand
+  const resolved = await resolveTrackSource(track).catch(() => null);
+  if (!resolved) return;
+  const latest = usePlaybackStore.getState();
+  if (!autoRetryIsCurrent(failedTrackId, retryToken)) {
+    if (resolved.ok) resolved.release();
+    return;
+  }
+  if (!resolved.ok) return;
 
-  const resumeAtMs = state.currentTimeMs;
-  const engine = state.getEngine();
+  const engine = latest.getEngine();
   engine.setSource(resolved.url);
   recordActiveSourceGeneration();
-  if (state.isPlaying) {
-    try {
-      await engine.play();
-      if (resumeAtMs > 0) engine.seekSec(resumeAtMs / 1000);
-      usePlaybackStore.setState({ status: "ready", error: null });
-    } catch {
-      // Fall back to the paused state with the source loaded.
-      usePlaybackStore.setState({ status: "ready" });
+  if (resumeAtMs > 0) engine.seekSec(resumeAtMs / 1000);
+  if (!resumePlayback || playToken !== playRequestToken) {
+    usePlaybackStore.setState({ status: "ready", error: null, currentTimeMs: resumeAtMs });
+    return;
+  }
+
+  try {
+    await engine.play();
+    if (!autoRetryIsCurrent(failedTrackId, retryToken) || playToken !== playRequestToken) return;
+    usePlaybackStore.setState({ status: "ready", error: null, isPlaying: true });
+  } catch (error) {
+    if (!autoRetryIsCurrent(failedTrackId, retryToken) || playToken !== playRequestToken) return;
+    if (error instanceof AutoplayBlockedError) {
+      usePlaybackStore.setState({ status: "ready", error: null, isPlaying: false, autoplayBlocked: true });
+      return;
     }
+    if (error instanceof DOMException && error.name === "AbortError") return;
+    usePlaybackStore.setState({
+      status: "error",
+      isPlaying: false,
+      error: describeFailureForTrack({ code: 2, message: "Cloud playback could not resume" }, track),
+    });
   }
 }
 
@@ -416,6 +446,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     acceptedSourceGeneration = null; // fresh engine, fresh generation space
     lastStartTrackAt = 0;
     preloadedForTrackId = null;
+    autoSourceRetryUsed = false;
     set({ engine });
   },
 
@@ -459,6 +490,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const isRapidSkip = options?.coalesce !== false && !options?.requestPermission && lastStartTrackAt > 0 && now - lastStartTrackAt < RAPID_SKIP_COALESCE_WINDOW_MS;
     lastStartTrackAt = now;
     preloadedForTrackId = null;
+    autoSourceRetryUsed = false;
 
     perfMark(`skip:start:${token}`);
     perfMark(`skip:store-update:start:${token}`);
@@ -996,12 +1028,14 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       return;
     }
     const track = playbackHelpers.currentTrack();
+    const resumePlayback = get().isPlaying;
+    const resumeAtMs = get().engine ? get().engine!.currentTimeSec * 1000 : get().currentTimeMs;
     if (track) {
       void diagnoseTrackSource(track, `MediaError(${failure.code}): ${failure.message}`);
     }
     // MediaError code 1 is transition noise; all other failures invalidate playback promises.
-    playRequestToken += 1;
-    loadToken += 1; // invalidate any in-flight loads
+    const playToken = ++playRequestToken;
+    const retryToken = ++loadToken;
     const errorInfo = describeFailureForTrack(failure, track);
     set({
       isPlaying: false,
@@ -1045,8 +1079,9 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
     // A network failure on a cloud track is often just an expired signed URL.
     // One automatic refresh keeps playback alive; a second failure surfaces.
-    if (failure.code === 2 && track?.objectKey) {
-      void retryWithFreshSource();
+    if (failure.code === 2 && track?.objectKey && !autoSourceRetryUsed) {
+      autoSourceRetryUsed = true;
+      void retryWithFreshSource(resumePlayback, track.id, resumeAtMs, retryToken, playToken);
     }
   },
 
@@ -1071,6 +1106,38 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
 
 /** Resume position captured by restoreQueue; consumed by the next explicit play(). */
 let pendingResumeMs: number | null = null;
+
+export function resetPlaybackRuntime(): void {
+  loadToken += 1;
+  playRequestToken += 1;
+  pendingSeekMs = null;
+  pendingResumeMs = null;
+  lastStartTrackAt = 0;
+  preloadedForTrackId = null;
+  acceptedSourceGeneration = null;
+  autoSourceRetryUsed = false;
+  clearMediaArtwork();
+  mediaSession?.clear();
+  const state = usePlaybackStore.getState();
+  state.engine?.pause();
+  state.engine?.setSource(null);
+  releaseActiveTrackSource();
+  usePlaybackStore.setState({
+    currentTrackId: null,
+    currentTimeMs: 0,
+    durationMs: null,
+    isPlaying: false,
+    isBuffering: false,
+    queueTrackIds: [],
+    queueIndex: -1,
+    contextTrackIds: [],
+    context: null,
+    status: "idle",
+    error: null,
+    autoplayBlocked: false,
+    announcement: "",
+  });
+}
 
 export function consumePendingResume(): number | null {
   const value = pendingResumeMs;

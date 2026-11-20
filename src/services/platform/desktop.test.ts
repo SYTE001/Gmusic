@@ -136,6 +136,36 @@ describe("desktop platform boundary", () => {
     expect(updates.get("t-missing")).toBe("missing");
   });
 
+  it("does not request fallback audio blobs for healthy desktop paths and reports only changed availability", async () => {
+    setTauriWindow(true);
+    const getAudioBlob = vi.spyOn(repository, "getAudioBlob").mockResolvedValue(undefined);
+    vi.mocked(invoke).mockResolvedValueOnce([
+      { path: "C:\\Music\\present.flac", exists: true },
+      { path: "C:\\Music\\moved.flac", exists: false },
+    ]);
+
+    const present = makeDesktopTrack({ id: "present", desktopPath: "C:\\Music\\present.flac" });
+    const missing = makeDesktopTrack({ id: "missing", desktopPath: "C:\\Music\\moved.flac" });
+    const updates = await revalidateAccess([present, missing], { changedOnly: true });
+
+    expect(getAudioBlob).toHaveBeenCalledTimes(1);
+    expect(getAudioBlob).toHaveBeenCalledWith("missing");
+    expect(updates.has("present")).toBe(false);
+    expect(updates.get("missing")).toBe("missing");
+  });
+
+  it("leaves desktop availability unchanged when native path validation is temporarily unavailable", async () => {
+    setTauriWindow(true);
+    const getAudioBlob = vi.spyOn(repository, "getAudioBlob").mockResolvedValue(undefined);
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("temporary IPC failure"));
+    const track = makeDesktopTrack({ id: "ipc-failure", desktopPath: "C:\\Music\\song.flac" });
+
+    const updates = await revalidateAccess([track], { changedOnly: true });
+
+    expect(updates.size).toBe(0);
+    expect(getAudioBlob).not.toHaveBeenCalled();
+  });
+
   it("relinks a track to a desktop file path", async () => {
     const deleteBlobSpy = vi.spyOn(repository, "deleteAudioBlob").mockResolvedValue(undefined);
     const updateTrackSpy = vi.spyOn(repository, "updateTrack").mockResolvedValue(undefined);

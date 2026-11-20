@@ -226,6 +226,7 @@ impl ArtworkEngine {
     }
 
     fn build_result_from_record(
+        cache_dir: &Path,
         record: &cache::CachedArtworkRecord,
         size: &str,
         from_cache: bool,
@@ -236,8 +237,12 @@ impl ArtworkEngine {
             "1200" | "full" => 1200,
             _ => 500,
         };
-        let chosen_path =
-            cache::blob_path_for_record(record, size_num).map(|p| p.to_string_lossy().into_owned());
+        let chosen_path = cache::blob_path_for_record(cache_dir, record, size_num)
+            .map(|p| p.to_string_lossy().into_owned());
+        let validated_path = |path: Option<&str>| {
+            path.and_then(|raw| cache::validated_cached_blob_path(cache_dir, raw))
+                .map(|p| p.to_string_lossy().into_owned())
+        };
         NativeArtworkResult {
             url: record.url.clone(),
             source: if from_cache && record.source != "none" && record.source != "embedded" {
@@ -258,9 +263,9 @@ impl ArtworkEngine {
             width: record.width,
             height: record.height,
             cached_path: chosen_path,
-            thumb_path_500: record.thumb_path_500.clone(),
-            thumb_path_256: record.thumb_path_256.clone(),
-            original_path: record.original_path.clone(),
+            thumb_path_500: validated_path(record.thumb_path_500.as_deref()),
+            thumb_path_256: validated_path(record.thumb_path_256.as_deref()),
+            original_path: validated_path(record.original_path.as_deref()),
             failed_http_requests: 0,
         }
     }
@@ -304,7 +309,8 @@ impl ArtworkEngine {
         .await
         .map_err(|e| e.to_string())??;
 
-        Ok(record_opt.map(|rec| Self::build_result_from_record(&rec, &size, false, false)))
+        Ok(record_opt
+            .map(|rec| Self::build_result_from_record(&cache_dir, &rec, &size, false, false)))
     }
 
     pub async fn resolve(
@@ -401,6 +407,7 @@ impl ArtworkEngine {
 
             if let Some(rec) = cached {
                 return Ok(Self::build_result_from_record(
+                    &cache_dir,
                     &rec,
                     &size,
                     true,
@@ -507,7 +514,8 @@ impl ArtworkEngine {
                     .map_err(|e| e.to_string())?;
 
                     if let Ok(rec) = stored {
-                        let mut res = Self::build_result_from_record(&rec, &size, false, false);
+                        let mut res =
+                            Self::build_result_from_record(&cache_dir, &rec, &size, false, false);
                         res.source = discovery.source;
                         res.failed_http_requests = total_failed_http;
                         return Ok(res);
@@ -594,13 +602,14 @@ impl ArtworkEngine {
             }
         }
         let tid = track.id.clone();
+        let write_cache_dir = cache_dir.clone();
         let stored = tokio::task::spawn_blocking(
             move || -> Result<Option<cache::CachedArtworkRecord>, String> {
                 let Ok(validated) = process::validate_and_inspect_image(&raw_bytes) else {
                     return Ok(None);
                 };
                 let rec = cache::store_artwork_blob(
-                    &cache_dir,
+                    &write_cache_dir,
                     &keys,
                     if tid.is_empty() { None } else { Some(&tid) },
                     &validated,
@@ -628,7 +637,7 @@ impl ArtworkEngine {
         .await
         .map_err(|e| e.to_string())??;
 
-        Ok(stored.map(|rec| Self::build_result_from_record(&rec, &size, false, false)))
+        Ok(stored.map(|rec| Self::build_result_from_record(&cache_dir, &rec, &size, false, false)))
     }
 }
 

@@ -109,6 +109,23 @@ export class LibraryRepository {
   private activeAuthority: PersistenceAuthority = "indexeddb";
   private lastStatus: PersistenceStatus | null = null;
   private ensurePromise: Promise<PersistenceAuthority> | null = null;
+  private mutationTails = new Map<string, Promise<void>>();
+
+  private runSerialized<T>(key: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTails.get(key) ?? Promise.resolve();
+    const run = previous.catch(() => undefined).then(operation);
+    const completion = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.mutationTails.set(key, completion);
+    void completion.finally(() => {
+      if (this.mutationTails.get(key) === completion) {
+        this.mutationTails.delete(key);
+      }
+    });
+    return run;
+  }
 
   /**
    * Resets internal authority caching (used by test suites when switching
@@ -118,6 +135,7 @@ export class LibraryRepository {
     this.activeAuthority = "indexeddb";
     this.lastStatus = null;
     this.ensurePromise = null;
+    this.mutationTails.clear();
   }
 
   getPersistenceAuthority(): PersistenceAuthority {
@@ -703,9 +721,11 @@ export class LibraryRepository {
 
   async updateTrack(id: string, patch: Partial<Track>): Promise<void> {
     if (await this.useSqlite()) {
-      const existing = await sqliteGetTrack(id);
-      if (!existing) return;
-      await sqlitePutTracks([{ ...existing, ...patch, id }]);
+      await this.runSerialized(`track:${id}`, async () => {
+        const existing = await sqliteGetTrack(id);
+        if (!existing) return;
+        await sqlitePutTracks([{ ...existing, ...patch, id }]);
+      });
       return;
     }
     await withTransaction([STORES.tracks], "readwrite", async (tx) => {
@@ -719,20 +739,28 @@ export class LibraryRepository {
   async updateTracksBatch(updates: Array<{ id: string; patch: Partial<Track> }>): Promise<void> {
     if (updates.length === 0) return;
     if (await this.useSqlite()) {
-      const all = await sqliteListTracks();
-      const byId = new Map(all.map((t) => [t.id, t]));
-      const modified: Track[] = [];
-      for (const { id, patch } of updates) {
-        const existing = byId.get(id);
-        if (existing) {
-          const next = { ...existing, ...patch, id };
-          byId.set(id, next);
-          modified.push(next);
+      const orderedIds = [...new Set(updates.map(({ id }) => id))].sort();
+      const runWithLocks = async (index: number): Promise<void> => {
+        if (index >= orderedIds.length) {
+          const all = await sqliteListTracks();
+          const byId = new Map(all.map((t) => [t.id, t]));
+          const modified: Track[] = [];
+          for (const { id, patch } of updates) {
+            const existing = byId.get(id);
+            if (existing) {
+              const next = { ...existing, ...patch, id };
+              byId.set(id, next);
+              modified.push(next);
+            }
+          }
+          if (modified.length > 0) {
+            await sqlitePutTracks(modified);
+          }
+          return;
         }
-      }
-      if (modified.length > 0) {
-        await sqlitePutTracks(modified);
-      }
+        await this.runSerialized(`track:${orderedIds[index]}`, () => runWithLocks(index + 1));
+      };
+      await runWithLocks(0);
       return;
     }
     await withTransaction([STORES.tracks], "readwrite", async (tx) => {
@@ -1045,7 +1073,7 @@ export class LibraryRepository {
 
   async putPendingCloudDeletion(item: PendingCloudDeletion): Promise<void> {
     if (await this.useSqlite()) {
-      await sqlitePutPendingCloudDeletion(item);
+      await this.runSerialized("pref:cloud-deletions", () => sqlitePutPendingCloudDeletion(item));
       return;
     }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
@@ -1059,7 +1087,7 @@ export class LibraryRepository {
 
   async removePendingCloudDeletion(trackId: string): Promise<void> {
     if (await this.useSqlite()) {
-      await sqliteRemovePendingCloudDeletion(trackId);
+      await this.runSerialized("pref:cloud-deletions", () => sqliteRemovePendingCloudDeletion(trackId));
       return;
     }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
@@ -1086,7 +1114,7 @@ export class LibraryRepository {
 
   async putPendingMetadataSync(item: PendingMetadataSync): Promise<void> {
     if (await this.useSqlite()) {
-      await sqlitePutPendingMetadataSync(item);
+      await this.runSerialized("pref:pending-metadata-sync", () => sqlitePutPendingMetadataSync(item));
       return;
     }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
@@ -1100,7 +1128,7 @@ export class LibraryRepository {
 
   async removePendingMetadataSync(trackId: string): Promise<void> {
     if (await this.useSqlite()) {
-      await sqliteRemovePendingMetadataSync(trackId);
+      await this.runSerialized("pref:pending-metadata-sync", () => sqliteRemovePendingMetadataSync(trackId));
       return;
     }
     await withTransaction([STORES.prefs], "readwrite", async (tx) => {
