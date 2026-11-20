@@ -42,7 +42,7 @@ No release tag, GitHub Release, signing secret, environment protection or update
 | Production MSI/NSIS and independent hashes | PASS. Optimized x64 MSI and NSIS built with cloud configuration disabled |
 | Hosted PR CI | See the checks on [PR #13](https://github.com/SYTE001/Gmusic/pull/13/checks) |
 | Offline fresh install without WebView2 | BLOCKED. In Windows Sandbox build 26100 with networking disabled, MSI returned 1603 and NSIS returned 2. MSI failed in `DownloadAndInvokeBootstrapper` |
-| Online fresh install and launch | INCONCLUSIVE. A network-enabled Sandbox started the MSI trial and exited before producing an installer exit code or app window result |
+| Fresh install retries | INCONCLUSIVE. The network-enabled Sandbox exited during the MSI trial. A separate offline Sandbox exited during WebView2 prerequisite setup using Microsoft’s signature-verified standalone installer. Neither retry recorded an installer exit code or an app launch |
 | Versioned upgrade and uninstall data preservation | NOT RUN. No older installer is published in the repository |
 | One-hour installed WebView2 audible playback/resource soak | NOT RUN (`music-lua` remains open) |
 | Authenticode signing | NOT RUN; Phase 7 MSI, NSIS and app EXE are `NotSigned` |
