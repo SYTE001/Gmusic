@@ -1,0 +1,57 @@
+{
+  "scope": "Node/jsdom parent route with ArtworkCard and modal mocked. Includes React mount and playlist summary computation; excludes WebView paint, image decode, SQLite and Tauri IPC.",
+  "results": [
+    {
+      "workload": "playlists_route_parent_mount_jsdom",
+      "librarySize": 1000,
+      "playlistCount": 20,
+      "tracksPerPlaylist": 50,
+      "samples_ms": [
+        6.389400000000023,
+        8.002900000000409,
+        13.946100000000115,
+        17.464500000000044,
+        4.094100000000253,
+        4.789300000000367,
+        5.6513999999997395,
+        6.757100000000719,
+        6.175799999999981,
+        6.005699999999706,
+        6.450699999999415,
+        5.801499999999578,
+        5.8890999999994165,
+        9.830999999999221,
+        4.793300000000272
+      ],
+      "p50_ms": 6.175799999999981,
+      "p95_ms": 17.464500000000044,
+      "track_id_reads": 1020
+    },
+    {
+      "workload": "playlists_route_parent_mount_jsdom",
+      "librarySize": 10000,
+      "playlistCount": 40,
+      "tracksPerPlaylist": 100,
+      "samples_ms": [
+        30.341700000000856,
+        30.085299999999734,
+        21.84769999999935,
+        29.38760000000002,
+        31.8104000000003,
+        22.41780000000017,
+        26.45719999999983,
+        31.445600000000013,
+        31.997999999999593,
+        20.825600000000122,
+        19.000099999999293,
+        29.573899999999412,
+        32.55069999999978,
+        16.545000000000073,
+        22.061800000000403
+      ],
+      "p50_ms": 29.38760000000002,
+      "p95_ms": 32.55069999999978,
+      "track_id_reads": 10040
+    }
+  ]
+}

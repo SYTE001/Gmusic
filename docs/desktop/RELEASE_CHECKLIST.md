@@ -32,6 +32,31 @@ Development failures retained: first baseline npmci EPERM due task-owned preview
 
 No release tag, GitHub Release, signing secret, environment protection or updater was created/enabled. `music-lua` remains open.
 
+## Phase 7 hardening evidence (2026-11-20 to 2026-11-21 local)
+
+| Gate | Status |
+|---|---|
+| Confirmed playback/persistence/cache regressions | Targeted frontend and Rust tests PASS; see `PHASE7_HARDENING.md` |
+| Reproducible matching/artwork/navigation/playback controls | Raw before/after JSON recorded under `docs/desktop/benchmarks/`; claims limited to harness scope |
+| Web/Rust full quality gates | PASS. Typecheck, ESLint, 976 Vitest tests across 78 files, web build, 3 release helper tests, Rust fmt, Clippy `-D warnings`, 71 Rust tests, and Windows debug no-bundle build |
+| Production MSI/NSIS and independent hashes | PASS. Optimized x64 MSI and NSIS built with cloud configuration disabled |
+| Hosted PR CI | See the checks on [PR #13](https://github.com/SYTE001/Gmusic/pull/13/checks) |
+| Offline fresh install without WebView2 | BLOCKED. In Windows Sandbox build 26100 with networking disabled, MSI returned 1603 and NSIS returned 2. MSI failed in `DownloadAndInvokeBootstrapper` |
+| Online fresh install and launch | INCONCLUSIVE. A network-enabled Sandbox started the MSI trial and exited before producing an installer exit code or app window result |
+| Versioned upgrade and uninstall data preservation | NOT RUN. No older installer is published in the repository |
+| One-hour installed WebView2 audible playback/resource soak | NOT RUN (`music-lua` remains open) |
+| Authenticode signing | NOT RUN; Phase 7 MSI, NSIS and app EXE are `NotSigned` |
+
+Phase 7 production artifacts from runtime commit `05ebc80cc6d154fb7a8e512a446a6412e3cf25de`.
+
+| Artifact | Bytes | SHA-256 | Authenticode |
+|---|---:|---|---|
+| `Gmusic_1.1.0_x64_en-US.msi` | 7,815,168 | `c2fd2fe79bf0f1c7e32c4fa72c64f5c8a78c4a63cd7211837469590cc064d3e7` | NotSigned |
+| `Gmusic_1.1.0_x64-setup.exe` | 5,621,643 | `f56ac2eb9378f16d87335f9b8569665a7749166e0a9addbe5fd7a4e34dfad81e` | NotSigned |
+| `gmusic.exe` | 20,990,464 | `1f75273b8a83022dc3e478fcdbab323238b90bd5b380945bc8578ff355765ed7` | NotSigned |
+
+Streaming Node artifact hashes matched independent PowerShell `Get-FileHash`. Production web preview loaded with one audio element and no Tauri marker; after stopping the origin server it reloaded the empty-library shell under active service-worker control. Browser-host file import/audible playback was unavailable and is not claimed. `npm audit` remains 8 moderate/2 critical; no forced dependency change was made.
+
 ## Required human gates before public publication
 
 | Acceptance gate | Status |
