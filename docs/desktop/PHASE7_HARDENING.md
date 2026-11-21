@@ -134,8 +134,33 @@ GMUSIC_BENCH=1 GMUSIC_BENCH_OUTPUT='C:/absolute/native.json' cargo test --locked
 - Native: Rust fmt check, Clippy all targets with `-D warnings`, **71 Rust tests**, Windows x64 debug no-bundle build — **PASS**.
 - Production packaging: locked optimized x64 MSI and NSIS builds with cloud configuration disabled — **PASS**. Node and PowerShell SHA-256 results agree. The MSI, NSIS and application executable are **NotSigned**. MSVC `dumpbin /dependents` reported Windows system libraries and Universal CRT API sets. WebView2 is a separate runtime prerequisite.
 - Web runtime: production preview rendered the empty-library shell with exactly one audio element, active service-worker control and no Tauri marker. With the task-owned origin server stopped, reload still rendered the cached shell — **PASS** for app-shell offline behavior. Browser-host file import/audible playback was unavailable.
-- Dependency audit: 8 moderate and 2 critical findings remain; evidence captured without `npm audit fix` or dependency changes.
+- Dependency audit: 8 moderate and 2 critical findings remained at runtime commit `05ebc80`; resolved on 2026-11-21 — see "Dependency security audit remediation" below.
 - Windows Sandbox build 26100 with networking disabled returned MSI exit 1603 and NSIS exit 2. The MSI log identified `DownloadAndInvokeBootstrapper` as the failing action. A clean machine without WebView2 needs the runtime preinstalled or network access for the Evergreen bootstrapper. The online retry exited during MSI setup, and a separate offline retry exited during prerequisite setup with Microsoft’s signature-verified standalone installer. Neither retry recorded an exit code. Successful install and launch, versioned upgrade, uninstall data preservation, audible playback, and a one-hour process-tree soak remain unverified.
+
+## Dependency security audit remediation (2026-11-21)
+
+A fresh `npm audit` on `7bf1a6c` reported 8 moderate and 2 critical findings. Every flagged package is dev-only lint/test tooling resolved from `devDependencies`; none is imported by application code or bundled into the shipped web or desktop runtime.
+
+| Cluster | Severity | Root cause | Advisories | Patched by |
+|---|---|---|---|---|
+| `minimatch` 10.2.6 under `@typescript-eslint/typescript-estree` (7 audit entries: the eslint plugin/parser/type-utils/utils/estree chain and direct `typescript-eslint`) | 8 moderate | globparts amplification denial of service | GHSA-g3hv-75wg-m249 | `minimatch` ≥ 11.0.1 |
+| `tinypool` 1.1.1 under `vitest` 3.2.7 | 2 critical | prototype-pollution gadgets in worker options and `run()` options leading to RCE in test-worker contexts | GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr | `tinypool` ≥ 2.1.2; vitest 4 removed the dependency entirely |
+| `@vitest/mocker` 3.2.7 | 1 moderate | redirect-mock path traversal and manual-mock registration injection in test contexts | GHSA-82fw-gwwq-j7x9, GHSA-qxg6-89mg-rqv8 | vitest ≥ 4.1.12 |
+
+Production exposure: none — lint and test tooling only. Residual practical risk was limited to running first-party tests/lint in this repository.
+
+Fix (smallest sufficient versions, no forced upgrades):
+
+- `typescript-eslint` `^8.33.0` → `^8.73.0` (same major; `typescript-estree` now depends on patched `minimatch` `^11.0.1`).
+- `vitest` `^3.2.0` → `^4.1.12`. npm's suggested fix was vitest 5.1.1, but 4.1.12 is the smallest release that both patches `@vitest/mocker` and drops the unpatchable `tinypool` chain (no vitest 3.x can use patched tinypool 2.x; a forced override would pair incompatible pool APIs). The nested `vitest` 4.1.12 already present under `@applemusic-like-lyrics/core` deduped into the single top-level copy.
+
+Vitest 3 → 4 test adaptations (no production code changed):
+
+- `tsconfig.app.json`: vitest 4's `vitest/globals` no longer transitively exposes Node types, so `"node"` joined `types`, restoring checkpoint state for `node:fs` / `node:perf_hooks` / `node:crypto` / `node:buffer` imports and the `process` global used by benchmark harnesses.
+- Vitest 4 no longer infers concrete signatures from a bare `vi.fn()`; `DynamicIslandNotification.test.tsx` and `mediaSession.test.ts` now declare and implement their store-action mocks against the real signatures.
+- Vitest 4's `vi.restoreAllMocks()` only restores `vi.spyOn` mocks, so `artworkService.test.ts` uses `vi.resetAllMocks()` in `beforeEach`; persistent `mockResolvedValue` implementations and queued once-values can no longer leak across tests.
+
+Validation on this tree: `npm audit` reports **0 vulnerabilities** (raw output: [phase7-npm-audit-after.json](benchmarks/phase7-npm-audit-after.json)); `npm run typecheck`, `npm run lint`, full `npm test` (**976 tests / 78 files**), `npm run build`, 3 Node release-helper tests, Rust fmt check, Clippy `-D warnings` and **71 Rust tests** — all **PASS**. No capability, endpoint, runtime dependency or bundled artifact changed.
 
 ## Remaining manual acceptance
 
