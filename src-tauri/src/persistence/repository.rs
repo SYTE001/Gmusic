@@ -658,7 +658,7 @@ fn store_artwork_in_cache_and_ref_tx(
 
     // 2. Also warm Phase 3 disposable artwork cache for fast thumbnail serving
     let key = format!("track::{track_id}");
-    let _ = art_cache::store_artwork_blob(
+    let _ = art_cache::store_artwork_blob_without_prune(
         artwork_cache_dir,
         &[key],
         Some(track_id),
@@ -685,6 +685,29 @@ fn store_artwork_in_cache_and_ref_tx(
     Ok(())
 }
 
+fn restore_artwork_cache_records(
+    artwork_cache_dir: &Path,
+    previous: &[(String, Option<art_cache::CachedArtworkRecord>)],
+) {
+    for (key, record) in previous {
+        if let Some(record) = record {
+            let _ = art_cache::write_index_record(artwork_cache_dir, key, record);
+        } else {
+            art_cache::remove_index_record(artwork_cache_dir, key);
+        }
+    }
+}
+
+fn cleanup_failed_artwork_write(
+    conn: &Connection,
+    artwork_cache_dir: &Path,
+    previous: &[(String, Option<art_cache::CachedArtworkRecord>)],
+) {
+    restore_artwork_cache_records(artwork_cache_dir, previous);
+    remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
+    let _ = art_cache::prune_cache(artwork_cache_dir, art_cache::DEFAULT_MAX_CACHE_BYTES);
+}
+
 pub fn put_track_with_files(
     conn: &mut Connection,
     artwork_cache_dir: &Path,
@@ -698,30 +721,44 @@ pub fn put_track_with_files(
             return Err("Audio blob exceeds maximum allowed size.".into());
         }
     }
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    upsert_track_tx(&tx, track)?;
-    if let Some(art) = artwork {
-        if !art.bytes.is_empty() {
+    let artwork = artwork.filter(|art| !art.bytes.is_empty());
+    let previous_cache_record = artwork.map(|_| {
+        let key = format!("track::{}", track.id);
+        let previous = art_cache::read_index_record(artwork_cache_dir, &key);
+        (key, previous)
+    });
+    let result = (|| -> Result<(), String> {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        upsert_track_tx(&tx, track)?;
+        if let Some(art) = artwork {
             store_artwork_in_cache_and_ref_tx(&tx, artwork_cache_dir, &track.id, &art.bytes)?;
         }
-    }
-    if let Some(aud) = audio {
-        if !aud.bytes.is_empty() {
-            tx.execute(
-                r#"
-                INSERT INTO audio_blobs (track_id, mime_type, bytes, updated_at)
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(track_id) DO UPDATE SET
-                    mime_type = excluded.mime_type,
-                    bytes = excluded.bytes,
-                    updated_at = excluded.updated_at
-                "#,
-                params![track.id, aud.mime_type, aud.bytes, now_ms()],
-            )
-            .map_err(|e| format!("Failed to store audio blob for {}: {e}", track.id))?;
+        if let Some(aud) = audio {
+            if !aud.bytes.is_empty() {
+                tx.execute(
+                    r#"
+                    INSERT INTO audio_blobs (track_id, mime_type, bytes, updated_at)
+                    VALUES (?1, ?2, ?3, ?4)
+                    ON CONFLICT(track_id) DO UPDATE SET
+                        mime_type = excluded.mime_type,
+                        bytes = excluded.bytes,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![track.id, aud.mime_type, aud.bytes, now_ms()],
+                )
+                .map_err(|e| format!("Failed to store audio blob for {}: {e}", track.id))?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())
+    })();
+    if let Some(previous) = previous_cache_record {
+        if result.is_err() {
+            cleanup_failed_artwork_write(conn, artwork_cache_dir, std::slice::from_ref(&previous));
+        } else {
+            let _ = art_cache::prune_cache(artwork_cache_dir, art_cache::DEFAULT_MAX_CACHE_BYTES);
         }
     }
-    tx.commit().map_err(|e| e.to_string())
+    result
 }
 
 pub fn delete_tracks(
@@ -799,10 +836,22 @@ pub fn put_artwork(
     if track_id.trim().is_empty() || track_id.len() > 256 {
         return Err("Invalid track ID.".into());
     }
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    store_artwork_in_cache_and_ref_tx(&tx, artwork_cache_dir, track_id, bytes)?;
-    tx.commit().map_err(|e| e.to_string())?;
+    let key = format!("track::{track_id}");
+    let previous_cache_records = vec![(
+        key.clone(),
+        art_cache::read_index_record(artwork_cache_dir, &key),
+    )];
+    let result = (|| -> Result<(), String> {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        store_artwork_in_cache_and_ref_tx(&tx, artwork_cache_dir, track_id, bytes)?;
+        tx.commit().map_err(|e| e.to_string())
+    })();
+    if result.is_err() {
+        cleanup_failed_artwork_write(conn, artwork_cache_dir, &previous_cache_records);
+        return result;
+    }
     remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
+    let _ = art_cache::prune_cache(artwork_cache_dir, art_cache::DEFAULT_MAX_CACHE_BYTES);
     Ok(())
 }
 
@@ -1602,6 +1651,15 @@ pub fn write_idb_migration_batch(
         return Err(validation_err);
     }
 
+    let previous_cache_records: Vec<_> = batch
+        .artwork
+        .iter()
+        .map(|art| {
+            let key = format!("track::{}", art.track_id);
+            let previous = art_cache::read_index_record(artwork_cache_dir, &key);
+            (key, previous)
+        })
+        .collect();
     let res = (|| -> Result<(), String> {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         for track in &batch.tracks {
@@ -1650,7 +1708,9 @@ pub fn write_idb_migration_batch(
 
     if let Err(ref err) = res {
         let _ = mark_migration_failed(conn, err);
-        remove_unreferenced_persistent_artwork_blobs(conn, artwork_cache_dir);
+        cleanup_failed_artwork_write(conn, artwork_cache_dir, &previous_cache_records);
+    } else if !previous_cache_records.is_empty() {
+        let _ = art_cache::prune_cache(artwork_cache_dir, art_cache::DEFAULT_MAX_CACHE_BYTES);
     }
     res
 }

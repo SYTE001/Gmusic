@@ -110,3 +110,12 @@ The PR #7 final verification results, actual Tauri runtime observations, install
 - `TrackRow.test.tsx` verifies the three-bar CSS-only state contract. Animation exists only for active playback; pause and reduced motion use the static transform without React frame updates.
 - `PlaylistsPage.performance.test.tsx` asserts linear track-ID work, duplicate/missing membership behavior and opt-in identical-workload p50/p95 output. `router.test.tsx` asserts primary route changes do not rerender persistent `AppShell`/`MiniPlayer` or reset playback. These are jsdom/component measurements, not WebView2 acceptance.
 - Installed NSIS launch, audible progress accuracy, CSS animation perception, real provider behavior, SQLite restart persistence and Windows WebView2 frame-time/long-task/GC acceptance remain manual QA. Report them as **NOT RUN** whenever an isolated Windows runtime is unavailable.
+
+## 10. Phase 7 Hardening and Recovery Coverage
+
+- `LibraryRepository.sqlite.test.ts` injects delayed desktop reads to prove same-track patches and read/modify/write preference queues serialize without lost fields. Existing web zero-IPC and migration fallback cases remain unchanged.
+- `libraryStore.test.ts` verifies a periodic checkpoint reads the authoritative engine clock and active-track deletion clears source, resources, queue/context/timing/errors and the saved session.
+- `playbackStore.cloud.test.ts` covers automatic one-shot signed-URL refresh, real-position resume, second-failure surfacing and late-result rejection after track switch. `playbackStore.test.ts` retains rapid-skip/object-URL coverage and adds an opt-in accelerated 1,000-start/seek stress control.
+- Desktop access tests count fallback-blob calls and assert unchanged statuses are omitted. Import matching tests retain the established reconciliation cases; the opt-in performance file measures the identical late-exact-match workload before/after indexing.
+- Rust cache/persistence tests cover path escape/oversize rejection, corrupt lyrics-cache eviction, failed atomic import disk cleanup, failed artwork replacement mapping restoration and newer-schema refusal without mutation.
+- [PHASE7_HARDENING.md](PHASE7_HARDENING.md) records raw benchmark methodology and the manual installed-app one-hour soak protocol. Synthetic jsdom/Rust workloads never count as audible WebView2 certification.

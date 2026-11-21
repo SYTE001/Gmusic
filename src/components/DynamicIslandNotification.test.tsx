@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { DynamicIslandNotification } from "./DynamicIslandNotification";
@@ -290,20 +290,22 @@ function stubEngine() {
 }
 
 describe("DynamicIslandNotification media card", () => {
-  let togglePlaySpy: ReturnType<typeof vi.fn>;
-  let nextSpy: ReturnType<typeof vi.fn>;
-  let previousSpy: ReturnType<typeof vi.fn>;
-  let seekSpy: ReturnType<typeof vi.fn>;
-  let seekBySpy: ReturnType<typeof vi.fn>;
-  let toggleLikeSpy: ReturnType<typeof vi.fn>;
+  // Vitest 4 no longer infers concrete signatures from a bare vi.fn();
+  // each spy is typed and implemented to match the store action it replaces.
+  let togglePlaySpy: Mock<() => void>;
+  let nextSpy: Mock<() => void>;
+  let previousSpy: Mock<() => void>;
+  let seekSpy: Mock<(ms: number) => void>;
+  let seekBySpy: Mock<(deltaMs: number) => void>;
+  let toggleLikeSpy: Mock<(trackId: string) => Promise<void>>;
 
   function setupStores(trackOverrides: Partial<Track> = {}) {
-    togglePlaySpy = vi.fn();
-    nextSpy = vi.fn();
-    previousSpy = vi.fn();
-    seekSpy = vi.fn();
-    seekBySpy = vi.fn();
-    toggleLikeSpy = vi.fn();
+    togglePlaySpy = vi.fn(() => {});
+    nextSpy = vi.fn(() => {});
+    previousSpy = vi.fn(() => {});
+    seekSpy = vi.fn((_ms: number) => {});
+    seekBySpy = vi.fn((_deltaMs: number) => {});
+    toggleLikeSpy = vi.fn(async (_trackId: string) => {});
     usePlaybackStore.setState({
       currentTrackId: "track-media-1",
       currentTimeMs: 60000,

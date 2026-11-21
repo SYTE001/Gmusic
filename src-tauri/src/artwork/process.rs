@@ -29,7 +29,7 @@ fn format_to_mime(format: ImageFormat) -> Option<&'static str> {
     }
 }
 
-pub fn validate_and_inspect_image(bytes: &[u8]) -> Result<ValidatedImage, String> {
+pub fn inspect_image_header(bytes: &[u8]) -> Result<(String, u32, u32), String> {
     if bytes.len() < MIN_RAW_IMAGE_BYTES {
         return Err("undersized".into());
     }
@@ -51,7 +51,6 @@ pub fn validate_and_inspect_image(bytes: &[u8]) -> Result<ValidatedImage, String
     let mime_type = format_to_mime(format)
         .ok_or_else(|| "invalid-mime".to_string())?
         .to_string();
-
     let (width, height) = reader
         .into_dimensions()
         .map_err(|_| "decode-failed".to_string())?;
@@ -63,6 +62,11 @@ pub fn validate_and_inspect_image(bytes: &[u8]) -> Result<ValidatedImage, String
     {
         return Err("oversized".into());
     }
+    Ok((mime_type, width, height))
+}
+
+pub fn validate_and_inspect_image(bytes: &[u8]) -> Result<ValidatedImage, String> {
+    let (mime_type, width, height) = inspect_image_header(bytes)?;
 
     // Perform full decode with strict memory limits to guarantee image integrity
     let mut decode_reader = ImageReader::new(Cursor::new(bytes))
@@ -73,15 +77,15 @@ pub fn validate_and_inspect_image(bytes: &[u8]) -> Result<ValidatedImage, String
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     limits.max_alloc = Some(192 * 1024 * 1024);
     decode_reader.limits(limits);
-    let decoded = decode_reader
+    decode_reader
         .decode()
         .map_err(|_| "decode-failed".to_string())?;
 
     Ok(ValidatedImage {
         bytes: bytes.to_vec(),
         mime_type,
-        width: decoded.width(),
-        height: decoded.height(),
+        width,
+        height,
     })
 }
 

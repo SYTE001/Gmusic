@@ -126,6 +126,90 @@ export type CandidateMatch = {
   matchLevel: 1 | 2 | 3;
 };
 
+export type ImportMatchIndex = {
+  exactFingerprint: Map<string, Track[]>;
+  tailHash: Map<string, Track[]>;
+  sizeAndName: Map<string, Track[]>;
+  metadata: Map<string, Track[]>;
+  upsert(track: Track): void;
+};
+
+function appendIndexed(
+  map: Map<string, Track[]>,
+  key: string | null,
+  track: Track,
+  order: Map<string, number>,
+): void {
+  if (!key) return;
+  const existing = map.get(key);
+  if (!existing) {
+    map.set(key, [track]);
+    return;
+  }
+  const position = order.get(track.id)!;
+  if (position > order.get(existing[existing.length - 1].id)!) {
+    existing.push(track);
+    return;
+  }
+  const insertAt = existing.findIndex((entry) => order.get(entry.id)! > position);
+  if (insertAt < 0) existing.push(track);
+  else existing.splice(insertAt, 0, track);
+}
+
+function removeIndexed(map: Map<string, Track[]>, key: string | null, trackId: string): void {
+  if (!key) return;
+  const existing = map.get(key);
+  if (!existing) return;
+  const remaining = existing.filter((track) => track.id !== trackId);
+  if (remaining.length > 0) map.set(key, remaining);
+  else map.delete(key);
+}
+
+function metadataIndexKey(title: string, artist: string): string | null {
+  const normalizedTitle = normalizeForSearch(title);
+  const normalizedArtist = normalizeForSearch(artist);
+  return normalizedTitle && normalizedArtist ? `${normalizedTitle}\u0000${normalizedArtist}` : null;
+}
+
+export function createImportMatchIndex(tracks: Track[]): ImportMatchIndex {
+  const exactFingerprint = new Map<string, Track[]>();
+  const tailHash = new Map<string, Track[]>();
+  const sizeAndName = new Map<string, Track[]>();
+  const metadata = new Map<string, Track[]>();
+  const currentById = new Map<string, Track>();
+
+  const originalOrder = new Map(tracks.map((track, index) => [track.id, index]));
+  const add = (track: Track) => {
+    if (!originalOrder.has(track.id)) originalOrder.set(track.id, originalOrder.size);
+    currentById.set(track.id, track);
+    appendIndexed(exactFingerprint, track.fingerprint, track, originalOrder);
+    appendIndexed(tailHash, extractTailHash(track.fingerprint), track, originalOrder);
+    appendIndexed(sizeAndName, `${track.fileSize}\u0000${track.fileName}`, track, originalOrder);
+    appendIndexed(metadata, metadataIndexKey(track.title, track.artist), track, originalOrder);
+  };
+
+  const remove = (track: Track) => {
+    removeIndexed(exactFingerprint, track.fingerprint, track.id);
+    removeIndexed(tailHash, extractTailHash(track.fingerprint), track.id);
+    removeIndexed(sizeAndName, `${track.fileSize}\u0000${track.fileName}`, track.id);
+    removeIndexed(metadata, metadataIndexKey(track.title, track.artist), track.id);
+  };
+
+  for (const track of tracks) add(track);
+
+  return {
+    exactFingerprint,
+    tailHash,
+    sizeAndName,
+    metadata,
+    upsert(track) {
+      const previous = currentById.get(track.id);
+      if (previous) remove(previous);
+      add(track);
+    },
+  };
+}
+
 export function findMatchingExistingTrack(params: {
   file: File;
   fingerprint: string | null;
@@ -136,12 +220,15 @@ export function findMatchingExistingTrack(params: {
   rawTitle: string;
   rawArtist: string;
   tracks: Track[];
+  index?: ImportMatchIndex;
 }): CandidateMatch | null {
-  const { file, fingerprint, tailHash, durationMs, normalizedTitle, normalizedArtist, rawTitle, tracks } = params;
+  const { file, fingerprint, tailHash, durationMs, normalizedTitle, normalizedArtist, rawTitle, tracks, index } = params;
 
   // Level 1: Exact fingerprint match
   if (fingerprint) {
-    const exact = tracks.find((t) => t.fingerprint && t.fingerprint === fingerprint);
+    const exact = index
+      ? index.exactFingerprint.get(fingerprint)?.[0]
+      : tracks.find((t) => t.fingerprint && t.fingerprint === fingerprint);
     if (exact) {
       return { match: exact, matchLevel: 1 };
     }
@@ -150,7 +237,8 @@ export function findMatchingExistingTrack(params: {
   // Level 2: Strong audio identity match
   // 2a. Tail hash match + duration within 1500ms
   if (tailHash && durationMs !== null) {
-    const tailMatch = tracks.find((t) => {
+    const tailCandidates = index ? (index.tailHash.get(tailHash) ?? []) : tracks;
+    const tailMatch = tailCandidates.find((t) => {
       const existingTail = extractTailHash(t.fingerprint);
       if (!existingTail || existingTail !== tailHash) return false;
       if (t.durationMs === null) return false;
@@ -162,7 +250,10 @@ export function findMatchingExistingTrack(params: {
   }
 
   // 2b. Same file size, file name, and duration within 1500ms
-  const sizeNameMatch = tracks.find((t) => {
+  const sizeNameCandidates = index
+    ? (index.sizeAndName.get(`${file.size}\u0000${file.name}`) ?? [])
+    : tracks;
+  const sizeNameMatch = sizeNameCandidates.find((t) => {
     if (t.fileSize !== file.size || t.fileName !== file.name) return false;
     if (durationMs !== null && t.durationMs !== null) {
       return Math.abs(t.durationMs - durationMs) <= 1500;
@@ -181,7 +272,10 @@ export function findMatchingExistingTrack(params: {
     !isGenericTitleOrArtist(normalizedTitle, normalizedArtist) &&
     durationMs !== null
   ) {
-    const metadataCandidate = tracks.find((t) => {
+    const metadataCandidates = index
+      ? (index.metadata.get(`${normalizedTitle}\u0000${normalizedArtist}`) ?? [])
+      : tracks;
+    const metadataCandidate = metadataCandidates.find((t) => {
       if (!t.title || !t.artist) return false;
       const tNormTitle = normalizeForSearch(t.title);
       const tNormArtist = normalizeForSearch(t.artist);
@@ -393,6 +487,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
   };
 
   const libraryTracks: Track[] = [...options.existingTracks];
+  const matchIndex = createImportMatchIndex(libraryTracks);
 
   let done = 0;
   for (const item of items) {
@@ -474,6 +569,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
         rawTitle,
         rawArtist,
         tracks: libraryTracks,
+        index: matchIndex,
       });
 
       const isHandle = await itemIsHandle(item);
@@ -549,6 +645,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
           const idx = libraryTracks.findIndex((t) => t.id === matchedTrack.id);
           if (idx !== -1) libraryTracks[idx] = updatedTrack;
           else libraryTracks.push(updatedTrack);
+          matchIndex.upsert(updatedTrack);
         } else {
           outcome.duplicatesSkipped += 1;
         }
@@ -616,6 +713,7 @@ export async function importAudioItems(items: ImportItem[], options: ImportOptio
         if (accessMode === "session-only") outcome.sessionOnlyAdded += 1;
         outcome.added += 1;
         libraryTracks.push(track);
+        matchIndex.upsert(track);
       }
     } catch (error) {
       const reason = error instanceof Error ? error.message : "Unknown error";

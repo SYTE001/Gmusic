@@ -3,7 +3,7 @@ import { BrowserRouter } from "react-router-dom";
 import { AppRoutes } from "./router";
 import { IntroSplash, INTRO_SPLASH_STORAGE_KEY } from "../components/IntroSplash";
 import { useSettingsStore } from "../stores/settingsStore";
-import { useLibraryStore, flushPlaybackSessionNow } from "../stores/libraryStore";
+import { useLibraryStore, flushPlaybackSessionNow, startPlaybackSessionCheckpointing } from "../stores/libraryStore";
 import { usePlaybackStore } from "../stores/playbackStore";
 import { useCloudStore } from "../stores/cloudStore";
 import { startLyricsPrefetch } from "../stores/lyricsStore";
@@ -106,12 +106,15 @@ export function App() {
       }
     }, 1000);
 
+    const stopPlaybackCheckpoints = startPlaybackSessionCheckpointing();
+
     const onPageHide = () => {
-      flushPlaybackSessionNow();
+      void flushPlaybackSessionNow().catch(() => undefined);
     };
     window.addEventListener("pagehide", onPageHide);
     return () => {
       stopLyricsPrefetch();
+      stopPlaybackCheckpoints();
       window.clearInterval(driftWatchdog);
       document.removeEventListener("visibilitychange", resyncOnWake);
       window.removeEventListener("focus", resyncOnWake);

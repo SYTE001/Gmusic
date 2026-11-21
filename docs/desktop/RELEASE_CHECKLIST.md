@@ -32,6 +32,41 @@ Development failures retained: first baseline npmci EPERM due task-owned preview
 
 No release tag, GitHub Release, signing secret, environment protection or updater was created/enabled. `music-lua` remains open.
 
+## Phase 7 hardening evidence (2026-11-20 to 2026-11-21 local)
+
+| Gate | Status |
+|---|---|
+| Confirmed playback/persistence/cache regressions | Targeted frontend and Rust tests PASS; see `PHASE7_HARDENING.md` |
+| Reproducible matching/artwork/navigation/playback controls | Raw before/after JSON recorded under `docs/desktop/benchmarks/`; claims limited to harness scope |
+| Web/Rust full quality gates | PASS. Typecheck, ESLint, 976 Vitest tests across 78 files, web build, 3 release helper tests, Rust fmt, Clippy `-D warnings`, 71 Rust tests, and Windows debug no-bundle build |
+| Production MSI/NSIS and independent hashes | PASS. Optimized x64 MSI and NSIS built with cloud configuration disabled |
+| Hosted PR CI | See the checks on [PR #13](https://github.com/SYTE001/Gmusic/pull/13/checks) |
+| Offline fresh install without WebView2 | BLOCKED. In Windows Sandbox build 26100 with networking disabled, MSI returned 1603 and NSIS returned 2. MSI failed in `DownloadAndInvokeBootstrapper` |
+| Fresh install retries | INCONCLUSIVE. The network-enabled Sandbox exited during the MSI trial. A separate offline Sandbox exited during WebView2 prerequisite setup using Microsoft’s signature-verified standalone installer. Neither retry recorded an installer exit code or an app launch |
+| Versioned upgrade and uninstall data preservation | NOT RUN. No older installer is published in the repository |
+| One-hour installed WebView2 audible playback/resource soak | NOT RUN (`music-lua` remains open) |
+| Authenticode signing | NOT RUN; Phase 7 MSI, NSIS and app EXE are `NotSigned` |
+
+Phase 7 production artifacts from runtime commit `05ebc80cc6d154fb7a8e512a446a6412e3cf25de`.
+
+| Artifact | Bytes | SHA-256 | Authenticode |
+|---|---:|---|---|
+| `Gmusic_1.1.0_x64_en-US.msi` | 7,815,168 | `c2fd2fe79bf0f1c7e32c4fa72c64f5c8a78c4a63cd7211837469590cc064d3e7` | NotSigned |
+| `Gmusic_1.1.0_x64-setup.exe` | 5,621,643 | `f56ac2eb9378f16d87335f9b8569665a7749166e0a9addbe5fd7a4e34dfad81e` | NotSigned |
+| `gmusic.exe` | 20,990,464 | `1f75273b8a83022dc3e478fcdbab323238b90bd5b380945bc8578ff355765ed7` | NotSigned |
+
+Streaming Node artifact hashes matched independent PowerShell `Get-FileHash`. Production web preview loaded with one audio element and no Tauri marker; after stopping the origin server it reloaded the empty-library shell under active service-worker control. Browser-host file import/audible playback was unavailable and is not claimed. `npm audit` reported 8 moderate/2 critical at the 05ebc80 runtime commit; resolved 2026-11-21 — see the audit remediation evidence below.
+
+## Dependency audit remediation evidence (2026-11-21, `fix/desktop-phase7-hardening`)
+
+| Gate | Status |
+|---|---|
+| Fresh `npm audit` triage on `7bf1a6c` | 8 moderate / 2 critical, all in dev-only lint/test tooling: `minimatch` via `@typescript-eslint/typescript-estree` (GHSA-g3hv-75wg-m249), `tinypool` under vitest 3.2.7 (GHSA-5gmw-xhrv-c9v3, GHSA-85c8-ppgw-ccpr), `@vitest/mocker` 3.2.7 (GHSA-82fw-gwwq-j7x9, GHSA-qxg6-89mg-rqv8). Zero production-bundle exposure |
+| Remediation | `typescript-eslint` `^8.33.0` → `^8.73.0` (pulls patched `minimatch` `^11.0.1`); `vitest` `^3.2.0` → `^4.1.12` (drops tinypool entirely, patches mocker). Smallest sufficient versions; npm's suggested vitest 5.1.1 major jump and forced tinypool overrides were not taken |
+| Post-fix `npm audit` | **0 vulnerabilities**; raw output [phase7-npm-audit-after.json](benchmarks/phase7-npm-audit-after.json) |
+| Post-fix quality gates | `npm run typecheck`, `npm run lint`, full `npm test` **976/976 across 78 files**, `npm run build`, 3 Node release-helper tests, Rust fmt check, Clippy `-D warnings`, **71 Rust tests** — all PASS |
+| Test-only adaptations | `tsconfig.app.json` `types` adds `"node"` (vitest 4 globals no longer re-export Node types); explicit `Mock` typing/implementations in `DynamicIslandNotification.test.tsx` and `mediaSession.test.ts`; `artworkService.test.ts` switches to `vi.resetAllMocks()` (vitest 4 `restoreAllMocks` only restores `vi.spyOn`) |
+
 ## Required human gates before public publication
 
 | Acceptance gate | Status |
@@ -43,7 +78,7 @@ No release tag, GitHub Release, signing secret, environment protection or update
 | Authenticode signing and timestamp validation (MSI, NSIS, app EXE) | Unverified; Phase6A installers unsigned |
 | Verify SHA256 against exact signed artifacts and downloaded copies | Required; checksums are not signatures |
 | Third-party redistribution notices/license review | Required before publication |
-| Resolve/triage existing dependency audit findings | Existing8 moderate/2 critical, separate security work |
+| Resolve/triage dependency audit findings | RESOLVED 2026-11-21: all 8 moderate/2 critical dev-tooling findings fixed (typescript-eslint ^8.73.0, vitest ^4.1.12); `npm audit` now reports 0 vulnerabilities. Re-run `npm audit` before publication |
 | Fresh MSI install in disposable Windows environment | Unverified |
 | Fresh per-user NSIS install | Unverified |
 | Launch/real WebView2/native SQLite init/authority | Unverified for installed production packages |

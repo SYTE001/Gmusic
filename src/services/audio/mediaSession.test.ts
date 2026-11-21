@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import {
   IMAGE_LOAD_TIMEOUT_MS,
   MediaSessionController,
@@ -97,14 +97,20 @@ function installWorkingCanvas(): { drawCalls: { dx: number; dy: number; dw: numb
   return { drawCalls };
 }
 
-function makeActions(): MediaSessionActions & Record<keyof MediaSessionActions, ReturnType<typeof vi.fn>> {
+// Vitest 4 no longer infers concrete signatures from a bare vi.fn(); the
+// mocked actions are typed against the real action signatures instead.
+type MockedMediaSessionActions = {
+  [K in keyof MediaSessionActions]: MediaSessionActions[K] & Mock<MediaSessionActions[K]>;
+};
+
+function makeActions(): MockedMediaSessionActions {
   return {
-    play: vi.fn(),
-    pause: vi.fn(),
-    previous: vi.fn(),
-    next: vi.fn(),
-    seek: vi.fn(),
-    seekBy: vi.fn(),
+    play: vi.fn(() => {}),
+    pause: vi.fn(() => {}),
+    previous: vi.fn(() => {}),
+    next: vi.fn(() => {}),
+    seek: vi.fn((_seconds: number) => {}),
+    seekBy: vi.fn((_deltaSeconds: number) => {}),
   };
 }
 

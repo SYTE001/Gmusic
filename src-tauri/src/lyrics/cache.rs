@@ -62,11 +62,17 @@ pub fn read(dir: &Path, key: &str, expected_fingerprint: &str) -> Result<Option<
         Err(e) => return Err(format!("Could not inspect lyrics cache: {e}")),
     };
     if metadata.len() > MAX_ENTRY_BYTES {
+        let _ = fs::remove_file(&path);
         return Err("Lyrics cache entry exceeds size limit.".into());
     }
-    let bytes = fs::read(path).map_err(|e| format!("Could not read lyrics cache: {e}"))?;
-    let entry: Entry =
-        serde_json::from_slice(&bytes).map_err(|e| format!("Invalid lyrics cache: {e}"))?;
+    let bytes = fs::read(&path).map_err(|e| format!("Could not read lyrics cache: {e}"))?;
+    let entry: Entry = match serde_json::from_slice(&bytes) {
+        Ok(entry) => entry,
+        Err(e) => {
+            let _ = fs::remove_file(&path);
+            return Err(format!("Invalid lyrics cache: {e}"));
+        }
+    };
     if entry.version != VERSION
         || entry.identity != key
         || entry.fingerprint != expected_fingerprint
@@ -74,6 +80,7 @@ pub fn read(dir: &Path, key: &str, expected_fingerprint: &str) -> Result<Option<
         return Ok(None);
     }
     if entry.result.candidates.len() > 12 || !entry.result.errors.is_empty() {
+        let _ = fs::remove_file(&path);
         return Err("Invalid lyrics cache contents.".into());
     }
     Ok(Some(entry))
@@ -121,6 +128,24 @@ mod tests {
             album: String::new(),
             duration_ms: Some(200000),
         }
+    }
+
+    #[test]
+    fn corrupt_and_oversized_entries_are_evicted_after_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = identity(&track(), &[]);
+        let expected = fingerprint(&track(), &[]);
+        let path = dir.path().join(format!("{key}.json"));
+
+        fs::write(&path, b"{broken").unwrap();
+        assert!(read(dir.path(), &key, &expected).is_err());
+        assert!(!path.exists());
+        assert!(read(dir.path(), &key, &expected).unwrap().is_none());
+
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_ENTRY_BYTES + 1).unwrap();
+        assert!(read(dir.path(), &key, &expected).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

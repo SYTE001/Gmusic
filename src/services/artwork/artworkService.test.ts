@@ -48,8 +48,10 @@ const REL_MBID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
 describe("artworkService", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    vi.restoreAllMocks();
+    // Vitest 4: restoreAllMocks only restores vi.spyOn mocks; resetAllMocks
+    // also clears implementations and queued once-values on vi.fn() module
+    // mocks, so persistent per-test mockResolvedValue calls cannot leak.
+    vi.resetAllMocks();
     localStorage.clear();
     __resetArtworkServiceForTests();
     __configureMusicBrainzForTests({ rateLimitMs: 0 });

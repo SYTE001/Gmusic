@@ -730,6 +730,48 @@ describe("LibraryRepository native SQLite migration & desktop runtime switching"
     expect((await repository.getTrack("t2"))?.title).toBe("Second SQLite Track");
   });
 
+  it("serializes concurrent desktop track patches and pending metadata queue updates", async () => {
+    const backend = createMockSqliteBackend();
+    const baseHandler = backend.handler;
+    invoke.mockImplementation(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "sqlite_get_track") {
+        const current = backend.state.tracks.get(String(args?.id));
+        const snapshot = current ? { ...current } : null;
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return snapshot;
+      }
+      if (cmd === "sqlite_get_pref_json" && args?.name === "pending-metadata-sync") {
+        const snapshot = [...((backend.state.prefs.get("pending-metadata-sync") as unknown[]) ?? [])];
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        return snapshot;
+      }
+      return baseHandler(cmd, args);
+    });
+    Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+
+    await repository.ensureDesktopPersistence();
+    await repository.putTracks([makeTrack({ id: "concurrent", title: "Before", availability: "available" })]);
+
+    await Promise.all([
+      repository.updateTrack("concurrent", { title: "After" }),
+      repository.updateTrack("concurrent", { availability: "missing" }),
+    ]);
+
+    expect(await repository.getTrack("concurrent")).toMatchObject({
+      title: "After",
+      availability: "missing",
+    });
+
+    await Promise.all([
+      repository.putPendingMetadataSync({ trackId: "one", title: "One", description: "", queuedAt: 1 }),
+      repository.putPendingMetadataSync({ trackId: "two", title: "Two", description: "", queuedAt: 2 }),
+    ]);
+    expect((await repository.listPendingMetadataSync()).map((item) => item.trackId).sort()).toEqual([
+      "one",
+      "two",
+    ]);
+  });
+
   it("detects concurrent binary content changes to IndexedDB artwork and audio records even when keys and counts are unchanged", async () => {
     const t1 = makeTrack({
       id: "t1",

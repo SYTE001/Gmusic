@@ -118,3 +118,12 @@ React 19 UI (src/components/, src/features/)
 - TypeScript and Rust lyrics matchers require strong title identity, verified artist identity and ≤5-second duration alignment for auto-attachment. Recording-version mismatches and low-identity duration outliers are removed rather than used as chooser filler. Native discovery cache version 2 invalidates candidates ranked under the earlier policy, and the frontend revalidates all native IPC/cache records before attaching or presenting them.
 - Track-row equalizers remain decorative CSS transforms. Only active playback owns the compositor animation; pause and reduced motion use a deterministic static transform.
 - Primary route navigation stays in-memory after library hydration. Playlist summaries and sidebar artwork identity use memoized O(n + memberships) lookup structures; route observation is isolated from persistent shell/player rendering. No navigation-specific SQLite read, Tauri IPC, schema, virtualization or telemetry path was added.
+
+## 10. Phase 7 Production Hardening Boundary
+
+- Desktop read/merge/write mutations are serialized per track or preference key, preventing concurrent IPC updates from dropping fields while allowing unrelated records to proceed independently.
+- Playback sessions use ordered writes and a 15-second authoritative-clock checkpoint during uninterrupted playback. Removing the active track performs the same full engine/source/session teardown as an explicit reset. Cloud source recovery is bounded to one fresh URL per track start and ignores late results after a newer start.
+- Desktop availability startup trusts the batched native path result and reads fallback blobs only for unavailable paths; only changed availability is persisted. Bulk duplicate matching uses one incrementally maintained import-session index while retaining established match priority and version guards.
+- Native artwork cache paths must be bounded, non-symlink direct children of the canonical blobs directory before read or asset authorization. Warm reads hash and inspect headers/dimensions without duplicating the ingestion-time full decode. Persistence-owned cache pruning happens only after SQLite commit so rollback restores both rows and disk mappings.
+- Corrupt native lyrics cache files are evicted after detection. New regressions cover newer SQLite schema refusal, disk-artifact rollback, session checkpoint recovery, concurrent mutations and stale cloud refreshes.
+- See [PHASE7_HARDENING.md](PHASE7_HARDENING.md) for reproducible before/after evidence and explicit manual limits.

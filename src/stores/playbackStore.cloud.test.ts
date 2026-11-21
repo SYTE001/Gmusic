@@ -14,11 +14,19 @@ const cloud = vi.hoisted(() => ({
   urlFor: new Map<string, string>(),
   refreshCount: 0,
   forceFailure: false,
+  deferNext: false,
+  resumeDeferred: null as (() => void) | null,
 }));
 
 vi.mock("../services/cloud/r2StorageService", () => ({
   getPlayUrl: async (objectKey: string) => {
     cloud.refreshCount += 1;
+    if (cloud.deferNext) {
+      cloud.deferNext = false;
+      await new Promise<void>((resolve) => {
+        cloud.resumeDeferred = resolve;
+      });
+    }
     if (cloud.forceFailure) throw new Error("link expired");
     const url = cloud.urlFor.get(objectKey);
     if (!url) throw new Error("no url configured");
@@ -123,6 +131,8 @@ describe("playback with cloud sources", () => {
     cloud.urlFor.clear();
     cloud.refreshCount = 0;
     cloud.forceFailure = false;
+    cloud.deferNext = false;
+    cloud.resumeDeferred = null;
     setOnline(true);
     tracks.length = 0;
 
@@ -258,6 +268,64 @@ describe("playback with cloud sources", () => {
     await waitUntil(() => usePlaybackStore.getState().isPlaying);
     expect(engine.src).toBe("https://r2/get/cloud-a?sig=2");
     expect(cloud.refreshCount).toBeGreaterThan(1);
+  });
+
+  it("automatically refreshes one expired cloud URL and resumes at the authoritative position", async () => {
+    usePlaybackStore.getState().playContext(["cloud-a"], 0, { type: "library", label: "L" });
+    await waitUntil(() => usePlaybackStore.getState().isPlaying);
+    engine.seekSec(60);
+
+    cloud.urlFor.set("users/u-1/tracks/cloud-a/audio.mp3", "https://r2/get/cloud-a?sig=2");
+    const firstSource = engine.src;
+    usePlaybackStore.getState().handleEngineError({ code: 2, message: "expired" } as never);
+
+    await waitUntil(() => engine.src !== firstSource && usePlaybackStore.getState().isPlaying);
+    const refreshedSource = engine.src;
+    expect(engine.time).toBe(60);
+    expect(usePlaybackStore.getState().status).toBe("ready");
+    expect(usePlaybackStore.getState().error).toBeNull();
+    expect(cloud.refreshCount).toBe(2);
+
+    cloud.urlFor.set("users/u-1/tracks/cloud-a/audio.mp3", "https://r2/get/cloud-a?sig=3");
+    usePlaybackStore.getState().handleEngineError({ code: 2, message: "still failing" } as never);
+    await waitUntil(() => usePlaybackStore.getState().status === "error");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(cloud.refreshCount).toBe(2);
+    expect(engine.src).toBe(refreshedSource);
+  });
+
+  it("does not let a late automatic refresh replace a newer track", async () => {
+    usePlaybackStore.getState().playContext(["cloud-a", "cloud-b"], 0, { type: "library", label: "L" });
+    await waitUntil(() => usePlaybackStore.getState().isPlaying);
+    cloud.deferNext = true;
+    usePlaybackStore.getState().handleEngineError({ code: 2, message: "expired" } as never);
+    await waitUntil(() => cloud.resumeDeferred !== null);
+
+    void usePlaybackStore.getState().startTrack("cloud-b", { autoplay: true, queueIndex: 1 });
+    await waitUntil(() => usePlaybackStore.getState().currentTrackId === "cloud-b" && usePlaybackStore.getState().isPlaying);
+    cloud.resumeDeferred!();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(usePlaybackStore.getState().currentTrackId).toBe("cloud-b");
+    expect(engine.src).toBe("https://r2/get/cloud-b?sig=1");
+  });
+
+  it("honors a pause while an automatic refresh is pending", async () => {
+    usePlaybackStore.getState().playContext(["cloud-a"], 0, { type: "library", label: "L" });
+    await waitUntil(() => usePlaybackStore.getState().isPlaying);
+    const originalSource = engine.src;
+    engine.seekSec(60);
+    cloud.deferNext = true;
+    usePlaybackStore.getState().handleEngineError({ code: 2, message: "expired" });
+    await waitUntil(() => cloud.resumeDeferred !== null);
+
+    usePlaybackStore.getState().pause();
+    cloud.resumeDeferred!();
+    await waitUntil(() => engine.src !== originalSource && usePlaybackStore.getState().status === "ready");
+
+    expect(engine.time).toBe(60);
+    expect(engine.playing).toBe(false);
+    expect(usePlaybackStore.getState().isPlaying).toBe(false);
   });
 
   it("reports an unavailable state instead of failing silently while offline", async () => {

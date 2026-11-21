@@ -699,7 +699,7 @@ State and invariants at this checkpoint:
   - Removing tracks purges them from the active queue and context, adjusting `queueIndex` properly.
   - Session recovery re-maps the active index accurately when preceding tracks were deleted.
   - Session state and playback are cleanly stopped and cleared on backup restore via `resetPlaybackState()`.
-- Known open item: `npm audit` reports vulnerabilities (8 moderate, 2 critical) — handle in a separate security audit, never with `npm audit fix --force`.
+- Dependency audit resolved (2026-11-21): `typescript-eslint` ^8.73.0 (patched `minimatch` ^11.0.1) and `vitest` ^4.1.12 (drops vulnerable `tinypool`, patches `@vitest/mocker`) clear all 10 findings; `npm audit` now reports 0 vulnerabilities. Evidence in `docs/desktop/PHASE7_HARDENING.md`. Still never use `npm audit fix --force`.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:46cd31e7 -->
 ## Beads Issue Tracker

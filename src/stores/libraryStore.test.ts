@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { useLibraryStore } from "./libraryStore";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useLibraryStore, startPlaybackSessionCheckpointing } from "./libraryStore";
 import { usePlaybackStore } from "./playbackStore";
 import type { AudioEngine } from "../services/audio/engine";
 import { repository } from "../services/indexeddb/LibraryRepository";
@@ -210,6 +210,116 @@ describe("queue and session consistency", () => {
     const playback = usePlaybackStore.getState();
     expect(playback.queueTrackIds).toEqual(["rb", "rc"]);
     expect(playback.queueIndex).toBe(1);
+  });
+
+  it("checkpoints the authoritative audio position during uninterrupted playback", async () => {
+    const track = makeTrack({ id: "checkpoint" });
+    await repository.putTracks([track]);
+    await useLibraryStore.getState().init();
+
+    let clockSec = 8;
+    const engine = {
+      element: {} as HTMLAudioElement,
+      setSource: () => undefined,
+      play: async () => undefined,
+      pause: () => undefined,
+      get currentTimeSec() {
+        return clockSec;
+      },
+      seekSec: () => undefined,
+      get durationSec() {
+        return 60;
+      },
+      setVolume: () => undefined,
+      setMuted: () => undefined,
+      dispose: () => undefined,
+    } satisfies AudioEngine;
+    usePlaybackStore.getState().setEngineForTests(engine);
+    usePlaybackStore.setState({
+      currentTrackId: track.id,
+      currentTimeMs: 8000,
+      durationMs: 60000,
+      isPlaying: true,
+      status: "ready",
+      queueTrackIds: [track.id],
+      queueIndex: 0,
+      contextTrackIds: [track.id],
+    });
+
+    const stop = startPlaybackSessionCheckpointing(5);
+    try {
+      clockSec = 41;
+      await vi.waitFor(async () => {
+        expect((await repository.getPlaybackSession())?.positionMs).toBe(41000);
+      });
+    } finally {
+      stop();
+    }
+  });
+
+  it("removing the active track clears the engine source and all playback context", async () => {
+    const track = makeTrack({ id: "active-remove" });
+    await repository.putTracks([track]);
+    await useLibraryStore.getState().init();
+
+    const setSource = vi.fn();
+    const pause = vi.fn();
+    const engine = {
+      element: null,
+      setSource,
+      play: async () => undefined,
+      pause,
+      get currentTimeSec() {
+        return 12;
+      },
+      seekSec: () => undefined,
+      get durationSec() {
+        return 60;
+      },
+      setVolume: () => undefined,
+      setMuted: () => undefined,
+      dispose: () => undefined,
+    } satisfies AudioEngine;
+    usePlaybackStore.getState().setEngineForTests(engine);
+    usePlaybackStore.setState({
+      currentTrackId: track.id,
+      currentTimeMs: 12000,
+      durationMs: 60000,
+      isPlaying: true,
+      status: "ready",
+      error: { title: "old", detail: "old", action: "none" },
+      queueTrackIds: [track.id],
+      queueIndex: 0,
+      contextTrackIds: [track.id],
+      context: { type: "library", label: "Library" },
+    });
+    await savePlaybackSession({
+      queueTrackIds: [track.id],
+      queueIndex: 0,
+      contextTrackIds: [track.id],
+      context: { type: "library", label: "Library" },
+      currentTrackId: track.id,
+      positionMs: 12000,
+      savedAt: 1,
+    });
+
+    await useLibraryStore.getState().removeTracks([track.id]);
+
+    expect(pause).toHaveBeenCalled();
+    expect(setSource).toHaveBeenCalledWith(null);
+    expect(usePlaybackStore.getState()).toMatchObject({
+      currentTrackId: null,
+      currentTimeMs: 0,
+      durationMs: null,
+      isPlaying: false,
+      status: "idle",
+      error: null,
+      queueTrackIds: [],
+      queueIndex: -1,
+      contextTrackIds: [],
+      context: null,
+    });
+    expect(await repository.getPlaybackSession()).toBeNull();
   });
 
   it("restores the saved queue at the right slot when an earlier track was deleted", async () => {

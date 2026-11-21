@@ -1,4 +1,4 @@
-use super::process::{generate_thumbnails, validate_and_inspect_image, ValidatedImage};
+use super::process::{generate_thumbnails, inspect_image_header, ValidatedImage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -110,6 +110,26 @@ pub fn write_index_record(
     atomic_write_file(&index_dir, &target, &payload)
 }
 
+pub(crate) fn read_index_record(cache_dir: &Path, key: &str) -> Option<CachedArtworkRecord> {
+    let path = cache_dir
+        .join("index")
+        .join(format!("{}.json", hash_key(key)));
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_INDEX_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    let record: CachedArtworkRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.version == CACHE_SCHEMA_VERSION && record.key == key).then_some(record)
+}
+
+pub(crate) fn remove_index_record(cache_dir: &Path, key: &str) {
+    let path = cache_dir
+        .join("index")
+        .join(format!("{}.json", hash_key(key)));
+    let _ = fs::remove_file(path);
+}
+
 pub fn store_negative_record(
     cache_dir: &Path,
     keys: &[String],
@@ -133,13 +153,14 @@ pub fn store_negative_record(
     Ok(rec)
 }
 
-pub fn store_artwork_blob(
+fn store_artwork_blob_inner(
     cache_dir: &Path,
     keys: &[String],
     track_id: Option<&str>,
     image: &ValidatedImage,
     source: &str,
     meta: CachedArtworkRecord,
+    prune: bool,
 ) -> Result<CachedArtworkRecord, String> {
     let blobs_dir = cache_dir.join("blobs");
     fs::create_dir_all(&blobs_dir)
@@ -209,8 +230,51 @@ pub fn store_artwork_blob(
         write_index_record(cache_dir, key, &rec)?;
     }
 
-    let _ = prune_cache(cache_dir, DEFAULT_MAX_CACHE_BYTES);
+    if prune {
+        let _ = prune_cache(cache_dir, DEFAULT_MAX_CACHE_BYTES);
+    }
     Ok(rec)
+}
+
+pub fn store_artwork_blob(
+    cache_dir: &Path,
+    keys: &[String],
+    track_id: Option<&str>,
+    image: &ValidatedImage,
+    source: &str,
+    meta: CachedArtworkRecord,
+) -> Result<CachedArtworkRecord, String> {
+    store_artwork_blob_inner(cache_dir, keys, track_id, image, source, meta, true)
+}
+
+pub(crate) fn store_artwork_blob_without_prune(
+    cache_dir: &Path,
+    keys: &[String],
+    track_id: Option<&str>,
+    image: &ValidatedImage,
+    source: &str,
+    meta: CachedArtworkRecord,
+) -> Result<CachedArtworkRecord, String> {
+    store_artwork_blob_inner(cache_dir, keys, track_id, image, source, meta, false)
+}
+
+pub(crate) fn validated_cached_blob_path(cache_dir: &Path, raw_path: &str) -> Option<PathBuf> {
+    let blobs_dir = cache_dir.join("blobs");
+    let canonical_blobs = fs::canonicalize(blobs_dir).ok()?;
+    let path = Path::new(raw_path);
+    let meta = fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink()
+        || !meta.is_file()
+        || meta.len() < super::process::MIN_RAW_IMAGE_BYTES as u64
+        || meta.len() > super::process::MAX_RAW_IMAGE_BYTES as u64
+    {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    if canonical.parent() != Some(canonical_blobs.as_path()) {
+        return None;
+    }
+    Some(canonical)
 }
 
 pub fn read_cached_artwork(
@@ -262,8 +326,11 @@ pub fn read_cached_artwork(
             let _ = fs::remove_file(&index_path);
             return Ok(None);
         };
-        let orig_path = Path::new(orig_str);
-        let Ok(img_bytes) = fs::read(orig_path) else {
+        let Some(orig_path) = validated_cached_blob_path(cache_dir, orig_str) else {
+            let _ = fs::remove_file(&index_path);
+            return Ok(None);
+        };
+        let Ok(img_bytes) = fs::read(&orig_path) else {
             let _ = fs::remove_file(&index_path);
             return Ok(None);
         };
@@ -276,8 +343,8 @@ pub fn read_cached_artwork(
                 return Ok(None);
             }
         }
-        if validate_and_inspect_image(&img_bytes).is_err() {
-            let _ = fs::remove_file(orig_path);
+        if inspect_image_header(&img_bytes).is_err() {
+            let _ = fs::remove_file(&orig_path);
             let _ = fs::remove_file(&index_path);
             return Ok(None);
         }
@@ -356,7 +423,11 @@ pub fn clear_all_cache(cache_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn blob_path_for_record(record: &CachedArtworkRecord, size: u32) -> Option<PathBuf> {
+pub fn blob_path_for_record(
+    cache_dir: &Path,
+    record: &CachedArtworkRecord,
+    size: u32,
+) -> Option<PathBuf> {
     let chosen = if size > 0 && size <= 256 {
         record
             .thumb_path_256
@@ -374,7 +445,7 @@ pub fn blob_path_for_record(record: &CachedArtworkRecord, size: u32) -> Option<P
             .as_deref()
             .or(record.thumb_path_500.as_deref())
     };
-    chosen.map(PathBuf::from).filter(|p| p.is_file())
+    chosen.and_then(|path| validated_cached_blob_path(cache_dir, path))
 }
 
 pub fn measure_cache_bytes(cache_dir: &Path) -> u64 {
@@ -601,6 +672,48 @@ mod tests {
             }
         }
         sum
+    }
+
+    #[test]
+    fn rejects_index_paths_outside_the_cache_and_oversized_cached_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = sample_image(300, 300, 64);
+        let rec = store_artwork_blob(
+            dir.path(),
+            &["track::guarded".into()],
+            Some("guarded"),
+            &img,
+            "embedded",
+            CachedArtworkRecord::default(),
+        )
+        .unwrap();
+        let index_path = dir
+            .path()
+            .join("index")
+            .join(format!("{}.json", hash_key("track::guarded")));
+        let outside = dir.path().join("outside.png");
+        fs::write(&outside, &img.bytes).unwrap();
+
+        let mut escaped = rec.clone();
+        escaped.key = "track::guarded".into();
+        escaped.original_path = Some(outside.to_string_lossy().into_owned());
+        escaped.thumb_path_500 = escaped.original_path.clone();
+        fs::write(&index_path, serde_json::to_vec(&escaped).unwrap()).unwrap();
+        assert!(read_cached_artwork(dir.path(), "track::guarded", false)
+            .unwrap()
+            .is_none());
+        assert!(outside.exists());
+
+        let mut oversized = rec;
+        oversized.key = "track::guarded".into();
+        let orig = PathBuf::from(oversized.original_path.as_ref().unwrap());
+        let file = fs::OpenOptions::new().write(true).open(&orig).unwrap();
+        file.set_len((super::super::process::MAX_RAW_IMAGE_BYTES + 1) as u64)
+            .unwrap();
+        fs::write(&index_path, serde_json::to_vec(&oversized).unwrap()).unwrap();
+        assert!(read_cached_artwork(dir.path(), "track::guarded", false)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

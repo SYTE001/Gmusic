@@ -1,0 +1,23 @@
+{
+  "scope": "Accelerated jsdom/store stress: 10 runs x 100 stored-copy starts with repeated seeks. Excludes audible decoding, WebView2, wall-clock playback duration, and process-tree memory.",
+  "samples_ms": [
+    179.39210000000003,
+    88.4349000000002,
+    109.76630000000023,
+    90.26980000000003,
+    88.58680000000004,
+    77.43000000000029,
+    101.1831000000002,
+    90.17589999999927,
+    86.86030000000028,
+    77.98999999999978
+  ],
+  "p50_ms": 88.58680000000004,
+  "p95_ms": 179.39210000000003,
+  "object_urls": {
+    "active": 1,
+    "created": 1000,
+    "revoked": 999
+  },
+  "audio_elements": 0
+}

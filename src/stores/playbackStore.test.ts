@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { writeFileSync } from "node:fs";
+import { performance } from "node:perf_hooks";
 import { usePlaybackStore, bindPlaybackHelpers } from "./playbackStore";
 import type { AudioEngine, EngineEvents, MediaFailure } from "../services/audio/engine";
 import { resolveTrackSource, releaseActiveTrackSource } from "../services/file-access/FileAccessService";
@@ -544,6 +546,61 @@ describe("playback store", () => {
     expect(stats.active).toBe(1);
     expect(stats.created - stats.revoked).toBe(1);
   });
+
+  it("records opt-in accelerated playback switching and seeking stress", async () => {
+    if (process.env.GMUSIC_BENCH !== "1") return;
+    releaseActiveTrackSource();
+    resetObjectUrlStats();
+    const stressTracks: Track[] = [];
+    for (let index = 0; index < 100; index += 1) {
+      const track = makeTrack({ id: `stress-${index}`, title: `Stress ${index}` });
+      stressTracks.push(track);
+      tracks.push(track);
+      await repository.putAudioBlob(track.id, new Blob([`audio-${index}`]));
+    }
+    await repository.putTracks(stressTracks);
+
+    const samples: number[] = [];
+    for (let run = 0; run < 10; run += 1) {
+      const started = performance.now();
+      usePlaybackStore.getState().playContext(
+        stressTracks.map((track) => track.id),
+        0,
+        { type: "library", label: "Stress" },
+      );
+      await waitForStore(() => usePlaybackStore.getState().isPlaying);
+      for (let index = 1; index < stressTracks.length; index += 1) {
+        await usePlaybackStore.getState().startTrack(stressTracks[index].id, {
+          autoplay: true,
+          queueIndex: index,
+          coalesce: false,
+        });
+        usePlaybackStore.getState().seek((index % 100) * 1000);
+      }
+      samples.push(performance.now() - started);
+    }
+
+    const sorted = [...samples].sort((a, b) => a - b);
+    const stats = getObjectUrlStats();
+    expect(stats.active).toBe(1);
+    expect(document.querySelectorAll("audio").length).toBeLessThanOrEqual(1);
+    writeFileSync(
+      process.env.GMUSIC_BENCH_OUTPUT!,
+      JSON.stringify(
+        {
+          scope: "Accelerated jsdom/store stress: 10 runs x 100 stored-copy starts with repeated seeks. Excludes audible decoding, WebView2, wall-clock playback duration, and process-tree memory.",
+          samples_ms: samples,
+          p50_ms: sorted[Math.ceil(samples.length * 0.5) - 1],
+          p95_ms: sorted[Math.ceil(samples.length * 0.95) - 1],
+          object_urls: stats,
+          audio_elements: document.querySelectorAll("audio").length,
+        },
+        null,
+        2,
+      ),
+      { flag: "wx" },
+    );
+  }, 120000);
 });
 
 function waitForStore(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
